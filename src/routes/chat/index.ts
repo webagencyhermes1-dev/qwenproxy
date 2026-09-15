@@ -40,7 +40,8 @@ import {
 } from "./retry-policy.ts";
 import { classifyMediaModel } from "../../services/media-generation.ts";
 import { handleMediaChatCompletion } from "./media.ts";
-import { getStickyMap, hashToStickyKey } from "../../services/session/stickyMap.ts";
+import { getStickyMap } from "../../services/session/stickyMap.ts";
+import { generateStickyKey } from "../../services/session/key.ts";
 
 
 
@@ -137,20 +138,30 @@ export async function chatCompletions(c: Context) {
     });
     mark("context", stepStartedAt);
 
-    // Loop 1 (lookup-only): observe sticky binding without changing routing.
-    // Full sticky-key + rebind logic lands in Loop 2 / Loop 8.
-    if (ctx.sessionId) {
-      try {
-        const lookupKey = hashToStickyKey(ctx.sessionId);
-        const observed = getStickyMap().get(lookupKey);
-        if (observed && logger.isLevelEnabled("info")) {
+    // Loop 2: deterministic sticky key (header > first_message > combined > random).
+    // Lookup-only: touch on hit for sliding TTL, no routing change yet.
+    // Rebind lands in Loop 8. Exposed via c.set for downstream account layer.
+    let stickyKey: string | null = null;
+    try {
+      stickyKey = generateStickyKey({
+        sessionHeader:
+          c.req.header("x-session-id") ?? c.req.header("X-Session-Id"),
+        explicitKey: conversationKey,
+        systemPrompt,
+        messages,
+      });
+      c.set("stickyKey" as never, stickyKey as never);
+      const observed = getStickyMap().get(stickyKey);
+      if (observed) {
+        getStickyMap().touch(stickyKey);
+        if (logger.isLevelEnabled("info")) {
           console.log(
-            `[Session] Lookup hit | key=${lookupKey} | account=${observed.accountId}`,
+            `[Session] Lookup hit | key=${stickyKey} | account=${observed.accountId} | session=${ctx.sessionId}`,
           );
         }
-      } catch {
-        // Observability only; never fail the request.
       }
+    } catch {
+      // Observability only; never fail the request.
     }
 
     // Chat lock is acquired AFTER stream creation (below) to avoid holding it
