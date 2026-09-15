@@ -70,6 +70,12 @@ const envSchema = z
     // Set QWEN_HOST_RESOLVER_RULES=false to let Chromium resolve normally.
     QWEN_HOST_RESOLVER_RULES: z.string().default("true"),
     QWEN_CHAT_ORIGIN_IP: z.string().default("8.219.122.25"),
+    // How old a persisted storage_state.json backup may be before it is
+    // treated as a stale session. Reusing an older backup drags a dead token
+    // back into the browser, every request 401s with "session expired", and
+    // the server mislabels the account broken until a fresh login happens.
+    // 6h covers restarts/reboots without shipping rotten cookies.
+    PLAYWRIGHT_STORAGE_STATE_TTL_MS: z.string().default("21600000"),
     CAPTCHA_SOLVER_ENABLED: z.string().default("true"),
     CAPTCHA_SOLVER_MAX_ATTEMPTS: z.string().default("3"),
     CAPTCHA_SOLVER_TIMEOUT_MS: z.string().default("15000"),
@@ -242,6 +248,7 @@ export const config = {
     maxParallelInit: Math.max(1, parseInt(env.PLAYWRIGHT_MAX_PARALLEL_INIT)),
     hostResolverRules: env.QWEN_HOST_RESOLVER_RULES !== "false",
     chatOriginIp: env.QWEN_CHAT_ORIGIN_IP,
+    storageStateTtlMs: Math.max(0, parseInt(env.PLAYWRIGHT_STORAGE_STATE_TTL_MS)),
     prepareAllOnStartup: env.PLAYWRIGHT_PREPARE_ALL_ON_STARTUP !== "false",
   },
   captcha: {

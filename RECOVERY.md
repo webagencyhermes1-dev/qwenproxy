@@ -120,7 +120,33 @@ Per-account Chromium contexts died mid-flight. A crash on one account cascaded i
 
 ## Loop 4 — Fix Session Expiry Handling
 
-*(pending)*
+**Symptom from log:**
+```
+Header capture failed for john.doe@gmail.com: session expired and no credentials available for re-login
+Auth required: session expired
+[Chat] /v1/chat/completions failed: auth required
+```
+A Qwen token expired server-side while the persisted browser profile still carried it. Every request — chat, `/v1/models`, personalization — then failed with `auth required`, and the account sat labeled as broken instead of being re-authenticated. A restart made it worse: the old `storage_state.json` backup (possibly days old) was re-injected into the fresh browser, dragging the dead token back in.
+
+**Root cause:**
+1. The profile/backup restore injected cookies with **no age or expiry check**: a token whose JWT `exp` had already passed — or whose `expires` had elapsed — was copied straight into the new browser context.
+2. There was no staleness bound on the persisted backup, so a server that restarted days later resurrected a session that the Qwen side had already killed.
+
+**Fix applied:**
+
+1. **Storage-state TTL** (`PLAYWRIGHT_STORAGE_STATE_TTL_MS`, default **6h**) — a persisted `storage_state.json`/`*_state.json` backup older than the TTL is treated as a dead session and never re-injected. Callers fall through to credential re-login instead.
+2. **Cookie-level expiry filtering** (`getRestorableCookies`) — even a fresh backup only contributes cookies whose `expires` is unset, session (`-1`), or still in the future, AND whose token value is not a JWT already past `exp` (`isTokenCookieJwtExpired`; opaque tokens are never discarded). A backup holding only a dead token is refused outright, so `loadStorageState` returns `undefined` and the browser boots from the native profile/credentials.
+3. Both per-account init paths (`initPlaywrightForAccount`, non-headless variant) now restore via `getRestorableCookies` — one code path, no duplicated read/parse logic.
+
+**Tests verifying the fix:**
+- `shared-browser.test.ts` —
+  - `isTokenCookieJwtExpired` parses JWT `exp`, survives URL-encoded tokens, and never mislabels opaque values.
+  - `getRestorableCookies` drops expired `expires` cookies AND expired-token JWTs, keeps fresh session/risk cookies, and returns `[]` when the only cookie is a dead token.
+  - `loadStorageState` refuses a backup beyond its TTL (mtime-probed) and reuses one inside the budget.
+
+**Commit:** `fix(auth): refuse stale/expired session backups and bound storage-state TTL`
+
+---
 
 ## Loop 5 — Fix the 2M Character Full Replay
 

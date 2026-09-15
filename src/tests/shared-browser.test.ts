@@ -5,6 +5,8 @@ import path from "node:path";
 import {
   getStorageStatePath,
   loadStorageState,
+  getRestorableCookies,
+  isTokenCookieJwtExpired,
   saveStorageState,
   isPlaywrightAlreadyClosedError,
   isPageLoggedIn,
@@ -36,6 +38,90 @@ test("Playwright Storage State: loadStorageState validates JSON and cookies arra
     // 2. Valid structure with cookies
     fs.writeFileSync(statePath, JSON.stringify({ cookies: [{ name: "token", value: "abc" }], origins: [] }));
     const loaded = loadStorageState(accountId);
+    assert.ok(loaded);
+    assert.equal(loaded, statePath);
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+function makeJwt(exp: number): string {
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({ exp })).toString("base64url");
+  return `${header}.${payload}.sig`;
+}
+
+test("isTokenCookieJwtExpired parses JWT exp and ignores opaque tokens", () => {
+  const past = makeJwt(Math.floor(Date.now() / 1000) - 60);
+  const future = makeJwt(Math.floor(Date.now() / 1000) + 3600);
+
+  assert.equal(isTokenCookieJwtExpired({ name: "token", value: past }), true);
+  assert.equal(isTokenCookieJwtExpired({ name: "token", value: future }), false);
+  // Opaque / non-JWT values must never be treated as expired.
+  assert.equal(isTokenCookieJwtExpired({ name: "token", value: "opaque-value" }), false);
+  assert.equal(isTokenCookieJwtExpired({ name: "acw_tc", value: past }), false);
+  // URL-encoded JWT (cookie values can be percent-encoded).
+  assert.equal(isTokenCookieJwtExpired({ name: "token", value: encodeURIComponent(past) }), true);
+});
+
+test("getRestorableCookies drops expired cookies and expired-token JWTs", () => {
+  const accountId = "restore-test-acc";
+  const statePath = getStorageStatePath(accountId);
+  const dir = path.dirname(statePath);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    const pastToken = makeJwt(Math.floor(Date.now() / 1000) - 60);
+    const futureToken = makeJwt(Math.floor(Date.now() / 1000) + 3600);
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        cookies: [
+          { name: "token", value: pastToken, expires: -1 },
+          { name: "session", value: futureToken, expires: -1 },
+          { name: "acw_tc", value: "risk-cookie", expires: 9999999999 },
+          { name: "expired_http", value: "x", expires: Math.floor(Date.now() / 1000) - 10 },
+        ],
+        origins: [],
+      }),
+    );
+
+    const restorable = getRestorableCookies(accountId);
+    const names = restorable.map((c) => c.name).sort();
+    assert.deepEqual(names, ["acw_tc", "session"], "expired token and expired http cookies must be filtered out");
+    // A dead-only-token backup is unusable: full state must be refused so the
+    // caller re-logs-in with credentials instead of dragging the stale cookie in.
+    const deadAccountId = "restore-expired-token-acc";
+    const deadStatePath = getStorageStatePath(deadAccountId);
+    fs.mkdirSync(path.dirname(deadStatePath), { recursive: true });
+    fs.writeFileSync(
+      deadStatePath,
+      JSON.stringify({ cookies: [{ name: "token", value: pastToken, expires: -1 }], origins: [] }),
+    );
+    assert.equal(getRestorableCookies(deadAccountId).length, 0);
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test("loadStorageState refuses a stale storage state beyond its TTL", () => {
+  const accountId = "stale-test-acc";
+  const statePath = getStorageStatePath(accountId);
+  const dir = path.dirname(statePath);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({ cookies: [{ name: "token", value: "abc", expires: -1 }], origins: [] }),
+    );
+    const oldMtime = Math.floor((Date.now() - 10_000) / 1000);
+    fs.utimesSync(statePath, oldMtime, oldMtime);
+
+    // Older than the 5s budget -> treated as an expired session.
+    assert.equal(loadStorageState(accountId, 5_000), undefined);
+    // Within the 60s budget -> reusable.
+    const loaded = loadStorageState(accountId, 60_000);
     assert.ok(loaded);
     assert.equal(loaded, statePath);
   } finally {

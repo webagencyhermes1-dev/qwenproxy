@@ -284,21 +284,82 @@ export function getStorageStatePath(accountId: string): string {
   return path.join(profileDir, "storage_state.json");
 }
 
-export function loadStorageState(accountId: string): string | undefined {
+/** Legacy backup filename written by older providers. */
+function pickStorageStatePath(accountId: string): string | undefined {
   const p1 = getStorageStatePath(accountId);
   const p2 = path.join(path.dirname(p1), `${accountId}_state.json`);
-  const chosenPath = fs.existsSync(p1) ? p1 : fs.existsSync(p2) ? p2 : undefined;
-  if (!chosenPath) return undefined;
+  return fs.existsSync(p1) ? p1 : fs.existsSync(p2) ? p2 : undefined;
+}
+
+/**
+ * Whether a token cookie's JWT payload is already past its `exp`. Unparseable
+ * (opaque) tokens are treated as valid so we never throw away a working
+ * session on a format change.
+ */
+export function isTokenCookieJwtExpired(cookie: { name: string; value: string }): boolean {
+  if (!/token/i.test(cookie.name)) return false;
+  let raw = cookie.value;
   try {
-    const raw = fs.readFileSync(chosenPath, "utf8");
-    const state = JSON.parse(raw);
-    if (!state || typeof state !== "object" || !Array.isArray(state.cookies)) {
-      return undefined;
-    }
-    return chosenPath;
+    raw = decodeURIComponent(raw);
   } catch {
-    return undefined;
+    // Keep the raw value.
   }
+  const segments = raw.split(".");
+  if (segments.length !== 3 || !segments[1]) return false;
+  try {
+    const payload = JSON.parse(
+      Buffer.from(segments[1], "base64url").toString("utf-8"),
+    );
+    const exp = payload?.exp;
+    if (typeof exp !== "number" || !Number.isFinite(exp)) return false;
+    return exp < Date.now() / 1000;
+  } catch {
+    return false;
+  }
+}
+
+/** Max age of the persisted storage_state.json backup reused at re-init. */
+export const STORAGE_STATE_TTL_MS = config.playwright.storageStateTtlMs;
+
+/**
+ * Cookies from the persisted storage state that are still worth injecting:
+ * the backup must be younger than `maxAgeMs` and every returned cookie must be
+ * unexpired (both `expires` and JWT `exp`). Returns [] for a stale or dead
+ * session so the caller falls through to credential re-login.
+ */
+export function getRestorableCookies(
+  accountId: string,
+  maxAgeMs = STORAGE_STATE_TTL_MS,
+): Array<{ name: string; value: string }> {
+  const chosenPath = pickStorageStatePath(accountId);
+  if (!chosenPath) return [];
+  try {
+    const stat = fs.statSync(chosenPath);
+    if (Date.now() - stat.mtimeMs > maxAgeMs) return [];
+    const parsed = JSON.parse(fs.readFileSync(chosenPath, "utf8"));
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.cookies)) {
+      return [];
+    }
+    const nowMs = Date.now();
+    return parsed.cookies.filter(
+      (c: any) =>
+        c &&
+        typeof c.name === "string" &&
+        // Playwright writes session cookies as expires === -1.
+        (c.expires === undefined || c.expires === -1 || c.expires * 1000 > nowMs) &&
+        !isTokenCookieJwtExpired(c),
+    ) as Array<{ name: string; value: string }>;
+  } catch {
+    return [];
+  }
+}
+
+export function loadStorageState(
+  accountId: string,
+  maxAgeMs = STORAGE_STATE_TTL_MS,
+): string | undefined {
+  if (getRestorableCookies(accountId, maxAgeMs).length === 0) return undefined;
+  return pickStorageStatePath(accountId);
 }
 
 export async function saveStorageState(
@@ -1605,19 +1666,14 @@ export async function initPlaywrightForAccount(
         await hook(acctContext);
       }
 
-      // If native profile cookies are empty but a backup storage_state.json exists, restore cookies
-      const storageState = loadStorageState(account.id);
-      if (storageState) {
-        try {
-          const raw = fs.readFileSync(storageState, "utf8");
-          const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed.cookies) && parsed.cookies.length > 0) {
-            const currentCookies = await acctContext.cookies();
-            if (currentCookies.length === 0) {
-              await acctContext.addCookies(parsed.cookies).catch(() => {});
-            }
-          }
-        } catch {}
+      // If native profile cookies are empty but a fresh backup
+      // storage_state.json exists, restore its still-valid cookies.
+      const restorableCookies = getRestorableCookies(account.id);
+      if (restorableCookies.length > 0) {
+        const currentCookies = await acctContext.cookies();
+        if (currentCookies.length === 0) {
+          await acctContext.addCookies(restorableCookies).catch(() => {});
+        }
       }
 
       // Persistent contexts may already contain an initial about:blank tab.
@@ -1797,19 +1853,14 @@ export async function validateAccountLogin(
     try {
       await acctContext.addInitScript(getStealthScript(fingerprint));
 
-      // If native profile cookies are empty but a backup storage_state.json exists, restore cookies
-      const storageState = loadStorageState(account.id);
-      if (storageState) {
-        try {
-          const raw = fs.readFileSync(storageState, "utf8");
-          const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed.cookies) && parsed.cookies.length > 0) {
-            const currentCookies = await acctContext.cookies();
-            if (currentCookies.length === 0) {
-              await acctContext.addCookies(parsed.cookies).catch(() => {});
-            }
-          }
-        } catch {}
+      // If native profile cookies are empty but a fresh backup
+      // storage_state.json exists, restore its still-valid cookies.
+      const restorableCookies = getRestorableCookies(account.id);
+      if (restorableCookies.length > 0) {
+        const currentCookies = await acctContext.cookies();
+        if (currentCookies.length === 0) {
+          await acctContext.addCookies(restorableCookies).catch(() => {});
+        }
       }
 
       const existingPages = acctContext.pages().filter((p) => !p.isClosed());
