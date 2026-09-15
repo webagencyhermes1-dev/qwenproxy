@@ -171,7 +171,7 @@ Escalations and failovers re-send the entire conversation. A conversation domina
   - failover prompt for a single 2M-char paste is served ≤ 100k with the truncation notice.
 - Existing 500-message/2M conversation, tool-pair integrity, T0 byte-identity, refs, and personalization-envelope tests unchanged and green.
 
-**Commit:** `fix(context): serve single giant messages by trimming to budget instead of refusing`
+**Commit:** `3405379 test(context): semantic retention of planted fact plus single-paste trim guard` (the tiered.ts guard + tests landed in that commit; this recovery doc entry was added in `95f3559`). The working-tree regression that temporarily reverted the guard was caught by the failing test above and restored.
 
 ---
 
