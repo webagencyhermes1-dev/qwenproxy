@@ -269,6 +269,9 @@ export class StickyMap {
         .set(redisKey(key), JSON.stringify(b), "PX", b.ttlMs)
         .catch(() => {});
     }
+    if (logger.isLevelEnabled("info")) {
+      console.log(`[Session] Touch | key=${key} | account=${b.accountId}`);
+    }
   }
 
   /** Remove expired entries; returns count removed. */

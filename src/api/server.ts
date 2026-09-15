@@ -21,6 +21,16 @@ import { sendOpenAIError } from "./error-helpers.js";
 import { AuthError, NotFoundError } from "../core/errors.js";
 import type { QwenAccount } from "../core/accounts.js";
 import { isAuthMockEnabled } from "../services/auth-playwright.js";
+import {
+  noteAccountInitFailure,
+  noteAccountInitSuccess,
+} from "../core/account-health.js";
+import {
+  isAccountEffectivelyBroken,
+  markAccountAuthError,
+  markAccountBroken,
+  noteAccountRecovered,
+} from "../core/account-state.js";
 
 // Module-level state (initialized in startServer)
 let cache: MemoryCache | undefined;
@@ -252,8 +262,69 @@ for (const [from, to] of LEGACY_REDIRECTS) {
   app.all(from, (c) => c.redirect(to, 308));
 }
 
+/** Mask an account id/email for /health output (never leak credentials). */
+function maskPoolAccountId(idOrEmail: string): string {
+  if (!idOrEmail) return "unknown";
+  if (idOrEmail.includes("@")) {
+    const [user, domain] = idOrEmail.split("@");
+    return `${user.slice(0, 2)}***@${domain}`;
+  }
+  return idOrEmail.length > 12 ? `${idOrEmail.slice(0, 12)}…` : idOrEmail;
+}
+
 app.get("/health", async (c) => {
   const status = await watchdog?.getStatus();
+  // Pool 2.0 observability: aggregated counts + per-account rows. All
+  // identifiers masked; no passwords, cookies or tokens are ever included.
+  let pool: Record<string, unknown> | null = null;
+  let poolAccounts: Array<Record<string, unknown>> = [];
+  try {
+    const manager = await import("../core/account-manager.js");
+    const { loadAccounts } = await import("../core/accounts.js");
+    const stats = manager.getPoolStats();
+    pool = {
+      total: stats.total,
+      ready: stats.ready,
+      warming: stats.warming,
+      busy: stats.busy,
+      cooldown: stats.cooldown,
+      authError: stats.authError,
+      broken: stats.broken,
+      disabled: stats.disabled,
+      sessionExpired: stats.sessionExpired,
+      activeStreams: stats.totalActiveStreams,
+      queued: stats.queuedRequests,
+      successRate: Number(stats.successRate.toFixed(4)),
+      failureRate: Number(stats.failureRate.toFixed(4)),
+      averageLatencyMs: stats.averageLatencyMs,
+      averageHealth: stats.averageHealth,
+    };
+    const accounts = loadAccounts();
+    const candidates = manager.buildSchedulerCandidates(accounts);
+    poolAccounts = candidates.map((cand) => {
+      const cd = manager.getAccountCooldownInfo(cand.account.id);
+      return {
+        // Opaque prefix only — never the full id or email.
+        id: maskPoolAccountId(cand.account.id),
+        account: maskPoolAccountId(cand.account.email || cand.account.id),
+        state: stats.states[cand.account.id] ?? "WARMING",
+        health: cand.health.healthScore,
+        activeStreams: cand.activeStreams,
+        queued: cand.queuedRequests,
+        requests: cand.health.successCount + cand.health.failureCount,
+        success: cand.health.successCount,
+        failure: cand.health.failureCount,
+        averageLatencyMs: cand.health.averageLatencyMs,
+        lastUsed: cand.health.lastRequestAt,
+        lastSuccess: cand.health.lastSuccessAt,
+        lastFailure: cand.health.lastFailureAt,
+        cooldownRemainingMs: cd?.remainingMs ?? 0,
+        cooldownReason: cd?.reason ?? cand.account.cooldown_reason ?? null,
+      };
+    });
+  } catch {
+    // Pool details are best-effort; core health must always respond.
+  }
   return c.json({
     status: status?.overall || "unknown",
     ram: status?.ram || "unknown",
@@ -270,10 +341,38 @@ app.get("/health", async (c) => {
     timestamp: Date.now(),
     readyAccounts: (await import("../core/account-manager.js")).getHeadersReadyAccountIds(),
     activeAccounts: (await import("../services/playwright.js")).getActivePlaywrightAccountIds(),
+    pool,
+    accounts: poolAccounts,
     metrics: {
       cache: await cache?.getStats(),
     },
   });
+});
+
+// Sticky session observability: size, active bindings, rebinds last hour.
+app.get("/health/sessions", async (c) => {
+  try {
+    const { getStickyMap } = await import("../services/session/stickyMap.ts");
+    const sm = getStickyMap();
+    const entries = sm.entries();
+    return c.json({
+      size: sm.size(),
+      activeBindings: entries.length,
+      rebindsLastHour: sm.rebindsLastHour(),
+      bindings: entries.map((e) => ({
+        key: e.key,
+        accountId: e.binding.accountId,
+        lastUsedAt: e.binding.lastUsedAt,
+        ageMs: Date.now() - e.binding.lastUsedAt,
+      })),
+      timestamp: Date.now(),
+    });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message : String(err) },
+      500,
+    );
+  }
 });
 
 // Token TTL diagnostics: inspect real cookie/header lifetimes
@@ -390,6 +489,14 @@ async function prepareQwenRuntime(params: {
         return false;
       }
     }
+    if (params.accountId) {
+      try {
+        noteAccountInitSuccess(params.accountId);
+        noteAccountRecovered(params.accountId);
+      } catch {
+        // Best-effort.
+      }
+    }
     return true;
   } catch (error) {
     console.warn(`❌ ${params.failureMessage}`, getErrorMessage(error));
@@ -401,6 +508,15 @@ async function prepareQwenRuntime(params: {
         config.concurrency.initFailureCooldownMs,
         "AuthInitFailed",
       );
+      // Pool 2.0: repeated init failures escalate WARMING → BROKEN.
+      try {
+        noteAccountInitFailure(params.accountId);
+        if (isAccountEffectivelyBroken(params.accountId)) {
+          markAccountBroken(params.accountId);
+        }
+      } catch {
+        // Best-effort.
+      }
     }
     return false;
   }
@@ -552,6 +668,14 @@ async function cleanupServerResources(): Promise<void> {
     flushLogicalThreadState();
   } catch {
     // Persistence is best-effort; the in-memory cache already served this run.
+  }
+
+  try {
+    // Pool 2.0: debounced health counters must land before the DB closes.
+    const { flushAccountHealth } = await import("../core/account-health.ts");
+    flushAccountHealth();
+  } catch {
+    // Best-effort.
   }
 
   const { closeDatabase } = await import("../core/database.ts");
@@ -765,11 +889,26 @@ export async function startServer(options?: {
                 // Add to priority list only once validated
                 ensureAccountInPriority(account.id);
                 validated++;
+                try {
+                  noteAccountInitSuccess(account.id);
+                  noteAccountRecovered(account.id);
+                } catch {
+                  // Best-effort.
+                }
                 console.log(
                   `✅ [Server] Standby account validated: ${maskEmail(account.email)}`,
                 );
               } else {
                 failed++;
+                try {
+                  noteAccountInitFailure(account.id);
+                  markAccountAuthError(account.id);
+                  if (isAccountEffectivelyBroken(account.id)) {
+                    markAccountBroken(account.id);
+                  }
+                } catch {
+                  // Best-effort.
+                }
                 console.warn(
                   `⚠️  [Server] Standby account login failed: ${maskEmail(account.email)} (quarantined)`,
                 );
@@ -813,6 +952,19 @@ export async function startServer(options?: {
     const { startLeaseSweepTimer } =
       await import("../core/account-concurrency.ts");
     startLeaseSweepTimer();
+
+    // Readiness guard: maintains the ready-account floor (2 ready + 1 warming).
+    const {
+      registerReadinessGuardDeps,
+      startReadinessGuardSweep,
+    } = await import("../core/readiness-guard.ts");
+    registerReadinessGuardDeps({
+      getAccountCredentials,
+      initPlaywrightForAccount,
+      disableNativeTools,
+      warmQwenChatPool,
+    });
+    startReadinessGuardSweep();
 
     const serverInstance = serve({
       fetch: app.fetch,
