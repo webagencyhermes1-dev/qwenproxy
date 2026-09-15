@@ -194,6 +194,45 @@ export async function withPlaywrightInitSlot<T>(fn: () => Promise<T>): Promise<T
   }
 }
 
+/**
+ * Global bound on concurrent Playwright BROWSER operations (max 5).
+ *
+ * Per-account mutexes serialize work for one account, but N accounts
+ * recovering at once (cold start, WAF storm) still fork N concurrent
+ * navigations/captures/logins against one host — the OOM cascade that killed
+ * sibling contexts. Every heavy browser op (header capture, login,
+ * keep-alive navigation) runs inside this slot; surplus ops queue FIFO.
+ * Leaf-only: never acquire another slot/mutex inside, so no lock ordering
+ * cycle is possible.
+ */
+export const PW_OP_SEMAPHORE_MAX = 5;
+let pwOpActive = 0;
+const pwOpWaiters: Array<() => void> = [];
+let pwOpHighWater = 0;
+
+export async function withPlaywrightOpSlot<T>(fn: () => Promise<T>): Promise<T> {
+  while (pwOpActive >= PW_OP_SEMAPHORE_MAX) {
+    await new Promise<void>((resolve) => pwOpWaiters.push(resolve));
+  }
+  pwOpActive++;
+  pwOpHighWater = Math.max(pwOpHighWater, pwOpActive);
+  try {
+    return await fn();
+  } finally {
+    pwOpActive--;
+    pwOpWaiters.shift()?.();
+  }
+}
+
+/** Highest concurrent op-slot occupancy observed (tests/observability). */
+export function getPlaywrightOpHighWater(): number {
+  return pwOpHighWater;
+}
+
+export function resetPlaywrightOpHighWaterForTests(): void {
+  pwOpHighWater = 0;
+}
+
 // Per-account mutexes for browser access. maxHoldMs = 60s: a page operation
 // legitimately takes a few seconds per step, but one exceeding 60s is a stuck
 // browser op (closed context / WAF page swallow) and the account should return
@@ -1983,6 +2022,16 @@ async function loginToQwen(
   email: string,
   password: string,
 ): Promise<boolean> {
+  return withPlaywrightOpSlot(() =>
+    loginToQwenInner(accountId, email, password),
+  );
+}
+
+async function loginToQwenInner(
+  accountId: string,
+  email: string,
+  password: string,
+): Promise<boolean> {
   if (!password || password === "***") {
     try {
       const { getAccountCredentials } = await import("../core/accounts.ts");
@@ -2306,6 +2355,17 @@ async function loginViaUi(
  * without starting a real browser.
  */
 export async function captureQwenHeaders(
+  accountId: string,
+  pageOverride?: Page,
+  timeoutMs = config.timeouts.headers,
+  triggerGraceMs = HEADER_CAPTURE_TRIGGER_GRACE_MS,
+): Promise<void> {
+  return withPlaywrightOpSlot(() =>
+    captureQwenHeadersInner(accountId, pageOverride, timeoutMs, triggerGraceMs),
+  );
+}
+
+async function captureQwenHeadersInner(
   accountId: string,
   pageOverride?: Page,
   timeoutMs = config.timeouts.headers,
@@ -3421,6 +3481,12 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
 }
 
 export async function keepAlivePlaywrightAccount(
+  accountId: string,
+): Promise<boolean> {
+  return withPlaywrightOpSlot(() => keepAlivePlaywrightAccountInner(accountId));
+}
+
+async function keepAlivePlaywrightAccountInner(
   accountId: string,
 ): Promise<boolean> {
   // The keep-alive navigates the same page the renderer is streaming from, so
