@@ -1,7 +1,94 @@
 # ROUTING — Account Routing with Sticky Affinity + Tiered Context Injection
 
-Real metrics from `tsx --test` runs on 2026-09-15. No fabricated numbers.
-Full new-module suite: **39 tests pass, 0 fail** (`duration ~2.07s`).
+Routing layer: complete (55 tests pass).
+Runtime stabilization: pending until items 1-6 pass on a real two-session run.
+tsc: must be clean before this branch is mergeable.
+
+Status detail (2026-09-15, second pass — the 7 stabilization items):
+
+- Item 1 (tsc): CLEAN. `npx tsc --noEmit` exits 0. The `withPlaywrightInitSlot`
+  brace mismatch and the missing `maxParallelInit` / `hostResolverRules` /
+  `chatOriginIp` config fields were fixed on this branch (commits `3824f83`,
+  `e3b8c0e`, present in tree; verified `tsc done: True` after every later
+  commit). If tsc ever goes red again, do not merge.
+- Item 2 (tiered on real path): DONE. `assembleCompressedContext` is called on
+  the real failover path via `buildCompressedFailoverPrompt` in
+  `src/routes/chat/account.ts` (4 sites: sticky-failover, in-progress
+  escalation, inner account switch, force-new-chat) plus the request-retry
+  path in `src/routes/chat/index.ts`. `grep assembleCompressedContext
+  src/routes/chat/account.ts` → import + call (2 hits). `grep full-replay
+  src/routes/chat/account.ts src/routes/chat/index.ts` → 0 hits. Failover logs
+  `context=compressed` with chars (e.g. `prompt=10/100000` seen live in the
+  mock-stack e2e log below). `compressContextForFailover` definition and its
+  own unit tests remain; it is no longer called on any failover path.
+- Item 3 (personalization mutex): DONE. try/finally was already present;
+  acquire budget was already 2s with skip; changed sync deadline 5s→2s with
+  `[Personalization] skipped after 2s` + proceed on TIMEOUT, while explicit
+  fast sync failures still throw `PersonalizationSyncError` (fail-loud e2e
+  still green). Mutex acquire-timeout warn silenced for this call site
+  (`silentTimeout`), so `Mutex[personalization` must not appear in normal logs.
+  New test: 10s lock hold → chat completes in ~2.0s with skip logged and zero
+  `Mutex[personalization` output.
+- Item 4 (Playwright bound): DONE the missing piece — global `PW_SEM=5`
+  (`withPlaywrightOpSlot`) wrapping header capture, login, keep-alive, with
+  high-water tracking; 50-task test proves ≤5 concurrent (observed overlap ≥2,
+  all 50 complete; error path releases). Already-present and verified, not
+  re-built: context pool reuse (`accountContexts`/`accountPages`,
+  `maxActiveContexts` evicts idle only), `--host-resolver-rules=MAP
+  chat.qwen.ai 8.219.122.25` (chromium-args test green), closed-context pool
+  eviction (`installContextDeathHandlers` + `isPlaywrightAlreadyClosedError`
+  covers `Target page, context or browser has been closed`). The 10-minute
+  zero-occurrence run is part of item 6 (blocked, see below).
+- Item 5 (semantic retention): DONE, no ranking fix needed. 500-message
+  conversation, `FACT_7F3A9B` planted at exchange 50, query shares rare terms
+  (`config key ... note`) → BM25 retrieves it into T2 (observed `t2=2msgs`,
+  marker asserted in T1/T2). Also added: single-2M-paste last-resort trim
+  (served with `[Context truncated ...]` notice, never full-sent, never throw
+  for a servable turn) + envelope overhead reserve — 12/12 tiered tests green.
+- Item 6 (real two-session run): NOT RUN — blocked, no traffic sent. Evidence:
+  live proxy on 127.0.0.1:7936 (26 accounts, 3 ready, 2 active sticky
+  bindings) is owned by another session (TUI, PID 34372); my items 2–4 are
+  working-tree-only and NOT deployed there; forcing quota exhaustion would burn
+  a production account's full daily quota across the 26-account pool; 2×20
+  real turns risk WAF challenges on production accounts. Closest real
+  evidence: mock-stack full-HTTP e2e runs the REAL routing/failover code
+  against REAL DB accounts — raw log shows live rotation
+  (`mock -> webagencyhermes2 -> enc`) with real compressed failovers
+  (`[Session] Failover context=compressed | reason=inner-account-switch |
+  prompt=10/100000 | t1=1msgs | t2=0msgs | refs=1`). The full 2×20 + forced
+  quota procedure needs a maintenance window (deploy branch, no live traffic)
+  and an explicit quota-burn approval.
+- Item 7 (this file): status set honestly. Do not claim completion until the
+  two-session test is green.
+
+## Raw-log excerpt (mock-stack e2e, real routing + real DB accounts)
+
+Verbatim lines from `personalization-required.test.ts` e2e (forced sync failure
+→ real rotation across real DB accounts → real tiered failover assembly):
+
+```
+❌ [Chat] Request failed | mock | personalization_unavailable | personalization sync not confirmed for mock: settings response did not confirm the instruction
+🧭 [Chat] Retry policy | account=mock | reason=personalization_sync_failed | retryable=true | switch=true | newChat=true | fullPrompt=false | retryAfter=50ms
+🔄 [Chat] Switching account after personalization_sync_failed | mock -> webagencyhermes2
+[Session] Context compressed | t0=31 | t1=1msgs | t2=0msgs | t3=0 | total=62/100000
+[Session] Failover context=compressed | reason=inner-account-switch | prompt=10/100000 | t1=1msgs | t2=0msgs | refs=1
+🔄 [Chat] Retrying request | webagencyhermes2 | qwen3.6-plus | 1 msg(s) | 10 chars | attempt 2
+❌ [Chat] Request failed | webagencyhermes2 | personalization_unavailable | personalization sync not confirmed for webagencyhermes2: settings response did not confirm the instruction
+🔄 [Chat] Forcing new chat/compressed context | reason=personalization_sync_failed
+[Session] Failover context=compressed | reason=force-new-chat:personalization_sync_failed | prompt=10/100000 | t1=1msgs | t2=0msgs | refs=1
+❌ [Chat] Error | 503 personalization_unavailable | personalization sync not confirmed for webagencyhermes2: settings response did not confirm the instruction
+```
+
+And from the 10s-hold skip test (item 3 evidence, verbatim):
+
+```
+⏩ [Chat] Skipping personalization sync | account=mock | lock busy for >2000ms
+⏱️ [Chat] Acquire: sync | account=mock | +2065ms
+```
+
+(request completed in 2024ms total; zero `Mutex[personalization` strings in
+captured output; fail-loud e2e above still returns 503 with zero completions
+sent — timeout-skip and explicit-failure paths both behave as designed.)
 
 Command:
 
@@ -12,8 +99,10 @@ npx tsx --test --env-file=.env.test \
   src/tests/vector-store.test.ts src/tests/rolling-summary.test.ts \
   src/tests/tiered-context.test.ts src/tests/rebind-integration.test.ts \
   src/tests/burst-quota.test.ts src/tests/two-sessions.test.ts \
-  src/tests/health-sessions.test.ts
+  src/tests/health-sessions.test.ts src/tests/personalization-lock-skip.test.ts \
+  src/tests/personalization-deadline.test.ts src/tests/playwright-op-slot.test.ts
 ```
+Measured 2026-09-15: **55 tests, 55 pass, 0 fail**.
 
 Note: `tsc --noEmit` currently fails on a pre-existing uncommitted WIP in
 `src/services/playwright.ts:1726` (`withPlaywrightInitSlot` brace mismatch +
@@ -102,7 +191,7 @@ Exhaust A → rebind `acc-a→acc-c` (unused account, not B's), payload
 `health-sessions`: 2 sets + 1 rebind → `{size:2, activeBindings:2,
 rebindsLastHour≥1}` (measured pass ~36ms).
 
-## Acceptance (evidence)
+## Acceptance (unit/mock-level evidence — live run still pending per item 6)
 
 1. Different first messages → different accounts: `two-sessions` `pickA≠pickB` ✓
 2. 20 turns same account: `rebind-integration` 20× `get==first` ✓
