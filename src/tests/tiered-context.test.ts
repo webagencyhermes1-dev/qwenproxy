@@ -189,3 +189,94 @@ test("failover: 2M-char conversation renders under budget", () => {
   assert.ok(prompt.startsWith("System: agent"));
   assert.ok(prompt.length <= 100_000, `prompt=${prompt.length}`);
 });
+
+test("semantic retention: planted fact at message 100 survives failover", () => {
+  const MARKER = "FACT_7F3A9B: the config key is REDACTED_XYZ";
+  const topics = [
+    "database optimization with indexes",
+    "caching strategies with memoization",
+    "frontend styling with variables",
+    "authentication flow with tokens",
+    "logging setup with rotation",
+    "queue workers with retries",
+  ];
+  const messages: Message[] = [];
+  for (let i = 0; i < 250; i++) {
+    const topic = topics[i % topics.length];
+    if (i === 50) {
+      messages.push({
+        role: "user",
+        content: `Note for later ${MARKER}, store it safely. ${"n".repeat(2000)}`,
+      });
+      messages.push({ role: "assistant", content: `Stored your note. ${"o".repeat(500)}` });
+    } else {
+      messages.push({ role: "user", content: `Discuss ${topic} part ${i}. ${"x".repeat(2000)}` });
+      messages.push({ role: "assistant", content: `On ${topic}: details ${i}. ${"y".repeat(2000)}` });
+    }
+  }
+  assert.equal(messages.length, 500);
+  const currentTurn: Message = {
+    role: "user",
+    content: "Quick question: what is the config key from my earlier note?",
+  };
+  const result = assembleCompressedContext({
+    systemPrompt: "",
+    tools: [],
+    messages,
+    currentTurn,
+    rollingSummary: "",
+    tokenBudget: 100_000,
+  });
+  assert.ok(result.totalChars <= 100_000);
+  const t12 = [...result.t1, ...result.t2].map((m) => String(m.content ?? ""));
+  const refTexts = Object.values(result.refs).map((m) => String(m.content ?? ""));
+  const inT12 = t12.some((t) => t.includes(MARKER));
+  const inT3 = result.t3.includes(MARKER);
+  const inRefs = refTexts.some((t) => t.includes(MARKER));
+  assert.ok(
+    inT12 || inT3 || inRefs,
+    "planted fact must survive in T1/T2/T3 or be re-injectable via refs",
+  );
+  // Stronger: the fact must be in the scored selection itself, not just refs.
+  assert.ok(inT12, "BM25 must retrieve the planted fact into T2");
+});
+
+test("tiered: a single 2M-char paste is trimmed to budget instead of throwing", () => {
+  const giant = { role: "user", content: "x".repeat(2_000_000) } as Message;
+  const result = assembleCompressedContext({
+    systemPrompt: "System: agent",
+    tools: [],
+    messages: [giant],
+    currentTurn: giant,
+    rollingSummary: "",
+    tokenBudget: 100_000,
+  });
+  assert.ok(result.totalChars <= 100_000, `total=${result.totalChars}`);
+  assert.ok(result.payload.length <= 100_000, `payload=${result.payload.length}`);
+  const kept = result.t1[result.t1.length - 1];
+  assert.ok(kept, "the current turn must still be present");
+  assert.ok(
+    String((kept as Message).content).length < 100_000,
+    `content=${String((kept as Message).content).length}`,
+  );
+  assert.ok(
+    String((kept as Message).content).includes("[Context truncated"),
+    "the trimmed message must carry a truncation notice",
+  );
+});
+
+test("failover: single 2M-char paste is served under budget, not errored", () => {
+  const giant = { role: "user", content: "z".repeat(2_000_000) } as Message;
+  const { prompt } = buildFailoverPrompt({
+    systemPrompt: "System: agent",
+    tools: [],
+    toolInstructions: "",
+    messages: [giant],
+    currentTurn: giant,
+    rollingSummary: "",
+    tokenBudget: 100_000,
+    usePersonalization: false,
+  });
+  assert.ok(prompt.length <= 100_000, `prompt=${prompt.length}`);
+  assert.ok(prompt.includes("[Context truncated"));
+});
