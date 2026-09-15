@@ -9,7 +9,12 @@
 import type { Context } from "hono";
 import { parseRequestBody } from "./validation.ts";
 import { buildFinalContext } from "./context.ts";
-import { acquireUpstreamStream, acquireChatLock } from "./account.ts";
+import {
+  acquireUpstreamStream,
+  acquireChatLock,
+  quarantineChallengedAccountOnce,
+  createRequestRetryContext,
+} from "./account.ts";
 import {
   abortLeaseBySessionLabel,
   hasUnemittedSessionStream,
@@ -22,6 +27,7 @@ import {
 } from "./streaming.ts";
 import { config, type ChatMode } from "../../core/config.ts";
 import { logger } from "../../core/logger.ts";
+import { compressContextForFailover } from "../../services/context-compressor.ts";
 import { getContextMeterHeaders, type ContextMeterMode } from "../../services/context-meter.ts";
 import {
   getLogicalThreadState,
@@ -34,6 +40,7 @@ import {
 } from "./retry-policy.ts";
 import { classifyMediaModel } from "../../services/media-generation.ts";
 import { handleMediaChatCompletion } from "./media.ts";
+import { getStickyMap, hashToStickyKey } from "../../services/session/stickyMap.ts";
 
 
 
@@ -130,6 +137,22 @@ export async function chatCompletions(c: Context) {
     });
     mark("context", stepStartedAt);
 
+    // Loop 1 (lookup-only): observe sticky binding without changing routing.
+    // Full sticky-key + rebind logic lands in Loop 2 / Loop 8.
+    if (ctx.sessionId) {
+      try {
+        const lookupKey = hashToStickyKey(ctx.sessionId);
+        const observed = getStickyMap().get(lookupKey);
+        if (observed && logger.isLevelEnabled("info")) {
+          console.log(
+            `[Session] Lookup hit | key=${lookupKey} | account=${observed.accountId}`,
+          );
+        }
+      } catch {
+        // Observability only; never fail the request.
+      }
+    }
+
     // Chat lock is acquired AFTER stream creation (below) to avoid holding it
     // during account selection, retries, and anti-bot recovery which can take
     // 30s+. Holding it here caused 190s+ lock contention cascading to all
@@ -217,6 +240,12 @@ export async function chatCompletions(c: Context) {
       }
     }
 
+    // Create the authoritative per-request retry context shared across ALL
+    // retry layers (inner, outer, mid-stream, request-level). This is the
+    // single source of truth for which accounts have been tried and how much
+    // global retry budget remains.
+    const retryCtx = createRequestRetryContext();
+
     let streamResult = await acquireUpstreamStream({
       finalPrompt,
       fullPrompt: fullPromptForRequest,
@@ -242,6 +271,7 @@ export async function chatCompletions(c: Context) {
       messages,
       parallelEscape,
       chatMode,
+      retryContext: retryCtx,
     });
 
 
@@ -321,6 +351,7 @@ export async function chatCompletions(c: Context) {
         contextMode: initialContextMode as ContextMeterMode,
         releaseAccountLease: streamResult.releaseAccountLease,
         messages,
+        retryContext: retryCtx,
       },
       onAssistantComplete,
       onStreamComplete: () => {
@@ -337,6 +368,9 @@ export async function chatCompletions(c: Context) {
         let invalidInputSameAccountRetries = 0;
         let currentStreamResult = streamResult;
         let currentParams = params;
+        // Use the shared per-request retry context — the tried set is shared
+        // across ALL retry layers so no layer can forget a failed account.
+        retryCtx.triedAccountIds.add(streamResult.activeAccountId);
 
         while (true) {
           try {
@@ -412,10 +446,38 @@ export async function chatCompletions(c: Context) {
             const retryWithFullPrompt = policy.retryWithFullPrompt;
             const retryFiles = policy.dropFiles ? [] : files;
 
-            // Do not cooldown an account when the policy is retrying it in
-            // place (temporary load shedding). A cooldown here would make the
-            // subsequent preferred-account retry skip that same account.
-            if (
+            // Merge nested tried sets so challenged accounts stay excluded.
+            try {
+              const nested = (streamErr as Record<string, unknown>)["triedAccountIds"];
+              if (Array.isArray(nested)) {
+                for (const id of nested) if (typeof id === "string") retryCtx.triedAccountIds.add(id);
+              }
+            } catch {
+              // Best-effort.
+            }
+            retryCtx.triedAccountIds.add(currentStreamResult.activeAccountId);
+            try {
+              (streamErr as Record<string, unknown>)["triedAccountIds"] = [...retryCtx.triedAccountIds];
+            } catch {
+              // Best-effort.
+            }
+
+            if (policy.reason === "anti_bot") {
+              // Authoritative request-level failover: quarantine once via WAF
+              // isolation, never retry the challenged account for this request.
+              quarantineChallengedAccountOnce(
+                streamErr,
+                currentStreamResult.activeAccountId,
+                currentStreamResult.activeAccountLabel || currentStreamResult.activeAccountId,
+                { completionId: currentStreamResult.completionId },
+              );
+              console.warn(
+                `[Account Failover] | from=${currentStreamResult.activeAccountLabel} | reason=anti_bot | req=${reqId} | tried=[${[...retryCtx.triedAccountIds].join(",")}]`,
+              );
+            } else if (
+              // Do not cooldown an account when the policy is retrying it in
+              // place (temporary load shedding). A cooldown here would make the
+              // subsequent preferred-account retry skip that same account.
               policy.switchAccount &&
               (policy.accountCooldownMs || policy.accountCooldownReason)
             ) {
@@ -426,6 +488,26 @@ export async function chatCompletions(c: Context) {
                 policy.accountCooldownMs,
                 policy.accountCooldownReason || "StreamRetry",
               );
+              try {
+                const { recordAccountFailure } = await import(
+                  "../../core/account-health.ts"
+                );
+                const reason = policy.accountCooldownReason ?? "";
+                recordAccountFailure(
+                  currentStreamResult.activeAccountId,
+                  reason === "RateLimitTemporary"
+                    ? "rate_limit"
+                    : /quota|RateLimited/i.test(reason)
+                      ? "quota"
+                      : /waf|challenge|captcha/i.test(
+                          `${reason} ${policy.reason}`,
+                        )
+                        ? "waf"
+                        : "network",
+                );
+              } catch {
+                // Best-effort.
+              }
             }
 
             // Release current chat lock and account lease before retrying
@@ -440,7 +522,7 @@ export async function chatCompletions(c: Context) {
             const needsFullPromptOnRetry =
               retryWithFullPrompt || switchAccount || forceRetryNewChat;
             const retryFinalPrompt = needsFullPromptOnRetry
-              ? fullPromptForRequest
+              ? compressContextForFailover(fullPromptForRequest, finalPrompt).prompt
               : finalPrompt;
             const retryMessageCount = needsFullPromptOnRetry
               ? parsed.messageCount
@@ -510,7 +592,7 @@ export async function chatCompletions(c: Context) {
                 ? null
                 : currentStreamResult.activeAccountId,
               excludeAccountIds: switchAccount
-                ? [currentStreamResult.activeAccountId]
+                ? [...retryCtx.triedAccountIds]
                 : undefined,
               messageCount: retryMessageCount,
               fullMessageCount: parsed.messageCount,
@@ -522,6 +604,7 @@ export async function chatCompletions(c: Context) {
               messages,
               parallelEscape: retryParallelEscape,
               chatMode,
+              retryContext: retryCtx,
             });
 
             if ("error" in newStreamResult) {
@@ -541,6 +624,15 @@ export async function chatCompletions(c: Context) {
             console.log(
               `🔄 [Chat] Request routed | ${newStreamResult.activeAccountLabel} | ${body.model} | ${retryMessageCount} msg(s) | ${retryFinalPrompt.length} chars | chat=${newStreamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | retry | +${Date.now() - reqStartedAt}ms`,
             );
+            if (policy.reason === "anti_bot") {
+              console.warn(
+                `[Replacement Account Selected] | account=${newStreamResult.activeAccountLabel} (${newStreamResult.activeAccountId}) | reason=anti_bot | req=${reqId}`,
+              );
+              console.warn(
+                `[Retry Started] | reason=anti_bot | account=${newStreamResult.activeAccountLabel} | req=${reqId} | freshChat=true | fullContext=true`,
+              );
+            }
+            retryCtx.triedAccountIds.add(newStreamResult.activeAccountId);
 
             currentStreamResult = newStreamResult;
             currentParams = {
@@ -584,6 +676,7 @@ export async function chatCompletions(c: Context) {
                   : initialContextMode,
                 releaseAccountLease: newStreamResult.releaseAccountLease,
                 messages,
+                retryContext: retryCtx,
               },
               onAssistantComplete,
               onStreamComplete: () => {
