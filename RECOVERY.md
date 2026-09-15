@@ -177,7 +177,34 @@ Escalations and failovers re-send the entire conversation. A conversation domina
 
 ## Loop 6 — Fix ReadinessGuard Thundering Herd
 
-*(pending)*
+**Symptom from log:**
+```
+[Readiness] warming up account acc-a...
+[Readiness] warming up account acc-a...   // duplicate, same instant
+[Readiness] warming up account acc-b...
+[Readiness] warming up account acc-b...   // duplicate
+```
+A burst of cold requests each called `ensurePoolReadiness()` concurrently. There was no in-flight coalescing and no per-account warming guard, so the same standbys were warmed multiple times in parallel — doubling Chrome context launches, header captures, and cooldown/noop log spam under load.
+
+**Root cause:**
+1. `ensurePoolReadiness` ran its full pool-check for every caller; N concurrent triggers ran N parallel checks.
+2. `warmAccount` had no early exit when an account was already mid-init, so the same account could be initialized twice by overlapping checks.
+
+**Fix applied (readiness-guard.ts):**
+1. **In-flight coalescing** — `ensurePoolReadiness` now delegates to `runPoolCheck` under a single-flight guard: callers arriving while a check is running record `pendingRecheck` and return; the running check loops (do/while) until the herd has drained. One initial check + one trailing recheck replaces N.
+2. **Double-warm guard** — `warmAccount` early-returns `false` when the account is already in `warmingInProgress`, so even a recheck can never start a second init for the same account.
+3. **Validation-bucket spread** — the periodic recovered-account sweeps are bucketed (`VALIDATION_BUCKETS = 3`, `sweepBucket = floor(now / SWEEP_INTERVAL_MS) % 3` via exported `recoveredValidationBucket`), so validation work is spread across intervals instead of stampeding all recovered accounts at sweep time.
+
+**Tests verifying the fix (readiness-guard.test.ts, new):**
+- 6 concurrent `ensurePoolReadiness` triggers with 3 cold standbys coalesce to ≤ 2 sequential inits, peak in-flight ≤ 1, no account initialized twice.
+- Fully-ready pool (`markAccountHeadersReady` on all accounts) is a no-op — zero inits.
+- Single standby behind concurrent triggers inits exactly once.
+- `recoveredValidationBucket` is deterministic and spreads accounts across buckets.
+- Sweep start/stop round-trips without throwing.
+
+**Commit:** Loop 6 (`fix(readiness): coalesce readiness bursts and spread validation sweeps`)
+
+**Note:** the tree keeps the pre-existing working-set (account-pool health/state/scheduler, forge-import, `.env.example`, etc.) untouched; only the readiness-guard hardening and its tests were staged for this loop.
 
 ## Loop 7 — Integration Test: Two Concurrent Coding Sessions
 
