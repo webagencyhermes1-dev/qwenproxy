@@ -86,7 +86,12 @@ import {
 	type AccountLease,
 } from "../../core/account-concurrency.ts";
 import { isAuthMockEnabled } from "../../services/auth-playwright.ts";
-import { compressContextForFailover } from "../../services/context-compressor.ts";
+import {
+  assembleCompressedContext,
+  renderFailoverPrompt,
+} from "../../services/context/tiered.ts";
+import { getRollingSummary } from "../../services/context/summary.ts";
+import { getVectorStore } from "../../services/context/vectorStore.ts";
 import { isPlaywrightInitialized, refreshHeaders } from "../../services/playwright.ts";
 import {
 	clearAllSessionsForAccount,
@@ -110,6 +115,7 @@ import {
 } from "../../services/context-meter.ts";
 import type { QwenFileEntry } from "../upload.ts";
 import type { Message } from "../../utils/types.ts";
+import type { FunctionToolDefinition } from "../../tools/types.ts";
 import { buildRepeatedToolCallReminder } from "../../utils/tool-call-guard.ts";
 import {
 	classifyRetryAction,
@@ -310,10 +316,13 @@ export interface StreamCreationResult {
 	uiSessionId: string;
 	activeAccountId: string;
 	activeAccountLabel: string;
-	/** True when the request resent the FULL prompt on a new upstream chat
-	 * (account switch / missing thread parent). The 📤 log line uses this to
-	 * show the real payload instead of the thread-native delta. */
+	/** True when the request replayed context on a new upstream chat
+	 * (account switch / missing thread parent). The replay is the TIERED
+	 * COMPRESSED prompt (100k budget), never the raw full history. The 📤
+	 * log line uses this to show the real payload instead of the delta. */
 	replayedFullContext: boolean;
+	/** Compressed failover prompt length (chars) when replayedFullContext. */
+	failoverPromptChars: number | null;
 	completionId: string;
 	logicalSessionId: string | null;
 	createdNewChat: boolean;
@@ -374,6 +383,14 @@ export interface AcquireParams {
 	chatMode: ChatMode;
 	/** Full message history for intelligent context truncation after model sync. */
 	messages?: Message[];
+	/** Verbatim system prompt (failover envelope, no-personalization mode). */
+	systemPrompt?: string;
+	/** Verbatim tool-instruction text (failover envelope). */
+	toolInstructions?: string;
+	/** Declared function tools (tiered T0). */
+	tools?: FunctionToolDefinition[];
+	/** Sticky session key (rolling-summary lookup on failover). */
+	stickyKey?: string | null;
 	forceNewChat?: boolean;
 	/**
 	 * Prefer this account when available.
@@ -541,10 +558,57 @@ async function attemptRelogin(
 	return false;
 }
 
+/**
+ * THE real failover path (tiered Message-level compression).
+ *
+ * Replaces the old raw `finalPrompt = fullPrompt` replays (which resent up to
+ * 2M chars): tiered selection (T1 last-3 + T2 BM25 + T3 summary) rendered in
+ * the validation segment format, same envelope as the original request
+ * (system prefix verbatim when personalization is off; personalization
+ * channel otherwise). Budget 100k enforced — throws instead of full-sending.
+ */
+export function buildCompressedFailoverPrompt(args: {
+	systemPrompt?: string;
+	toolInstructions?: string;
+	tools?: FunctionToolDefinition[];
+	messages?: Message[];
+	fallbackQuery?: string;
+	stickyKey?: string | null;
+	usePersonalization?: boolean;
+	reason: string;
+}): string {
+	const messages = args.messages ?? [];
+	const currentTurn =
+		messages[messages.length - 1] ??
+		({ role: "user", content: args.fallbackQuery ?? "" } as Message);
+	// System messages are covered by the envelope/personalization — keep them
+	// out of the selection so compression cannot duplicate or drop them.
+	const nonSystem = messages.filter((m) => m.role !== "system");
+	const compressed = assembleCompressedContext({
+		systemPrompt: args.systemPrompt ?? "",
+		tools: args.tools ?? [],
+		messages: nonSystem,
+		currentTurn,
+		vectorStore: getVectorStore(),
+		sessionKey: args.stickyKey ?? undefined,
+		rollingSummary: getRollingSummary().get(args.stickyKey ?? ""),
+		tokenBudget: 100_000,
+	});
+	const prompt = renderFailoverPrompt(compressed, {
+		systemPrompt: args.systemPrompt ?? "",
+		toolInstructions: args.toolInstructions ?? "",
+		usePersonalization: args.usePersonalization ?? false,
+		budget: 100_000,
+	});
+	console.warn(
+		`[Session] Failover context=compressed | reason=${args.reason} | prompt=${prompt.length}/100000 | t1=${compressed.t1.length}msgs | t2=${compressed.t2.length}msgs | refs=${Object.keys(compressed.refs).length}`,
+	);
+	return prompt;
+}
+
 export async function acquireUpstreamStream(
 	params: AcquireParams,
-): Promise<StreamCreationResult | StreamCreationFailure> {
-	const {
+): Promise<StreamCreationResult | StreamCreationFailure> {	const {
 		finalPrompt,
 		isThinkingModel,
 		model,
@@ -700,7 +764,7 @@ export async function acquireUpstreamStream(
 			);
 			if (stickyThreadAccountId === accountId) {
 				console.warn(
-					`⚠️  [Chat] Sticky account is on cooldown; recreating upstream chat on another account with full context.`,
+					`⚠️  [Chat] Sticky account is on cooldown; recreating upstream chat on another account with compressed context.`,
 				);
 			}
 			account = getNextAvailableAccount(triedAccountIds);
@@ -737,14 +801,25 @@ export async function acquireUpstreamStream(
 			// brand-new upstream chat — the previous account's parent chain is unusable.
 			// Same-account forceNewChat keeps the caller's finalPrompt (may already be
 			// a rollover summary or a full-history rebuild from the retry layer).
-			const recreatingOnNewAccount =
-				!!stickyThreadAccountId && accountId !== stickyThreadAccountId;
-			const mustReplayFullContext =
-				recreatingOnNewAccount || threadMissingParent;
-			const attemptForceNewChat = forceNewChat || mustReplayFullContext;
-			const attemptFinalPrompt = mustReplayFullContext
-				? compressContextForFailover(params.fullPrompt, finalPrompt).prompt
-				: finalPrompt;
+		const recreatingOnNewAccount =
+			!!stickyThreadAccountId && accountId !== stickyThreadAccountId;
+		const mustReplayFullContext =
+			recreatingOnNewAccount || threadMissingParent;
+		const attemptForceNewChat = forceNewChat || mustReplayFullContext;
+		// Failover onto a new upstream chat: tiered compressed context
+		// (T1+T2+T3, 100k budget) — never the raw 2M-char full replay.
+		const attemptFinalPrompt = mustReplayFullContext
+			? buildCompressedFailoverPrompt({
+					systemPrompt: params.systemPrompt,
+					toolInstructions: params.toolInstructions,
+					tools: params.tools,
+					messages: params.messages,
+					fallbackQuery: finalPrompt,
+					stickyKey: params.stickyKey,
+					usePersonalization: params.requestPersonalizationInstruction != null,
+					reason: recreatingOnNewAccount ? "sticky-failover" : "missing-parent",
+				})
+			: finalPrompt;
 			// The thread owner (or a deployment where no alternate account is
 			// free) must queue on its own slot until generation finishes. A hard
 			// 30s busy timeout here would needlessly 500 the same conversation
@@ -786,10 +861,14 @@ export async function acquireUpstreamStream(
 					contextMode: mustReplayFullContext
 						? "replay"
 						: params.contextMode,
-					requestSignal: params.requestSignal,
-					queueSlotUntilFree: waitForSlot,
-					messages: params.messages,
-					completionId,
+				requestSignal: params.requestSignal,
+				queueSlotUntilFree: waitForSlot,
+				messages: params.messages,
+				systemPrompt: params.systemPrompt,
+				toolInstructions: params.toolInstructions,
+				tools: params.tools,
+				stickyKey: params.stickyKey,
+				completionId,
 					parallelEscape: params.parallelEscape,
 					chatMode,
 				},
@@ -811,13 +890,14 @@ export async function acquireUpstreamStream(
 						`[Retry Succeeded] | account=${maskEmail(result.accountEmail)} (${result.accountId}) | afterFailover=true | tried=[${[...triedAccountIds].join(",")}]`,
 					);
 				}
-				return {
-					stream: result.stream,
-					uiSessionId: result.uiSessionId,
-					activeAccountId: result.accountId,
-					activeAccountLabel: result.accountEmail,
-					replayedFullContext: mustReplayFullContext,
-					completionId,
+			return {
+				stream: result.stream,
+				uiSessionId: result.uiSessionId,
+				activeAccountId: result.accountId,
+				activeAccountLabel: result.accountEmail,
+				replayedFullContext: mustReplayFullContext,
+				failoverPromptChars: mustReplayFullContext ? attemptFinalPrompt.length : null,
+				completionId,
 					logicalSessionId:
 						useThreadNative && updateLogicalThread ? sessionId : null,
 					createdNewChat: result.createdNewChat,
@@ -876,7 +956,7 @@ export async function acquireUpstreamStream(
 					isAccountInitializationError(lastError) ||
 					isChatInProgressError(lastError));
 			console.warn(
-				`⚠️  [Chat] Quota exceeded | ${quotaInfo.email} | cooldown=${quotaInfo.cooldownSeconds}s${quotaInfo.untilStr} | ${quotaInfo.message}${stickyRotation ? " | switching sticky account with full context" : ""}`,
+				`⚠️  [Chat] Quota exceeded | ${quotaInfo.email} | cooldown=${quotaInfo.cooldownSeconds}s${quotaInfo.untilStr} | ${quotaInfo.message}${stickyRotation ? " | switching sticky account with compressed context" : ""}`,
 			);
 		}
 
@@ -906,7 +986,7 @@ export async function acquireUpstreamStream(
 			if (stickyAccountMustRotate) {
 				if (!quotaInfo) {
 					console.warn(
-						`⚠️  [Chat] Sticky account unavailable (${isAntiBotError(lastError) ? "waf_challenge" : "upstream failure"}); trying another account with full context.`,
+						`⚠️  [Chat] Sticky account unavailable (${isAntiBotError(lastError) ? "waf_challenge" : "upstream failure"}); trying another account with compressed context.`,
 					);
 				}
 				// Clear the dead parent binding so the NEXT request on this session
@@ -1128,6 +1208,10 @@ async function tryCreateStreamWithRetry(
 		requestSignal?: AbortSignal;
 		queueSlotUntilFree?: boolean;
 		messages?: Message[];
+		systemPrompt?: string;
+		toolInstructions?: string;
+		tools?: FunctionToolDefinition[];
+		stickyKey?: string | null;
 		/** Stream registry key; the emit-aware supersede links the lease to it. */
 		completionId: string;
 		/**
@@ -1943,17 +2027,26 @@ async function tryCreateStreamWithRetry(
 					// with the full context (the only way to progress while the
 					// old chat runs on server-side). Bounded: this fires at most
 					// once per request.
-					chatInProgressEscalated = true;
-					console.warn(
-						`🔄 [Chat] chat_in_progress escalation (${chatInProgressCount}) | forcing a new chat with full context on ${currentAccountEmail}`,
-					);
-					if (params.useThreadNative) {
-						params.existingThread = null;
-						params.finalPrompt = params.fullPrompt;
-						params.messageCount =
-							params.fullMessageCount ?? params.messageCount;
-						params.forceNewChat = true;
-					}
+				chatInProgressEscalated = true;
+				console.warn(
+					`🔄 [Chat] chat_in_progress escalation (${chatInProgressCount}) | forcing a new chat with compressed context on ${currentAccountEmail}`,
+				);
+				if (params.useThreadNative) {
+					params.existingThread = null;
+					params.finalPrompt = buildCompressedFailoverPrompt({
+						systemPrompt: params.systemPrompt,
+						toolInstructions: params.toolInstructions,
+						tools: params.tools,
+						messages: params.messages,
+						fallbackQuery: params.finalPrompt,
+						stickyKey: params.stickyKey,
+						usePersonalization: params.requestPersonalizationInstruction != null,
+						reason: "in-progress-escalation",
+					});
+					params.messageCount =
+						params.fullMessageCount ?? params.messageCount;
+					params.forceNewChat = true;
+				}
 					// The escalation targets a FRESH chat (not the busy one), so
 					// no settle wait — it gets its own attempt budget.
 					attemptsLeft = Math.max(attemptsLeft, 1);
@@ -2052,15 +2145,25 @@ async function tryCreateStreamWithRetry(
 				currentAccountEmail = maskEmail(nextAccount.email);
 				accountSwitches++;
 
-				// Account switch always rebuilds a fresh upstream chat with full history.
-				// Do NOT persist sticky binding until create succeeds — premature empty
-				// chatSessionId writes make subsequent turns rotate/lose context.
-				if (params.useThreadNative) {
-					params.existingThread = null;
-					params.finalPrompt = params.fullPrompt;
-					params.messageCount = params.fullMessageCount ?? params.messageCount;
-					params.forceNewChat = true;
-				}
+			// Account switch always rebuilds a fresh upstream chat with COMPRESSED
+			// history (tiered T1+T2+T3, 100k budget — never the raw full replay).
+			// Do NOT persist sticky binding until create succeeds — premature empty
+			// chatSessionId writes make subsequent turns rotate/lose context.
+			if (params.useThreadNative) {
+				params.existingThread = null;
+				params.finalPrompt = buildCompressedFailoverPrompt({
+					systemPrompt: params.systemPrompt,
+					toolInstructions: params.toolInstructions,
+					tools: params.tools,
+					messages: params.messages,
+					fallbackQuery: params.finalPrompt,
+					stickyKey: params.stickyKey,
+					usePersonalization: params.requestPersonalizationInstruction != null,
+					reason: "inner-account-switch",
+				});
+				params.messageCount = params.fullMessageCount ?? params.messageCount;
+				params.forceNewChat = true;
+			}
 
 				await new Promise((resolve) =>
 					setTimeout(
@@ -2082,13 +2185,22 @@ async function tryCreateStreamWithRetry(
 			(policy.forceNewChat || policy.retryWithFullPrompt) &&
 			params.useThreadNative
 		) {
-			console.warn(
-				`🔄 [Chat] Forcing new chat/full context | reason=${policy.reason}`,
-			);
-			params.existingThread = null;
-			params.finalPrompt = params.fullPrompt;
-			params.messageCount = params.fullMessageCount ?? params.messageCount;
-			params.forceNewChat = true;
+		console.warn(
+			`🔄 [Chat] Forcing new chat/compressed context | reason=${policy.reason}`,
+		);
+		params.existingThread = null;
+		params.finalPrompt = buildCompressedFailoverPrompt({
+			systemPrompt: params.systemPrompt,
+			toolInstructions: params.toolInstructions,
+			tools: params.tools,
+			messages: params.messages,
+			fallbackQuery: params.finalPrompt,
+			stickyKey: params.stickyKey,
+			usePersonalization: params.requestPersonalizationInstruction != null,
+			reason: `force-new-chat:${policy.reason}`,
+		});
+		params.messageCount = params.fullMessageCount ?? params.messageCount;
+		params.forceNewChat = true;
 		}
 
 		// Drop files on retry for invalid_input to isolate file-related errors

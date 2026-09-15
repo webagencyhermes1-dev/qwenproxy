@@ -12,6 +12,7 @@ import { buildFinalContext } from "./context.ts";
 import {
   acquireUpstreamStream,
   acquireChatLock,
+  buildCompressedFailoverPrompt,
   quarantineChallengedAccountOnce,
   createRequestRetryContext,
 } from "./account.ts";
@@ -27,7 +28,6 @@ import {
 } from "./streaming.ts";
 import { config, type ChatMode } from "../../core/config.ts";
 import { logger } from "../../core/logger.ts";
-import { compressContextForFailover } from "../../services/context-compressor.ts";
 import { getContextMeterHeaders, type ContextMeterMode } from "../../services/context-meter.ts";
 import {
   getLogicalThreadState,
@@ -310,6 +310,10 @@ export async function chatCompletions(c: Context) {
       contextMode: initialContextMode,
       requestSignal: c.req.raw.signal,
       messages,
+      systemPrompt,
+      toolInstructions,
+      tools: declaredTools,
+      stickyKey,
       parallelEscape,
       chatMode,
       retryContext: retryCtx,
@@ -418,12 +422,17 @@ export async function chatCompletions(c: Context) {
       c.header(name, value);
     }
 
-    // A full-context replay (account switch / missing thread parent) hides its
+    // A failover replay (account switch / missing thread parent) hides its
     // real cost behind the thread-native delta numbers: surface it explicitly
-    // so the 📤 line shows what was actually sent upstream.
+    // so the 📤 line shows what was actually sent upstream (tiered compressed
+    // context, 100k budget — never the raw full history).
     const replayed = streamResult.replayedFullContext === true;
+    const replayedChars =
+      replayed && typeof streamResult.failoverPromptChars === "number"
+        ? streamResult.failoverPromptChars
+        : fullPromptForRequest.length;
     console.log(
-      `📤 [${routeLabel}] Request | req=${reqId} | ${streamResult.activeAccountLabel} | ${body.model} | ${replayed ? parsed.messageCount : msgCount} msg(s) | ${replayed ? fullPromptForRequest.length : finalPrompt.length} chars${replayed ? " | full-replay" : ""} | chat=${streamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | +${Date.now() - reqStartedAt}ms`,
+      `📤 [${routeLabel}] Request | req=${reqId} | ${streamResult.activeAccountLabel} | ${body.model} | ${replayed ? parsed.messageCount : msgCount} msg(s) | ${replayed ? replayedChars : finalPrompt.length} chars${replayed ? " | context=compressed" : ""} | chat=${streamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | +${Date.now() - reqStartedAt}ms`,
     );
 
     const onAssistantComplete: ((event: AssistantCompleteEvent) => Promise<void> | void) | undefined = undefined;
@@ -469,6 +478,10 @@ export async function chatCompletions(c: Context) {
         contextMode: initialContextMode as ContextMeterMode,
         releaseAccountLease: streamResult.releaseAccountLease,
         messages,
+        systemPrompt,
+        toolInstructions,
+        tools: declaredTools,
+        stickyKey,
         retryContext: retryCtx,
       },
       onAssistantComplete,
@@ -665,12 +678,22 @@ export async function chatCompletions(c: Context) {
             }
             currentStreamResult.releaseAccountLease();
 
-            // Account switch always rebuilds full history; same-account retry
-            // only does so when the policy asks for forceNewChat/full prompt.
+            // Account switch always rebuilds compressed history (tiered T1+T2+T3);
+            // same-account retry only does so when the policy asks for
+            // forceNewChat/full prompt.
             const needsFullPromptOnRetry =
               retryWithFullPrompt || switchAccount || forceRetryNewChat;
             const retryFinalPrompt = needsFullPromptOnRetry
-              ? compressContextForFailover(fullPromptForRequest, finalPrompt).prompt
+              ? buildCompressedFailoverPrompt({
+                  systemPrompt,
+                  toolInstructions,
+                  tools: declaredTools,
+                  messages,
+                  fallbackQuery: finalPrompt,
+                  stickyKey,
+                  usePersonalization: ctx.requestPersonalizationInstruction != null,
+                  reason: `request-retry:${policy.reason}`,
+                })
               : finalPrompt;
             const retryMessageCount = needsFullPromptOnRetry
               ? parsed.messageCount
@@ -678,7 +701,7 @@ export async function chatCompletions(c: Context) {
 
             if (forceRetryNewChat || switchAccount) {
               console.warn(
-                `[Chat] Retry will force a new upstream chat and resend full context | ${streamErr.message?.substring(0, 150)}`,
+                `[Chat] Retry will force a new upstream chat and resend compressed context | ${streamErr.message?.substring(0, 150)}`,
               );
             }
             if (switchAccount) {
@@ -750,6 +773,10 @@ export async function chatCompletions(c: Context) {
               contextMode: needsFullPromptOnRetry ? "replay" : initialContextMode,
               requestSignal: c.req.raw.signal,
               messages,
+              systemPrompt,
+              toolInstructions,
+              tools: declaredTools,
+              stickyKey,
               parallelEscape: retryParallelEscape,
               chatMode,
               retryContext: retryCtx,
@@ -770,14 +797,14 @@ export async function chatCompletions(c: Context) {
             }
 
             console.log(
-              `🔄 [Chat] Request routed | ${newStreamResult.activeAccountLabel} | ${body.model} | ${retryMessageCount} msg(s) | ${retryFinalPrompt.length} chars | chat=${newStreamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | retry | +${Date.now() - reqStartedAt}ms`,
+              `🔄 [Chat] Request routed | ${newStreamResult.activeAccountLabel} | ${body.model} | ${retryMessageCount} msg(s) | ${retryFinalPrompt.length} chars${needsFullPromptOnRetry ? " | context=compressed" : ""} | chat=${newStreamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | retry | +${Date.now() - reqStartedAt}ms`,
             );
             if (policy.reason === "anti_bot") {
               console.warn(
                 `[Replacement Account Selected] | account=${newStreamResult.activeAccountLabel} (${newStreamResult.activeAccountId}) | reason=anti_bot | req=${reqId}`,
               );
               console.warn(
-                `[Retry Started] | reason=anti_bot | account=${newStreamResult.activeAccountLabel} | req=${reqId} | freshChat=true | fullContext=true`,
+                `[Retry Started] | reason=anti_bot | account=${newStreamResult.activeAccountLabel} | req=${reqId} | freshChat=true | compressedContext=true`,
               );
             }
             retryCtx.triedAccountIds.add(newStreamResult.activeAccountId);
@@ -850,6 +877,10 @@ export async function chatCompletions(c: Context) {
                   : initialContextMode,
                 releaseAccountLease: newStreamResult.releaseAccountLease,
                 messages,
+                systemPrompt,
+                toolInstructions,
+                tools: declaredTools,
+                stickyKey,
                 retryContext: retryCtx,
               },
               onAssistantComplete,

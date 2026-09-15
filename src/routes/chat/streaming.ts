@@ -17,8 +17,9 @@ import {
   RetryableQwenStreamError,
   setToolCapNotice,
 } from "../../services/qwen.ts";
-import { acquireUpstreamStream } from "./account.ts";
-import { markAccountRateLimited } from "../../core/account-manager.ts";
+import { acquireUpstreamStream, quarantineChallengedAccountOnce } from "./account.ts";
+import { getAccountCooldownInfo, markAccountRateLimited } from "../../core/account-manager.ts";
+import { recordAccountFailure, recordAccountTtfb } from "../../core/account-health.ts";
 import {
   clearTemporaryBusy,
   markAccountTemporarilyBusy,
@@ -40,6 +41,7 @@ import {
   updateStreamTargetResponseId,
 } from "../../core/stream-registry.ts";
 import { metrics } from "../../core/metrics.js";
+import { performanceMetrics } from "../../core/performance-metrics.ts";
 import {
   logger,
   isToolcallDebugEnabled,
@@ -213,8 +215,16 @@ export interface StreamProcessingParams {
     contextMode?: ContextMeterMode;
     releaseAccountLease: () => void;
     messages?: Message[];
+    /** Verbatim system prompt / tool instructions / tools for failover envelope. */
+    systemPrompt?: string;
+    toolInstructions?: string;
+    tools?: any[];
+    /** Sticky session key for rolling-summary lookup on failover. */
+    stickyKey?: string | null;
     /** How many malformed-tool-call auto-retries have already run (0-based). */
     malformedRetryCount?: number;
+    /** Authoritative per-request retry state shared across all retry layers. */
+    retryContext?: import("./account.ts").RequestRetryContext;
   };
   onAssistantComplete?: AssistantCompleteHandler;
   onStreamComplete?: () => void;
@@ -261,6 +271,7 @@ export async function processNonStreamingResponse(
   } = params;
   const reqId = params.reqId ?? completionId.substring(0, 8);
   const streamStartedAt = Date.now();
+  let firstChunkAt: number | null = null;
   let currentTokenEstimationContext = tokenEstimationContext;
 
   try {
@@ -389,6 +400,9 @@ export async function processNonStreamingResponse(
 
         try {
                   const chunk = JSON.parse(dataStr);
+                  if (firstChunkAt === null) {
+                    firstChunkAt = Date.now();
+                  }
                   rememberSession(extractChatSessionId(chunk));
 
                   // Generic upstream SSE error handling (retry/switch via policy)
@@ -626,14 +640,19 @@ export async function processNonStreamingResponse(
       }
       midStreamRetry.releaseAccountLease();
 
-      // Acquire new stream for retry - keep same account, force new chat
+      // Tool call repair: send a SHORT repair prompt on the SAME thread instead
+      // of replaying the full 2M+ context. The upstream chat already has the
+      // conversation history via parent_id, so we only need the correction.
+      const repairPrompt = `[SYSTEM CORRECTION]\n${errorMessage}\n\nPlease retry your tool call(s) with correct JSON and valid tool names from the available tools list above.`;
+
+      // Acquire new stream for retry - keep same account, reuse thread (no full replay)
       const newStreamResult = await acquireUpstreamStream({
-        finalPrompt: retryPrompt,
+        finalPrompt: repairPrompt,
         fullPrompt: retryPrompt,
         isThinkingModel: midStreamRetry.isThinkingModel,
         model: body.model,
         reasoningMode: midStreamRetry.reasoningMode,
-        shouldResetUpstreamThread: true,
+        shouldResetUpstreamThread: false,
         allFiles: midStreamRetry.allFiles,
         isNewSession: midStreamRetry.isNewSession,
         sessionId: midStreamRetry.sessionId,
@@ -642,16 +661,20 @@ export async function processNonStreamingResponse(
         parallelEscape: midStreamRetry.parallelEscape,
         allowThreadReuse: midStreamRetry.allowThreadReuse,
         chatMode: midStreamRetry.chatMode,
-        forceNewChat: true,
+        forceNewChat: false,
         preferredAccountId: midStreamRetry.activeAccountId,
         excludeAccountIds: undefined,
         messageCount: midStreamRetry.messageCount,
         fullMessageCount: midStreamRetry.fullMessageCount,
         toolsCount: midStreamRetry.toolsCount,
         requestPersonalizationInstruction: midStreamRetry.requestPersonalizationInstruction,
-        contextMode: "replay",
+        contextMode: "delta",
         requestSignal: c.req.raw.signal,
         messages: midStreamRetry.messages,
+        systemPrompt: midStreamRetry.systemPrompt,
+        toolInstructions: midStreamRetry.toolInstructions,
+        tools: midStreamRetry.tools,
+        stickyKey: midStreamRetry.stickyKey,
       });
 
       if ("error" in newStreamResult) {
@@ -761,6 +784,15 @@ export async function processNonStreamingResponse(
       usage,
       mode: "non-stream",
       context: currentTokenEstimationContext,
+    });
+
+    performanceMetrics.recordRequest({
+      timestamp: Date.now(),
+      durationMs: Date.now() - streamStartedAt,
+      ttfbMs: Date.now() - streamStartedAt,
+      promptTokens: usage.prompt_tokens ?? 0,
+      completionTokens: usage.completion_tokens ?? 0,
+      totalTokens: usage.total_tokens ?? 0,
     });
 
     // The response was fully processed: persist the next-turn parent.
@@ -1133,6 +1165,11 @@ export async function processStreamingResponse(
               `⏱️ [Chat] First chunk | req=${reqId} | +${firstChunkAt - streamStartedAt}ms`,
             );
           }
+          if (activeAccountId) {
+            try {
+              recordAccountTtfb(activeAccountId, firstChunkAt - streamStartedAt);
+            } catch {}
+          }
         }
         lastDeltaAt = now;
         const serialized =
@@ -1345,6 +1382,23 @@ export async function processStreamingResponse(
                 )
               : null;
 
+        // Post-output challenges must never duplicate already-emitted
+        // assistant content. Quarantine the challenged account for FUTURE
+        // routing, but do not fail over THIS committed response.
+        if (emittedModelOutput && normalizedError) {
+          const probePolicy = classifyRetryAction(normalizedError, {
+            requestAborted: c.req.raw.signal.aborted,
+          });
+          if (probePolicy.reason === "anti_bot") {
+            quarantineChallengedAccountOnce(
+              normalizedError,
+              currentAccountId,
+              retryContext.activeAccountLabel || currentAccountId,
+              { completionId },
+            );
+          }
+        }
+
         if (
           !normalizedError ||
           (clientDisconnected && !gracePending) ||
@@ -1412,7 +1466,32 @@ export async function processStreamingResponse(
         const switchAccount =
           policy.switchAccount && !retryInvalidInputOnSameAccount;
 
-        if (
+        if (policy.reason === "anti_bot") {
+          // Authoritative mid-stream failover: quarantine once via WAF
+          // isolation (escalating + fingerprint, persisted), never retry the
+          // challenged account for this request. The fresh stream below
+          // excludes it and replays full context on a new chat.
+          quarantineChallengedAccountOnce(
+            normalizedError,
+            currentAccountId,
+            retryContext.activeAccountLabel || currentAccountId,
+            { completionId },
+          );
+          try {
+            const rec = normalizedError as unknown as Record<string, unknown>;
+            const tried = rec["triedAccountIds"];
+            if (!Array.isArray(tried)) {
+              rec["triedAccountIds"] = [currentAccountId];
+            } else if (!(tried as unknown[]).includes(currentAccountId)) {
+              (tried as unknown[]).push(currentAccountId);
+            }
+          } catch {
+            // Best-effort.
+          }
+          console.warn(
+            `[Account Failover] | from=${currentAccountId} | reason=anti_bot | streamRecovery=true`,
+          );
+        } else if (
           switchAccount &&
           (policy.accountCooldownMs || policy.accountCooldownReason)
         ) {
@@ -1421,6 +1500,25 @@ export async function processStreamingResponse(
             policy.accountCooldownMs,
             policy.accountCooldownReason || "StreamRetry",
           );
+          // Pool 2.0: mid-stream failover also debits health (switch implies
+          // retryable upstream failure — terminal errors never switch).
+          try {
+            const reason = policy.accountCooldownReason ?? "";
+            recordAccountFailure(
+              currentAccountId,
+              reason === "RateLimitTemporary"
+                ? "rate_limit"
+                : /quota|RateLimited/i.test(reason)
+                  ? "quota"
+                  : /waf|challenge|captcha/i.test(
+                        `${reason} ${policy.reason}`,
+                      )
+                    ? "waf"
+                    : "network",
+            );
+          } catch {
+            // Best-effort.
+          }
         }
 
         retryContext.releaseAccountLease?.();
@@ -1437,6 +1535,25 @@ export async function processStreamingResponse(
         const forceRetryNewChat = policy.forceNewChat;
         const needsFullPrompt =
           policy.retryWithFullPrompt || switchAccount || forceRetryNewChat;
+        // Exclude every account already tried for THIS request (challenged
+        // accounts must never be re-selected, even if cooldown allows it).
+        // Use the shared retry context when available for the authoritative set.
+        const sharedRetryCtx = midStreamRetry.retryContext;
+        let streamExclude: string[] | undefined;
+        if (switchAccount) {
+          if (sharedRetryCtx) {
+            sharedRetryCtx.triedAccountIds.add(currentAccountId);
+            streamExclude = [...sharedRetryCtx.triedAccountIds];
+          } else {
+            const rec = normalizedError as unknown as Record<string, unknown>;
+            const tried = rec["triedAccountIds"];
+            const base = Array.isArray(tried)
+              ? (tried as unknown[]).filter((v): v is string => typeof v === "string")
+              : [];
+            if (!base.includes(currentAccountId)) base.push(currentAccountId);
+            streamExclude = base;
+          }
+        }
         const newStreamResult = await acquireUpstreamStream({
           finalPrompt: needsFullPrompt
             ? midStreamRetry.fullPrompt
@@ -1456,7 +1573,7 @@ export async function processStreamingResponse(
           chatMode: midStreamRetry.chatMode,
           forceNewChat: forceRetryNewChat || switchAccount,
           preferredAccountId: switchAccount ? null : currentAccountId,
-          excludeAccountIds: switchAccount ? [currentAccountId] : undefined,
+          excludeAccountIds: streamExclude,
           messageCount: needsFullPrompt
             ? midStreamRetry.fullMessageCount
             : midStreamRetry.messageCount,
@@ -1470,6 +1587,11 @@ export async function processStreamingResponse(
           requestSignal: c.req.raw.signal,
           allowTemporarilyBusyAccountId: currentAccountId,
           messages: midStreamRetry.messages,
+          systemPrompt: midStreamRetry.systemPrompt,
+          toolInstructions: midStreamRetry.toolInstructions,
+          tools: midStreamRetry.tools,
+          stickyKey: midStreamRetry.stickyKey,
+          retryContext: sharedRetryCtx,
         });
 
         if ("error" in newStreamResult) {
@@ -2042,13 +2164,18 @@ export async function processStreamingResponse(
           }
           midStreamRetry.releaseAccountLease();
 
+          // Tool call repair: send a SHORT repair prompt on the SAME thread
+          // instead of replaying the full 2M+ context. The upstream chat
+          // already has the conversation history via parent_id.
+          const repairPrompt = `[SYSTEM CORRECTION]\n${errorMessage}\n\nPlease retry your tool call(s) with correct JSON and valid tool names from the available tools list above.`;
+
           const newStreamResult = await acquireUpstreamStream({
-            finalPrompt: retryPrompt,
+            finalPrompt: repairPrompt,
             fullPrompt: retryPrompt,
             isThinkingModel: midStreamRetry.isThinkingModel,
             model: body.model,
             reasoningMode: midStreamRetry.reasoningMode,
-            shouldResetUpstreamThread: true,
+            shouldResetUpstreamThread: false,
             allFiles: midStreamRetry.allFiles,
             isNewSession: midStreamRetry.isNewSession,
             sessionId: midStreamRetry.sessionId,
@@ -2057,7 +2184,7 @@ export async function processStreamingResponse(
             parallelEscape: midStreamRetry.parallelEscape,
             allowThreadReuse: midStreamRetry.allowThreadReuse,
             chatMode: midStreamRetry.chatMode,
-            forceNewChat: true,
+            forceNewChat: false,
             preferredAccountId: midStreamRetry.activeAccountId,
             excludeAccountIds: undefined,
             messageCount: midStreamRetry.messageCount,
@@ -2065,9 +2192,13 @@ export async function processStreamingResponse(
             toolsCount: midStreamRetry.toolsCount,
             requestPersonalizationInstruction:
               midStreamRetry.requestPersonalizationInstruction,
-            contextMode: "replay",
+            contextMode: "delta",
             requestSignal: c.req.raw.signal,
             messages: midStreamRetry.messages,
+            systemPrompt: midStreamRetry.systemPrompt,
+            toolInstructions: midStreamRetry.toolInstructions,
+            tools: midStreamRetry.tools,
+            stickyKey: midStreamRetry.stickyKey,
           });
 
           if ("error" in newStreamResult) {
@@ -2485,6 +2616,15 @@ export async function processStreamingResponse(
           mode: "stream",
           context: currentTokenEstimationContext,
         });
+
+        performanceMetrics.recordRequest({
+          timestamp: Date.now(),
+          durationMs: Date.now() - streamStartedAt,
+          ttfbMs: firstChunkAt ? firstChunkAt - streamStartedAt : Date.now() - streamStartedAt,
+          promptTokens: (usage as any).input_tokens ?? usage.prompt_tokens ?? 0,
+          completionTokens: (usage as any).output_tokens ?? usage.completion_tokens ?? 0,
+          totalTokens: usage.total_tokens ?? 0,
+        });
       } else {
         if (isToolcallDebugEnabled()) {
           logger.debug(
@@ -2629,8 +2769,17 @@ export async function processStreamingResponse(
 
     // The HTTP response is already committed at this point. Emit a terminal
     // OpenAI-compatible SSE error instead of silently closing the connection.
+    // Include a finish_reason chunk so clients can distinguish error termination
+    // from normal completion, followed by the error event and [DONE].
     try {
       await errorStream.write(
+        `data: ${JSON.stringify({
+          id: completionId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: body.model,
+          choices: [{ index: 0, delta: {}, finish_reason: "error" }],
+        })}\n\n` +
         `data: ${JSON.stringify({
           error: {
             message: err.message,

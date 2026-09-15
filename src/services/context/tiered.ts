@@ -19,6 +19,7 @@
 
 import type { Message } from "../../utils/types.ts";
 import type { FunctionToolDefinition } from "../../tools/types.ts";
+import { TOOL_CALL_OPEN, TOOL_CALL_CLOSE } from "../../tools/toolcall-tags.ts";
 import { tokenize } from "../context-compressor.ts";
 import type { VectorStore } from "./vectorStore.ts";
 
@@ -56,7 +57,7 @@ function textOf(m: Message): string {
     return (c as Array<{ type?: string; text?: string }>)
       .filter((p) => p?.type === "text")
       .map((p) => p.text || "")
-      .join(" ");
+      .join("\n");
   }
   if (c && typeof c === "object") {
     try {
@@ -66,6 +67,63 @@ function textOf(m: Message): string {
     }
   }
   return "";
+}
+
+/**
+ * Render messages in the exact segment format the upstream Qwen renderer
+ * expects (mirrors validation.ts buildPromptFromMessages):
+ * `User:`, `Assistant:` (+ reasoning + tool-call tags), `Tool Response (name):`.
+ * System messages are skipped here — system rides the personalization channel
+ * (or the verbatim envelope prefix in no-personalization mode), never the
+ * selection, so it cannot be duplicated or dropped by compression.
+ */
+export function renderMessagesToPrompt(messages: Message[]): string {
+  const toolCallNamesById = new Map<string, string>();
+  for (const msg of messages) {
+    if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
+        if (tc.id && tc.function?.name) toolCallNamesById.set(tc.id, tc.function.name);
+      }
+    }
+  }
+  const parts: string[] = [];
+  for (const msg of messages) {
+    const contentStr = textOf(msg);
+    if (msg.role === "system") continue;
+    if (msg.role === "user") {
+      parts.push(`User: ${contentStr || ""}\n\n`);
+    } else if (msg.role === "assistant") {
+      const chunks: string[] = [];
+      const reasoning = (msg as Message).reasoning_content;
+      if (reasoning) chunks.push(reasoning + "\n");
+      if (contentStr) chunks.push(contentStr);
+      if (Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          let parsedArgs: unknown = {};
+          const rawArgs = tc.function?.arguments;
+          if (typeof rawArgs === "string") {
+            try {
+              parsedArgs = JSON.parse(rawArgs);
+            } catch {
+              parsedArgs = { _raw: rawArgs };
+            }
+          } else if (rawArgs && typeof rawArgs === "object") {
+            parsedArgs = rawArgs;
+          }
+          const payload = { name: tc.function?.name, arguments: parsedArgs };
+          const tag = `\n${TOOL_CALL_OPEN}\n${JSON.stringify(payload)}\n${TOOL_CALL_CLOSE}`;
+          chunks.push(chunks.length > 0 ? tag : tag.trim());
+        }
+      }
+      parts.push(`Assistant: ${chunks.join("").trim()}\n\n`);
+    } else if (msg.role === "tool" || msg.role === "function") {
+      const toolName =
+        msg.name ||
+        (msg.tool_call_id ? toolCallNamesById.get(msg.tool_call_id) : undefined);
+      parts.push(`Tool Response (${toolName || "tool"}): ${contentStr || ""}\n\n`);
+    }
+  }
+  return parts.join("");
 }
 
 function serialize(m: Message): string {
@@ -223,4 +281,77 @@ export function assembleCompressedContext(input: ContextInput): CompressedContex
   );
 
   return { t0, t1, t2, t3: curT3, refs, payload, totalChars: total };
+}
+
+export interface FailoverPromptInput extends ContextInput {
+  /** Verbatim tool-instruction text (prompt envelope, no-personalization mode). */
+  toolInstructions: string;
+  /**
+   * True when agent instructions ride the account-level personalization channel
+   * (re-synced on the new account before the completion). Then system/tools
+   * stay out of the prompt; otherwise they prefix it verbatim.
+   */
+  usePersonalization: boolean;
+}
+
+export interface FailoverPromptResult {
+  /** Upstream-ready prompt string in validation segment format. Never > budget. */
+  prompt: string;
+  compressed: CompressedContext;
+}
+
+/**
+ * THE real failover path: tiered Message-level selection rendered into the
+ * same envelope the original full prompt used, so the upstream renderer sees
+ * a familiar shape at a fraction of the chars.
+ *
+ * - Personalization mode: `[T3 section, T2+T1 rendered]` (system rides the
+ *   re-synced personalization channel, byte-identical instruction string).
+ * - No-personalization mode: `[systemPrompt, toolInstructions, T3, rendered]`
+ *   with the system prefix verbatim (T0 byte-identical).
+ * - Tool call/result pairs survive via whole-group selection + faithful tags.
+ * - Over budget after selection → throw (caller must error, never full-send).
+ */
+export function buildFailoverPrompt(input: FailoverPromptInput): FailoverPromptResult {
+  const budget = input.tokenBudget ?? TIERED_DEFAULT_BUDGET;
+  // System messages are covered by the envelope/personalization — keep them
+  // out of the selection so compression cannot duplicate or drop them.
+  const nonSystem = input.messages.filter((m) => m.role !== "system");
+  const compressed = assembleCompressedContext({ ...input, messages: nonSystem });
+  const prompt = renderFailoverPrompt(compressed, {
+    systemPrompt: input.systemPrompt,
+    toolInstructions: input.toolInstructions,
+    usePersonalization: input.usePersonalization,
+    budget,
+  });
+  return { prompt, compressed };
+}
+
+/**
+ * Render a tiered selection into the upstream-ready prompt string.
+ * Split out so live failover paths can select (assembleCompressedContext)
+ * and render as explicit steps with refs retained for re-injection.
+ */
+export function renderFailoverPrompt(
+  compressed: CompressedContext,
+  opts: {
+    systemPrompt: string;
+    toolInstructions: string;
+    usePersonalization: boolean;
+    budget?: number;
+  },
+): string {
+  const budget = opts.budget ?? TIERED_DEFAULT_BUDGET;
+  const rendered = renderMessagesToPrompt([...compressed.t2, ...compressed.t1]);
+  const t3section = compressed.t3 ? `[Earlier conversation summary]\n${compressed.t3}` : "";
+  const parts = opts.usePersonalization
+    ? [t3section, rendered]
+    : [opts.systemPrompt, opts.toolInstructions, t3section, rendered];
+  const prompt = parts.filter((p) => p.trim().length > 0).join("\n\n");
+  if (prompt.length > budget) {
+    throw new Error(
+      `Failover prompt exceeds budget (${prompt.length} > ${budget}); refusing to send full context`,
+    );
+  }
+  return prompt;
 }

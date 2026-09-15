@@ -4,6 +4,7 @@ import test from "node:test";
 process.env.TEST_MOCK_QWEN_AUTH = "true";
 
 import { assembleCompressedContext } from "../services/context/tiered.ts";
+import { buildFailoverPrompt, renderMessagesToPrompt } from "../services/context/tiered.ts";
 import type { Message } from "../utils/types.ts";
 
 function buildMessages(exchanges: number, charsPerMsg = 4000): Message[] {
@@ -112,4 +113,79 @@ test("tiered: refs contains every retained message", () => {
   });
   const retained = result.t1.length + result.t2.length;
   assert.equal(Object.keys(result.refs).length, retained);
+});
+
+test("failover: no-personalization envelope keeps system prefix verbatim", () => {
+  const sys = "System: agent instructions v1";
+  const toolsText = "Tool: shell";
+  const messages = buildMessages(10, 500);
+  const { prompt, compressed } = buildFailoverPrompt({
+    systemPrompt: sys,
+    tools: [],
+    toolInstructions: toolsText,
+    messages,
+    currentTurn: messages[messages.length - 1],
+    rollingSummary: "",
+    tokenBudget: 100_000,
+    usePersonalization: false,
+  });
+  assert.ok(prompt.startsWith(sys), "system prefix must be verbatim T0");
+  assert.ok(prompt.includes(toolsText));
+  assert.ok(prompt.includes("User:"));
+  assert.ok(prompt.includes("Assistant:"));
+  assert.ok(prompt.length <= 100_000);
+  assert.ok(Object.keys(compressed.refs).length > 0);
+});
+
+test("failover: personalization mode keeps system out of the prompt", () => {
+  const sys = "System: secret agent instructions";
+  const messages = buildMessages(10, 500);
+  const { prompt } = buildFailoverPrompt({
+    systemPrompt: sys,
+    tools: [],
+    toolInstructions: "Tool: shell",
+    messages,
+    currentTurn: messages[messages.length - 1],
+    rollingSummary: "prior summary",
+    tokenBudget: 100_000,
+    usePersonalization: true,
+  });
+  assert.ok(!prompt.includes(sys), "system must ride personalization, not inline");
+  assert.ok(prompt.includes("prior summary"));
+  assert.ok(prompt.includes("Question 9"));
+  assert.ok(prompt.length <= 100_000);
+});
+
+test("failover: tool call/result pairs render with tags intact", () => {
+  const messages = buildToolMessages();
+  const rendered = renderMessagesToPrompt(messages);
+  assert.ok(rendered.includes("Assistant:"));
+  assert.ok(rendered.includes("Tool Response (read_file):"));
+  const { prompt } = buildFailoverPrompt({
+    systemPrompt: "",
+    tools: [],
+    toolInstructions: "",
+    messages,
+    currentTurn: { role: "user", content: "continue" },
+    rollingSummary: "",
+    tokenBudget: 100_000,
+    usePersonalization: true,
+  });
+  assert.ok(prompt.includes("Tool Response (read_file):"));
+});
+
+test("failover: 2M-char conversation renders under budget", () => {
+  const messages = buildMessages(250, 4000);
+  const { prompt } = buildFailoverPrompt({
+    systemPrompt: "System: agent",
+    tools: [],
+    toolInstructions: "",
+    messages,
+    currentTurn: messages[messages.length - 1],
+    rollingSummary: "summary",
+    tokenBudget: 100_000,
+    usePersonalization: false,
+  });
+  assert.ok(prompt.startsWith("System: agent"));
+  assert.ok(prompt.length <= 100_000, `prompt=${prompt.length}`);
 });
