@@ -523,6 +523,26 @@ export async function chatCompletions(c: Context) {
               invalidateLogicalThreadParent(ctx.sessionId);
             }
 
+            // Loop 9: burst vs quota health feed. Burst (temporary, same-account
+            // retry) must NOT rebind; quota must. Recording here keeps the
+            // HealthTracker in sync even when the retry succeeds on same/new acct.
+            try {
+              const acct = currentStreamResult.activeAccountId;
+              if (policy.reason === "quota_or_rate_limit" && acct) {
+                const kind = policy.switchAccount ? "quota" : "burst";
+                getHealthTracker().record429(acct, kind as "burst" | "quota", policy.retryAfterMs);
+                if (kind === "burst" && logger.isLevelEnabled("info")) {
+                  console.log(
+                    `[Session] Burst pace, no rebind | account=${acct} | retryAfter=${policy.retryAfterMs}ms | key=${stickyKey ?? "n/a"}`,
+                  );
+                }
+              } else if (policy.reason === "anti_bot" && currentStreamResult.activeAccountId) {
+                getHealthTracker().recordCaptcha(currentStreamResult.activeAccountId);
+              }
+            } catch {
+              // Best-effort.
+            }
+
             if (policy.reason === "chat_in_progress") {
               // The same-chat settle budget AND the single bounded escalation
               // (fresh chat + full replay) were already spent at the create path
