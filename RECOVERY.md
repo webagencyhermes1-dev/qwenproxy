@@ -208,7 +208,29 @@ A burst of cold requests each called `ensurePoolReadiness()` concurrently. There
 
 ## Loop 7 — Integration Test: Two Concurrent Coding Sessions
 
-*(pending)*
+**Symptom from log:**
+```
+[Session] New session bound | key=82a1… | account=acc-a
+[Session] New session bound | key=91c4… | account=acc-a   // second session, same instant
+```
+Two brand-new coding sessions fired their first turns at the same moment against an idle pool. The selection layer is synchronous and health-only: it knows nothing about sessions already being served per account. With identical health across the pool, the second first-turn selector picked the SAME account as the first (tie-break by id), then had to queue for a lease. Because stickiness survives the whole session, both sessions stayed glued to one account forever — permanently halving pool parallelism, even though two idle accounts were sitting nearby.
+
+**Root cause:**
+1. No in-flight guard between "selected" and "bound": selection claims nothing, so a concurrent sibling re-selects the same account during the async lease/stream gap.
+2. No load-awareness: `selectAccountForNewSession` never counts how many live sessions already serve each account, so even after bind A→acc-a, a new session still picked acc-a (identical composite score, lexicographic tie-break).
+
+**Fix applied (selection.ts):**
+1. **Synchronous in-flight claims** (`pendingClaims`, `CLAIM_TTL_MS = 5s`, exports `releaseAccountClaim`/`clearSelectionClaimsForTests`) — the very first act of selecting for a sticky key is claiming the picked account. A concurrent sibling's selector then sees that account as loaded (its own key is exempt, so retries/failover never self-block). Claims overwrite on re-selection and expire by TTL; the auto-release hook keeps the window tight.
+2. **Live-binding load penalty** — selection now counts live non-expired sticky bindings per account (excluding the selecting session's own binding) plus other sessions' in-flight claims, and scales the composite score by `1/(1+load)`. Accounts already serving sessions remain eligible (overflow never bounces) but new sessions deterministically prefer the least-served account. Single-account pools are unaffected.
+
+**Tests verifying the fix (concurrent-sessions-integration.test.ts, new):**
+- Two first turns racing an idle 3-account pool (selection → 40ms async lease gap → bind) end bound to DIFFERENT accounts.
+- A third session starting right after binds must land on the remaining (load-0) account, not pile onto either live session.
+- Existing `two-sessions`, `rebind-integration`, `account-selection`, `burst-quota` stay green (no-claim paths unchanged).
+
+**Commit:** `fix(selection): steer concurrent first turns and live sessions off the same account`
+
+**Note:** the no-op claim stub was first validated RED (both sessions landed on `acc-a` and the "different accounts" assertion failed) before the load-aware fix was applied.
 
 ## Loop 8 — Recovery Metrics and Logging
 
