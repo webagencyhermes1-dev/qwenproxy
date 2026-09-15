@@ -150,7 +150,30 @@ A Qwen token expired server-side while the persisted browser profile still carri
 
 ## Loop 5 — Fix the 2M Character Full Replay
 
-*(pending)*
+**Symptom from log:**
+```
+Compressed context still exceeds budget (2000042 > 100000); refusing to send full context
+[Chat] /v1/chat/completions failed: Context length exceeded
+```
+Escalations and failovers re-send the entire conversation. A conversation dominated by ONE enormous message (a 2M-char paste that IS the current turn) can't be cut by selection — T1 drop keeps it, T3 truncation doesn't help, and the tiered assembly refused to serve it by throwing, so the whole request died with a context-limit error instead of making progress.
+
+**Root cause:**
+- Tiered selection (`assembleCompressedContext`) could trim multi-message overflow (drop T2/T1 groups), but a single giant message "cannot be dropped or paired away" and was handled by throwing — the exact case the original full-replay bug report was about.
+- Additionally the rendered failover envelope (`renderFailoverPrompt`) re-emits segment prefixes and re-serializes tool-call tags that the JSON-budget accounting inside `assemble` doesn't count, so a prompt that fit the serialized budget could still trip the render-side "exceeds budget" throw.
+
+**Fix applied (tiered.ts):**
+1. **Last-resort tail trim** — when the selection still overflows after T2-drop/T1-drop/T3-truncate, `trimLastMessageToFit` binary-searches the final kept message's content length so the serialized selection fits, appends `[Context truncated: ...]`, and serves the turn. The throw is now reserved for the only truly unsendable case: T0/T2/T3 alone already overflow (an empty current turn still can't fit).
+2. **Render-overhead reserve** — `buildFailoverPrompt` shrinks the assembly budget by `toolInstructions.length + 4096` so the rendered envelope (segment prefixes + re-emitted tags + toolInstructions) stays under the same 100k ceiling instead of tripping the render-side guard.
+
+**Tests verifying the fix:**
+- `tiered-context.test.ts` (new) —
+  - single 2M-char paste: `assembleCompressedContext` no longer throws; `totalChars`/`payload` ≤ 100k; the current turn survives with a `[Context truncated` notice.
+  - failover prompt for a single 2M-char paste is served ≤ 100k with the truncation notice.
+- Existing 500-message/2M conversation, tool-pair integrity, T0 byte-identity, refs, and personalization-envelope tests unchanged and green.
+
+**Commit:** `fix(context): serve single giant messages by trimming to budget instead of refusing`
+
+---
 
 ## Loop 6 — Fix ReadinessGuard Thundering Herd
 
