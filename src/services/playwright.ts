@@ -79,6 +79,8 @@ import { subtlePageActivity } from "./human-behavior.ts";
 import { solveBaxiaCaptcha } from "./captcha-solver.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { setWafContextResetListener } from "../core/waf-isolation.ts";
+import { recordAccountFailure } from "../core/account-health.ts";
+import { markAccountAuthError } from "../core/account-state.ts";
 import { updateQwenWebVersion, getQwenWebVersion } from "./qwen-headers.ts";
 import { getAccountProfilePath, getProfilesDir } from "../core/paths.ts";
 
@@ -469,8 +471,29 @@ const FIRST_TRIGGER_GRACE_MS = 3_000;
  * fire one before it finished computing its token, and dropping the account on
  * that first unlucky request costs five minutes of cooldown; a couple of extra
  * sends cover it while still failing a page that never produces them.
+ *
+ * The FIRST send fails fast (see FIRST_TRIGGER_GRACE_MS) because a cold page
+ * has not computed its bx tokens yet, so attempt 2 is the realistic recovery
+ * window. Two attempts bound the reload cost of a truly blocked page (WAF
+ * interstitial) at ~2x15s input waits; three only bought a third reload that a
+ * WAF-detected page no longer performs.
  */
-const HEADER_CAPTURE_TRIGGER_ATTEMPTS = 3;
+const HEADER_CAPTURE_TRIGGER_ATTEMPTS = 2;
+/**
+ * The Qwen chat-input selector family. The first alternative is the stable
+ * Qwen-specific class; the rest guard against DOM churn (sibling textareas,
+ * contenteditable editors, and the ARIA textbox role). Keeping this in one
+ * constant makes future DOM updates a single-point change instead of inline
+ * string edits inside triggerSend.
+ */
+export const CHAT_INPUT_SELECTOR =
+  'textarea.message-input-textarea:visible, textarea:visible, [contenteditable="true"]:visible, [role="textbox"]:visible';
+/** Send-button selector family, in preference order, for header capture. */
+const SEND_BUTTON_SELECTORS = [
+  ".message-input-right-button-send .send-button",
+  ".chat-prompt-send-button",
+  "button.send-button",
+];
 /**
  * A healthy Qwen chat page renders its input within a couple of seconds. When
  * it never does, the page is blocked (WAF interstitial, punish document, or a
@@ -481,6 +504,8 @@ const HEADER_CAPTURE_TRIGGER_ATTEMPTS = 3;
 const CHAT_INPUT_APPEAR_TIMEOUT_MS = 15_000;
 /** Per-action bound for focus/fill/type once the input is already visible. */
 const CHAT_INPUT_ACTION_TIMEOUT_MS = 10_000;
+/** Bound on the one-shot page-state probe used for WAF / input-miss diagnosis. */
+const WAF_PAGE_PROBE_TIMEOUT_MS = 1_500;
 
 /**
  * A challenge blocking the chat page makes the send button inert, so header
@@ -502,6 +527,186 @@ async function clearVisibleChallenge(page: Page): Promise<void> {
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+export interface ChatPageBlock {
+  kind: "waf" | null;
+  reason?: string;
+  markers: string[];
+}
+
+/**
+ * Markers that alone prove the page is an anti-bot/WAF interstitial rather
+ * than a healthy chat UI. Kept in the same spirit as isAntiBotChallengeText
+ * (retry-policy.ts) and looksLikeAntiBotChallengeText (media-generation.ts):
+ * every recognized variant normalizes to the same "waf" classification.
+ */
+const WAF_STRONG_MARKERS = [
+  "just a moment",
+  "attention required!",
+  "cf-chl-",
+  "challenge-platform",
+  "challenges.cloudflare.com",
+  "websiteprotection.net",
+  "_____tmd_____",
+  "____punish____",
+  "punish",
+  "fk_waf_challenge",
+  "aliyun_waf",
+  "x5secdata",
+  "rgv587_error",
+  "fail_sys_user_validate",
+  "denyfromx5",
+  "access denied",
+  "请求被拦截",
+  "操作过于频繁",
+  "访问被拒绝",
+] as const;
+
+/**
+ * Markers that only confirm a challenge page in combination (>=2 hits). A
+ * healthy chat page can contain "captcha"/"验证码" in its own copy, so a single
+ * generic hit is never enough to call the page blocked.
+ */
+const WAF_CONTEXT_MARKERS = [
+  "captcha",
+  "verify you are human",
+  "verify you're human",
+  "verify your browser",
+  "human verification",
+  "security verification",
+  "安全验证",
+  "滑动验证",
+  "验证码",
+  "turnstile",
+  "hcaptcha",
+] as const;
+
+/**
+ * Classify a chat-page state snapshot as WAF-blocked or not. Pure and
+ * unit-testable: the DOM probe only supplies title/href/bodyText. Rationale:
+ * a missing chat input alone only proves the SPA did not hydrate, whereas a
+ * challenge marker set proves the page is deliberately blocking — and the
+ * latter must fail the capture immediately instead of reloading into the same
+ * needless 15s input waits.
+ */
+export function detectChatPageBlockText(input: {
+  title?: string;
+  bodyText?: string;
+  href?: string;
+}): ChatPageBlock {
+  const haystack = [input.title, input.href, input.bodyText]
+    .filter((s): s is string => !!s)
+    .join("\n")
+    .toLowerCase();
+  const found: string[] = [];
+
+  for (const marker of WAF_STRONG_MARKERS) {
+    if (haystack.includes(marker)) found.push(marker);
+  }
+  let contextHits = 0;
+  for (const marker of WAF_CONTEXT_MARKERS) {
+    if (haystack.includes(marker)) {
+      found.push(marker);
+      contextHits++;
+    }
+  }
+  const strongHit = found.some((m) => (WAF_STRONG_MARKERS as readonly string[]).includes(m));
+  const waf = strongHit || contextHits >= 2;
+  return {
+    kind: waf ? "waf" : null,
+    reason: waf
+      ? `page shows an anti-bot challenge (${found.slice(0, 3).join(", ") || "unknown"})`
+      : undefined,
+    markers: found,
+  };
+}
+
+/**
+ * One-shot snapshot of the page's title/URL/body text, bounded so a frozen or
+ * WAF-swallowed page cannot hang the caller. Returns null when the page is
+ * closed, lacks evaluate (test doubles), or the probe times out — the caller
+ * treats null as "no block evidence" (reload path).
+ */
+async function probeChatPageDom(
+  page: Page,
+): Promise<{ title: string; href: string; bodyText: string } | null> {
+  if (!page || (typeof page.isClosed === "function" && page.isClosed())) {
+    return null;
+  }
+  if (typeof page.evaluate !== "function") return null;
+  try {
+    const snapshot = await withTimeout(
+      page.evaluate(() => ({
+        title: document.title || "",
+        href: typeof window !== "undefined" ? window.location.href : "",
+        bodyText: (document.body?.innerText || "").slice(0, 4000),
+      })),
+      WAF_PAGE_PROBE_TIMEOUT_MS,
+      "chat page state probe timed out",
+    );
+    return snapshot as { title: string; href: string; bodyText: string };
+  } catch {
+    return null;
+  }
+}
+
+/** Wrap the pure classifier over a live page. */
+export async function detectChatPageBlock(page: Page): Promise<ChatPageBlock> {
+  const snapshot = await probeChatPageDom(page);
+  if (!snapshot) return { kind: null, markers: [] };
+  return detectChatPageBlockText(snapshot);
+}
+
+/**
+ * Collapse a body-text dump into a single sanitized line for diagnostics:
+ * control chars and runs of whitespace removed, length-capped.
+ */
+export function sanitizeBodySnippet(text: string, maxLength = 500): string {
+  return String(text ?? "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/[^\S ]+/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+/**
+ * Write a diagnostic snapshot for a page that never rendered the chat UI
+ * (WAF block, punish document, or an SPA that failed to hydrate). Best-effort:
+ * a failing dump must never break the capture path it is reporting on.
+ */
+export async function dumpPlaywrightMiss(
+  accountId: string,
+  page: Page | undefined,
+  opts: { reason: string; attempt?: number; markers?: string[] },
+): Promise<void> {
+  try {
+    const snapshot = page ? await probeChatPageDom(page) : null;
+    const dir = path.join(process.cwd(), "logs", "playwright_misses");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${accountId}-${Date.now()}.json`);
+    fs.writeFileSync(
+      file,
+      JSON.stringify(
+        {
+          timestamp: new Date().toISOString(),
+          accountId,
+          reason: opts.reason,
+          attempt: opts.attempt ?? null,
+          markers: opts.markers ?? [],
+          url: snapshot?.href ?? "",
+          title: snapshot?.title ?? "",
+          bodySnippet: snapshot ? sanitizeBodySnippet(snapshot.bodyText) : "",
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+  } catch {
+    // Diagnostics never break the capture path.
+  }
 }
 
 function withTimeout<T>(
@@ -1725,6 +1930,12 @@ async function loginToQwen(
         24 * 3600 * 1000,
         `AuthPermanentFailure: ${apiResult.reason}`,
       );
+      try {
+        markAccountAuthError(accountId);
+        recordAccountFailure(accountId, "auth");
+      } catch {
+        // Best-effort.
+      }
       return false;
     }
 
@@ -1744,6 +1955,12 @@ async function loginToQwen(
         24 * 3600 * 1000,
         `AuthPermanentFailure: ${uiResult.reason}`,
       );
+      try {
+        markAccountAuthError(accountId);
+        recordAccountFailure(accountId, "auth");
+      } catch {
+        // Best-effort.
+      }
       return false;
     }
 
@@ -1764,6 +1981,12 @@ async function loginToQwen(
     24 * 3600 * 1000,
     "AuthFailed: All login methods exhausted",
   );
+  try {
+    markAccountAuthError(accountId);
+    recordAccountFailure(accountId, "auth");
+  } catch {
+    // Best-effort.
+  }
   return false;
 }
 
@@ -2263,9 +2486,7 @@ export async function captureQwenHeaders(
 
       // Prefer the Qwen-specific input selector first (stable against the DOM
       // picking a sibling textarea/contenteditable), then fall back to generic.
-      // Mirrors upstream 5b3fd3e (robust account header capture).
-      const inputSelector =
-        'textarea.message-input-textarea:visible, textarea:visible, [contenteditable="true"]:visible';
+      const inputSelector = CHAT_INPUT_SELECTOR;
       // Bound the appearance wait: a page that never renders the chat input is
       // blocked (WAF interstitial, punish document, or failed SPA hydration).
       // Unbounded, page.focus would burn its 60s default timeout on every
@@ -2284,6 +2505,30 @@ export async function captureQwenHeaders(
           });
       } catch {
         if (settled || page.isClosed()) return;
+        // The input never appeared: decide whether the page is a WAF/challenge
+        // interstitial (fail fast, do NOT reload into the same 15s wait) or a
+        // generic failed-to-hydrate page (reload).
+        const blocked = await detectChatPageBlock(page);
+        if (blocked.kind === "waf") {
+          await dumpPlaywrightMiss(accountId, page, {
+            reason: blocked.reason ?? "waf block",
+            attempt,
+            markers: blocked.markers,
+          });
+          console.warn(
+            `🚫 [Playwright] Chat page WAF-blocked for ${accountId} (attempt ${attempt}): ${blocked.reason ?? "challenge"}`,
+          );
+          settle(
+            new Error(
+              `WAF challenge detected for ${accountId}: ${blocked.reason ?? "chat page blocked by anti-bot challenge"}`,
+            ),
+          );
+          return;
+        }
+        await dumpPlaywrightMiss(accountId, page, {
+          reason: "chat input never appeared",
+          attempt,
+        });
         console.warn(
           `⏱️  [Playwright] Chat input never appeared for ${accountId} (attempt ${attempt}); reloading`,
         );
@@ -2323,11 +2568,7 @@ export async function captureQwenHeaders(
       await sleep(2000);
       if (settled || page.isClosed()) return;
 
-      const sendSelectors = [
-        ".message-input-right-button-send .send-button",
-        ".chat-prompt-send-button",
-        "button.send-button",
-      ];
+      const sendSelectors = SEND_BUTTON_SELECTORS;
 
       let clicked = false;
       for (const selector of sendSelectors) {
@@ -3020,12 +3261,22 @@ export async function closeIdlePlaywrightAccounts(
     const mutex = accountMutexes.get(candidate.accountId);
     if (!mutex?.isIdle()) continue;
 
-    await closePlaywrightForAccount(candidate.accountId).catch((error) => {
+    const release = await acquireAccountMutex(
+      candidate.accountId,
+      `idle-close:${candidate.accountId.substring(0, 12)}`,
+    ).catch(() => null);
+    if (!release) continue;
+    try {
+      if (isAccountServingStream(candidate.accountId)) continue;
+      await closePlaywrightForAccountLocked(candidate.accountId);
+      closed++;
+    } catch (error) {
       console.warn(
         `[Playwright] Failed to close idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
       );
-    });
-    closed++;
+    } finally {
+      release();
+    }
   }
   return closed;
 }
@@ -3058,12 +3309,22 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
     const mutex = accountMutexes.get(candidate.accountId);
     if (!mutex?.isIdle()) continue;
 
-    await closePlaywrightForAccount(candidate.accountId).catch((error) => {
+    const release = await acquireAccountMutex(
+      candidate.accountId,
+      `idle-evict:${candidate.accountId.substring(0, 12)}`,
+    ).catch(() => null);
+    if (!release) continue;
+    try {
+      if (isAccountServingStream(candidate.accountId)) continue;
+      await closePlaywrightForAccountLocked(candidate.accountId);
+      closed++;
+    } catch (error) {
       console.warn(
         `[Playwright] Failed to evict idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
       );
-    });
-    closed++;
+    } finally {
+      release();
+    }
   }
 
   return closed;
@@ -3089,6 +3350,8 @@ export async function keepAlivePlaywrightAccount(
   if (!release) return false;
 
   try {
+    if (isAccountServingStream(accountId)) return false;
+
     const page = accountPages.get(accountId);
     if (!page || page.isClosed()) return false;
 
