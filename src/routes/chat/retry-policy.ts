@@ -241,8 +241,12 @@ export function isQuotaLikeError(err: unknown): boolean {
   return (
     code === "quota_limit" ||
     code === "ratelimited" ||
+    code === "quota_exceeded" ||
+    code.includes("usage_limit") ||
+    code.includes("daily_limit") ||
     message.includes("quota_limit") ||
     message.includes("quota exceeded") ||
+    message.includes("quota exhausted") ||
     message.includes("allocated quota") ||
     message.includes("token-limit") ||
     message.includes("insufficient quota") ||
@@ -250,8 +254,14 @@ export function isQuotaLikeError(err: unknown): boolean {
     message.includes("high demand") ||
     message.includes("request rate increased too quickly") ||
     message.includes("rate increased too quickly") ||
-    message.includes("upper limit for today's usage") ||
-    message.includes("you've reached the upper limit") ||
+    message.includes("upper limit") ||
+    message.includes("limit for today") ||
+    message.includes("usage limit") ||
+    message.includes("usage_limit") ||
+    message.includes("maximum usage") ||
+    message.includes("max usage") ||
+    message.includes("daily limit") ||
+    message.includes("daily usage") ||
     // Accept local rate_limit code only when message also looks like quota/rate
     (code === "rate_limit_exceeded" &&
       (message.includes("quota") ||
@@ -262,27 +272,67 @@ export function isQuotaLikeError(err: unknown): boolean {
   );
 }
 
-export function isAntiBotError(err: unknown): boolean {
-  const code = errCode(err);
-  const codeLower = code.toLowerCase();
-  const message = errMessage(err).toLowerCase();
-  if (err instanceof RetryableQwenStreamError) {
-    return codeLower === "waf_challenge" || message.includes("anti-bot");
+/**
+ * Canonical upstream anti-bot / CAPTCHA / WAF challenge matcher.
+ *
+ * Every currently-recognized challenge form normalizes to the single
+ * `anti_bot` classification before retry decisions are made. Do not rely on
+ * one literal string: upstream surfaces the same challenge as error codes
+ * (waf_challenge / FAIL_SYS_USER_VALIDATE / RGV587_ERROR), as SSE error
+ * details ("user validate"), as human-readable messages (CAPTCHA / security
+ * verification / human verification), and as raw HTML WAF pages.
+ */
+const ANTI_BOT_CODE_SET = new Set([
+  "waf_challenge",
+  "fail_sys_user_validate",
+  "rgv587_error",
+]);
+
+const ANTI_BOT_MESSAGE_MARKERS = [
+  "fail_sys_user_validate",
+  "rgv587_error",
+  "user validate",
+  "_____tmd_____",
+  "tmd anti-bot",
+  "tmd anti_bot",
+  "aliyun_waf",
+  "denyfromx5",
+  "captcha",
+  "security verification",
+  "security-verification",
+  "verify you are human",
+  "verify you're human",
+  "verify youre human",
+  "human verification",
+  "anti-bot",
+  "anti_bot",
+] as const;
+
+/** True when free-form upstream text looks like a WAF/anti-bot challenge. */
+export function isAntiBotChallengeText(value: string | null | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.toLowerCase();
+  if (ANTI_BOT_CODE_SET.has(normalized.trim())) return true;
+  for (const marker of ANTI_BOT_MESSAGE_MARKERS) {
+    if (normalized.includes(marker)) return true;
   }
-  return (
-    code === "FAIL_SYS_USER_VALIDATE" ||
-    code === "RGV587_ERROR" ||
-    codeLower === "waf_challenge" ||
-    message.includes("fail_sys_user_validate") ||
-    message.includes("rgv587_error") ||
-    message.includes("_____tmd_____") ||
-    message.includes("tmd anti-bot") ||
-    message.includes("captcha") ||
-    message.includes("security verification") ||
-    message.includes("verify you are human") ||
-    message.includes("human verification") ||
-    message.includes("denyfromx5")
-  );
+  return false;
+}
+
+export function isAntiBotError(err: unknown): boolean {
+  const codeLower = errCode(err).toLowerCase();
+  if (ANTI_BOT_CODE_SET.has(codeLower)) return true;
+  const message = errMessage(err);
+  if (isAntiBotChallengeText(message)) return true;
+  // Retryable stream errors inherit an OpenAI-style code; the upstream
+  // category lives in upstreamCode/message instead.
+  if (err instanceof RetryableQwenStreamError) {
+    const upstream = (err as { upstreamCode?: unknown }).upstreamCode;
+    if (typeof upstream === "string" && ANTI_BOT_CODE_SET.has(upstream.toLowerCase())) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function classifyQuotaCooldown(message: string): {
@@ -533,23 +583,37 @@ export function classifyRetryAction(
     }
 
     if (isAntiBotError(err)) {
-      // WAF/captcha is only identified here. Retry the same request on the
-      // same account immediately; recovery, cooldown and account rotation are
-      // intentionally left out so the failure path stays observable.
-      return makeRetryAction("anti_bot");
+      // Canonical anti-bot failover: a verified upstream CAPTCHA/WAF
+      // challenge must NEVER retry the same account for the same request.
+      // The challenged account is quarantined via the existing WAF isolation
+      // (recordWafHardBlock) by the caller, excluded from every remaining
+      // candidate for this request, and the SAME logical request is replayed
+      // on the next eligible account with a fresh upstream chat + full
+      // context (sticky parent chains cannot be reused across accounts).
+      // Bounded by the existing account-switch/retry budget at the call site.
+      return makeRetryAction("anti_bot", {
+        switchAccount: true,
+        forceNewChat: true,
+        retryWithFullPrompt: true,
+        retryAfterMs: 0,
+        accountCooldownMs: config.captcha.accountCooldownMs,
+        accountCooldownReason: "WafChallenge",
+      });
     }
 
     if (isQuotaLikeError(err)) {
       const typed = err as RetryableStreamError;
       const quota = classifyQuotaCooldown(errMessage(err));
       const isTemporary = quota.accountCooldownReason === "RateLimitTemporary";
-      // Temporary load shedding: retry same account first, only switch on
-      // repeated failure. Real quota exhaustion: switch immediately.
+      // Temporary service-wide load shedding: retry same account and do not
+      // burn other accounts. Real quota exhaustion: switch immediately.
       return makeRetryAction("quota_or_rate_limit", {
         switchAccount: isTemporary ? false : typed.switchAccount !== false,
         forceNewChat: typed.forceNewChat === true,
         retryWithFullPrompt: typed.retryWithFullPrompt === true,
-        retryAfterMs: typed.retryAfterMs ?? (isTemporary ? 3_000 : baseDelayMs),
+        retryAfterMs:
+          typed.retryAfterMs ??
+          (isTemporary ? Math.min(baseDelayMs * 3, 3_000) : baseDelayMs),
         accountCooldownMs: quota.accountCooldownMs,
         accountCooldownReason: quota.accountCooldownReason,
       });
@@ -739,16 +803,23 @@ export function throwFromSseUpstreamError(
     throw error;
   }
 
+  // Canonical anti-bot normalization: every recognized challenge form
+  // (codes, SSE details, human-readable messages) becomes the SAME
+  // waf_challenge classification before retry decisions are made. The
+  // sanitized message never carries raw WAF HTML/challenge payloads.
   if (
-    errDetails.includes("FAIL_SYS_USER_VALIDATE") ||
-    errDetails.includes("RGV587_ERROR") ||
-    errDetails.includes("user validate")
+    isAntiBotChallengeText(errCode) ||
+    isAntiBotChallengeText(errDetails) ||
+    isAntiBotChallengeText(normalizedErrCode)
   ) {
+    logger.warn(`[Upstream Challenge Detected] | code=waf_challenge`);
     const error = new RetryableQwenStreamError(
-      `Qwen anti-bot: ${errCode}: ${errDetails}`,
+      `Qwen anti-bot: waf_challenge: ${errDetails.substring(0, 200)}`,
       0,
     ) as RetryableStreamError;
-    error.upstreamCode = errCode;
+    error.upstreamCode = "waf_challenge";
+    error.forceNewChat = true;
+    error.retryWithFullPrompt = true;
     error.switchAccount = true;
     throw error;
   }

@@ -9,6 +9,10 @@ import {
   markAccountHeadersReady,
   unmarkAccountHeadersReady,
 } from "../core/account-manager.ts";
+import {
+  clearTemporaryBusy,
+  markAccountTemporarilyBusy,
+} from "../core/account-concurrency.ts";
 
 const TEST_ACCOUNTS = ["ready-a", "ready-b", "ready-c"];
 
@@ -34,6 +38,7 @@ test.beforeEach(() => {
 test.afterEach(() => {
   for (const id of [...TEST_ACCOUNTS, "ready-solo"]) {
     unmarkAccountHeadersReady(id);
+    clearTemporaryBusy(id);
   }
   if (originalQwenAccounts !== undefined) {
     process.env.QWEN_ACCOUNTS = originalQwenAccounts;

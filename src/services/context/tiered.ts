@@ -27,7 +27,7 @@ import { TOOL_CALL_OPEN, TOOL_CALL_CLOSE } from "../../tools/toolcall-tags.ts";
 import { tokenize } from "../context-compressor.ts";
 import type { VectorStore } from "./vectorStore.ts";
 
-export const TIERED_DEFAULT_BUDGET = 100_000;
+export const TIERED_DEFAULT_BUDGET = 200_000;
 const T1_EXCHANGES = 3;
 
 export type RefMap = Record<string, Message>;
@@ -387,7 +387,7 @@ export function buildFailoverPrompt(input: FailoverPromptInput): FailoverPromptR
   // tool-call tags) that the JSON serialization inside assemble does not count,
   // and in no-personalization mode toolInstructions rides only the envelope.
   // Shrink the assembly budget by that overhead so the downstream render check
-  // passes with the same 100k ceiling instead of throwing on the envelope.
+  // passes with the same 200k ceiling instead of throwing on the envelope.
   const RENDER_OVERHEAD_RESERVE = 4_096;
   const assemblyBudget = Math.max(
     1,

@@ -181,6 +181,36 @@ function runMigrations(db: Database.Database): void {
   } catch (err) {
     if (!isDuplicateColumnError(err)) throw err;
   }
+  try {
+    db.exec(`ALTER TABLE accounts ADD COLUMN disabled INTEGER DEFAULT 0;`);
+  } catch (err) {
+    if (!isDuplicateColumnError(err)) throw err;
+  }
+
+  // Account Pool 2.0: persistent per-account health (bounded score + counters).
+  // Separate table so the hot accounts row stays narrow and existing installs
+  // migrate without data loss. All columns have defaults for zero-config upgrade.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS account_health (
+      account_id TEXT PRIMARY KEY,
+      health_score INTEGER NOT NULL DEFAULT 100,
+      success_count INTEGER NOT NULL DEFAULT 0,
+      failure_count INTEGER NOT NULL DEFAULT 0,
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      rate_limit_events INTEGER NOT NULL DEFAULT 0,
+      quota_events INTEGER NOT NULL DEFAULT 0,
+      auth_failures INTEGER NOT NULL DEFAULT 0,
+      network_failures INTEGER NOT NULL DEFAULT 0,
+      waf_events INTEGER NOT NULL DEFAULT 0,
+      total_latency_ms INTEGER NOT NULL DEFAULT 0,
+      last_request_at INTEGER,
+      last_success_at INTEGER,
+      last_failure_at INTEGER,
+      init_fail_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_account_health_score ON account_health(health_score);
+  `);
 }
 
 function isDuplicateColumnError(err: unknown): boolean {

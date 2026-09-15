@@ -33,13 +33,13 @@ export class LogsView implements TuiView {
     chips: Array<{ id: "all" | "warn" | "error" | "copy" | "clear"; label: string; startCol: number; endCol: number }>;
   } {
     const titlePrefix = `Logs (${rawCount})  `;
-    const copyLabel = this.copyNotification ? " [ Y ] Copiado! " : " [ Y ] Copiar ";
+    const copyLabel = this.copyNotification ? " [ Y ] Copied! " : " [ Y ] Copy ";
     const defs = [
-      { id: "all" as const, label: " [ T ] Todos " },
-      { id: "warn" as const, label: " [ W ] Avisos " },
-      { id: "error" as const, label: " [ E ] Erros " },
+      { id: "all" as const, label: " [ A ] All " },
+      { id: "warn" as const, label: " [ W ] Warnings " },
+      { id: "error" as const, label: " [ E ] Errors " },
       { id: "copy" as const, label: copyLabel },
-      { id: "clear" as const, label: " [ C ] Limpar " },
+      { id: "clear" as const, label: " [ C ] Clear " },
     ];
 
     let currentCol = 4 + stringWidth(titlePrefix);
@@ -63,12 +63,12 @@ export class LogsView implements TuiView {
 
   public getShortcuts(): Array<{ key: string; label: string }> {
     return [
-      { key: "T", label: "Todos" },
-      { key: "W", label: "Avisos" },
-      { key: "E", label: "Erros" },
-      { key: "Y", label: "Copiar" },
-      { key: "C", label: "Limpar" },
-      { key: "↑/↓", label: "Rolar" },
+      { key: "A", label: "All" },
+      { key: "W", label: "Warnings" },
+      { key: "E", label: "Errors" },
+      { key: "Y", label: "Copy" },
+      { key: "C", label: "Clear" },
+      { key: "↑/↓", label: "Scroll" },
     ];
   }
 
@@ -201,7 +201,7 @@ export class LogsView implements TuiView {
     }
 
     // Filter toggles
-    if ((key.name === "t" || key.name === "T") && !key.ctrl) {
+    if ((key.name === "a" || key.name === "A" || key.name === "t" || key.name === "T") && !key.ctrl) {
       this.filter = "all";
       this.scrollOffset = 0;
       this.selectedLogIndex = null;
@@ -315,26 +315,26 @@ export class LogsView implements TuiView {
     // Filter Chips in Top Title
     const allChip =
       this.filter === "all"
-        ? `\x1b[48;2;45;35;85m\x1b[38;2;247;248;252m [ T ] Todos \x1b[49m\x1b[39m`
+        ? `\x1b[48;2;45;35;85m\x1b[38;2;247;248;252m [ A ] All \x1b[49m\x1b[39m`
         : this.hoveredChip === "all"
-          ? theme.bgHover(" [ T ] Todos ")
-          : theme.cyan(" [ T ] Todos ");
+          ? theme.bgHover(" [ A ] All ")
+          : theme.cyan(" [ A ] All ");
 
     const warnChip =
       this.filter === "warn"
-        ? `\x1b[48;2;65;48;10m\x1b[38;2;242;178;45m [ W ] Avisos \x1b[49m\x1b[39m`
+        ? `\x1b[48;2;65;48;10m\x1b[38;2;242;178;45m [ W ] Warnings \x1b[49m\x1b[39m`
         : this.hoveredChip === "warn"
-          ? theme.bgHover(" [ W ] Avisos ")
-          : theme.yellow(" [ W ] Avisos ");
+          ? theme.bgHover(" [ W ] Warnings ")
+          : theme.yellow(" [ W ] Warnings ");
 
     const errChip =
       this.filter === "error"
-        ? `\x1b[48;2;70;20;25m\x1b[38;2;252;109;109m [ E ] Erros \x1b[49m\x1b[39m`
+        ? `\x1b[48;2;70;20;25m\x1b[38;2;252;109;109m [ E ] Errors \x1b[49m\x1b[39m`
         : this.hoveredChip === "error"
-          ? theme.bgHover(" [ E ] Erros ")
-          : theme.red(" [ E ] Erros ");
+          ? theme.bgHover(" [ E ] Errors ")
+          : theme.red(" [ E ] Errors ");
 
-    const copyLabel = this.copyNotification ? " [ Y ] Copiado! " : " [ Y ] Copiar ";
+    const copyLabel = this.copyNotification ? " [ Y ] Copied! " : " [ Y ] Copy ";
     const copyChip =
       this.copyNotification
         ? `\x1b[48;2;15;50;35m\x1b[38;2;8;229;166m${copyLabel}\x1b[49m\x1b[39m`
@@ -344,18 +344,18 @@ export class LogsView implements TuiView {
 
     const clearChip =
       this.hoveredChip === "clear"
-        ? theme.bgHover(" [ C ] Limpar ")
-        : theme.muted(" [ C ] Limpar ");
+        ? theme.bgHover(" [ C ] Clear ")
+        : theme.muted(" [ C ] Clear ");
 
     const formattedLines: string[] = [];
 
     if (rawEntries.length === 0) {
       formattedLines.push("");
       formattedLines.push(
-        theme.muted(`  Nenhum log registrado para o filtro atual [${this.filter}].`),
+        theme.muted(`  No logs recorded for the current filter [${this.filter}].`),
       );
       formattedLines.push(
-        theme.muted("  Eventos de inicialização, requisições e alertas do proxy aparecerão aqui."),
+        theme.muted("  Startup events, requests, and proxy alerts will appear here."),
       );
     } else {
       for (const entry of rawEntries) {

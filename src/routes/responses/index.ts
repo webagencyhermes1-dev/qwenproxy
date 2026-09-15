@@ -1,6 +1,7 @@
 import { Hono, type Context } from "hono";
 import { config } from "../../core/config.ts";
 import { logger } from "../../core/logger.ts";
+import { performanceMetrics } from "../../core/performance-metrics.ts";
 import { validateResponsesRequest } from "./validation.ts";
 import {
   responsesToChatCompletions,
@@ -222,6 +223,14 @@ app.post("/v1/responses", async (c) => {
                   streamState,
                   completionTokens,
                 );
+                performanceMetrics.recordRequest({
+                  timestamp: Date.now(),
+                  durationMs: Date.now() - requestStartedAt,
+                  ttfbMs: Date.now() - requestStartedAt,
+                  promptTokens: finalUsage.input_tokens ?? 0,
+                  completionTokens: finalUsage.output_tokens ?? 0,
+                  totalTokens: finalUsage.total_tokens ?? 0,
+                });
                 const finalResponse = finalizeResponse(
                   inProgressResponse,
                   finalOutput,

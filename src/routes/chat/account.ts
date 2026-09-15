@@ -89,6 +89,7 @@ import { isAuthMockEnabled } from "../../services/auth-playwright.ts";
 import {
   assembleCompressedContext,
   renderFailoverPrompt,
+  TIERED_DEFAULT_BUDGET,
 } from "../../services/context/tiered.ts";
 import { getRollingSummary } from "../../services/context/summary.ts";
 import { getVectorStore } from "../../services/context/vectorStore.ts";
@@ -326,7 +327,7 @@ export interface StreamCreationResult {
 	activeAccountLabel: string;
 	/** True when the request replayed context on a new upstream chat
 	 * (account switch / missing thread parent). The replay is the TIERED
-	 * COMPRESSED prompt (100k budget), never the raw full history. The 📤
+	 * COMPRESSED prompt (200k budget), never the raw full history. The 📤
 	 * log line uses this to show the real payload instead of the delta. */
 	replayedFullContext: boolean;
 	/** Compressed failover prompt length (chars) when replayedFullContext. */
@@ -573,7 +574,8 @@ async function attemptRelogin(
  * 2M chars): tiered selection (T1 last-3 + T2 BM25 + T3 summary) rendered in
  * the validation segment format, same envelope as the original request
  * (system prefix verbatim when personalization is off; personalization
- * channel otherwise). Budget 100k enforced — throws instead of full-sending.
+ * channel otherwise). Budget (TIERED_DEFAULT_BUDGET, 200k chars) enforced —
+ * throws instead of full-sending.
  */
 export function buildCompressedFailoverPrompt(args: {
 	systemPrompt?: string;
@@ -600,23 +602,24 @@ export function buildCompressedFailoverPrompt(args: {
 		vectorStore: getVectorStore(),
 		sessionKey: args.stickyKey ?? undefined,
 		rollingSummary: getRollingSummary().get(args.stickyKey ?? ""),
-		tokenBudget: 100_000,
+		tokenBudget: TIERED_DEFAULT_BUDGET,
 	});
 	const prompt = renderFailoverPrompt(compressed, {
 		systemPrompt: args.systemPrompt ?? "",
 		toolInstructions: args.toolInstructions ?? "",
 		usePersonalization: args.usePersonalization ?? false,
-		budget: 100_000,
+		budget: TIERED_DEFAULT_BUDGET,
 	});
 	console.warn(
-		`[Session] Failover context=compressed | reason=${args.reason} | prompt=${prompt.length}/100000 | t1=${compressed.t1.length}msgs | t2=${compressed.t2.length}msgs | refs=${Object.keys(compressed.refs).length}`,
+		`[Session] Failover context=compressed | reason=${args.reason} | prompt=${prompt.length}/${TIERED_DEFAULT_BUDGET} | t1=${compressed.t1.length}msgs | t2=${compressed.t2.length}msgs | refs=${Object.keys(compressed.refs).length}`,
 	);
 	return prompt;
 }
 
 export async function acquireUpstreamStream(
 	params: AcquireParams,
-): Promise<StreamCreationResult | StreamCreationFailure> {	const {
+): Promise<StreamCreationResult | StreamCreationFailure> {
+	const {
 		finalPrompt,
 		isThinkingModel,
 		model,
@@ -814,8 +817,8 @@ export async function acquireUpstreamStream(
 		const mustReplayFullContext =
 			recreatingOnNewAccount || threadMissingParent;
 		const attemptForceNewChat = forceNewChat || mustReplayFullContext;
-		// Failover onto a new upstream chat: tiered compressed context
-		// (T1+T2+T3, 100k budget) — never the raw 2M-char full replay.
+			// Failover onto a new upstream chat: tiered compressed context
+			// (T1+T2+T3, 200k budget) — never the raw 2M-char full replay.
 		const attemptFinalPrompt = mustReplayFullContext
 			? buildCompressedFailoverPrompt({
 					systemPrompt: params.systemPrompt,
@@ -2170,8 +2173,8 @@ async function tryCreateStreamWithRetry(
 				currentAccountEmail = maskEmail(nextAccount.email);
 				accountSwitches++;
 
-			// Account switch always rebuilds a fresh upstream chat with COMPRESSED
-			// history (tiered T1+T2+T3, 100k budget — never the raw full replay).
+				// Account switch always rebuilds a fresh upstream chat with COMPRESSED
+			// history (tiered T1+T2+T3, 200k budget — never the raw full replay).
 			// Do NOT persist sticky binding until create succeeds — premature empty
 			// chatSessionId writes make subsequent turns rotate/lose context.
 			if (params.useThreadNative) {
@@ -2301,9 +2304,9 @@ async function tryCreateStreamWithRetry(
 			const contextLabel =
 				promptChars > 1_000_000
 					? `${(promptChars / (1024 * 1024)).toFixed(1)}MB context`
-					: promptChars > 100_000
-						? `${Math.round(promptChars / 1024)}KB context`
-						: "";
+				: promptChars > 200_000
+					? `${Math.round(promptChars / 1024)}KB context`
+					: "";
 			const contextSuffix = contextLabel ? ` | ${contextLabel}` : "";
 			console.warn(
 				`⏳ [Chat] Chat settling | ${failedAccountEmail}${contextSuffix} | waiting ${(useDelay / 1000).toFixed(1)}s (attempt ${chatInProgressCount}/${config.retry.chatInProgressMaxAttempts})...`,

@@ -191,9 +191,14 @@ test("throwFromSseUpstreamError maps WAF user-validate codes to retryable stream
     const typed = err as InstanceType<typeof RetryableQwenStreamError> & {
       upstreamCode?: string;
       switchAccount?: boolean;
+      forceNewChat?: boolean;
+      retryWithFullPrompt?: boolean;
     };
-    assert.strictEqual(typed.upstreamCode, "FAIL_SYS_USER_VALIDATE");
+    // Canonical normalization: every challenge form becomes waf_challenge.
+    assert.strictEqual(typed.upstreamCode, "waf_challenge");
     assert.strictEqual(typed.switchAccount, true);
+    assert.strictEqual(typed.forceNewChat, true);
+    assert.strictEqual(typed.retryWithFullPrompt, true);
     assert.ok(typed.message.includes("anti-bot"));
   }
 });

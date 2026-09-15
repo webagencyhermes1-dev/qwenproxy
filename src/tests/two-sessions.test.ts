@@ -117,9 +117,9 @@ test("two sessions: different first messages bind different accounts; A failover
       messages,
       currentTurn: messages[messages.length - 1],
       rollingSummary: "A summary",
-      tokenBudget: 100_000,
+      tokenBudget: 200_000,
     });
-    assert.ok(compressed.totalChars <= 100_000, `failover=${compressed.totalChars}`);
+    assert.ok(compressed.totalChars <= 200_000, `failover=${compressed.totalChars}`);
 
     sticky.rebind(keyA, rebindTo!, null);
 

@@ -9,9 +9,15 @@ export interface QwenAccount {
   password: string;
   cooldown_until?: number;
   cooldown_reason?: string | null;
+  disabled?: number;
 }
 
-function generateId(email: string): string {
+/**
+ * Deterministic account ID from the email (md5 formatted as a UUID). Shared
+ * by the QWEN_ACCOUNTS env sync and the Qwen-Forge importer so the same email
+ * always maps to the same account identity across imports/restarts.
+ */
+export function generateAccountId(email: string): string {
   return crypto
     .createHash("md5")
     .update(email)
@@ -45,7 +51,7 @@ function parseEnvAccounts(): QwenAccount[] {
         return null;
       }
       return {
-        id: generateId(email),
+        id: generateAccountId(email),
         email: email.trim(),
         password: password.trim(),
       };
@@ -99,7 +105,7 @@ function getCachedAccounts(): QwenAccount[] {
   const db = getDatabase();
   const rows = db
     .prepare(
-      "SELECT id, email, password, cooldown_until, cooldown_reason FROM accounts ORDER BY created_at ASC",
+      "SELECT id, email, password, cooldown_until, cooldown_reason, disabled FROM accounts ORDER BY created_at ASC",
     )
     .all() as QwenAccount[];
 
@@ -183,4 +189,20 @@ export function updateAccountCooldown(
     "UPDATE accounts SET cooldown_until = ?, cooldown_reason = ? WHERE id = ?",
   ).run(cooldownUntil, reason, id);
   invalidateAccountsCache();
+}
+
+/** Manual admin disable (DISABLED state). Never set automatically. */
+export function setAccountDisabled(id: string, disabled: boolean): void {
+  const db = getDatabase();
+  db.prepare("UPDATE accounts SET disabled = ? WHERE id = ?").run(
+    disabled ? 1 : 0,
+    id,
+  );
+  invalidateAccountsCache();
+}
+
+export function isAccountDisabledRecord(
+  account: Pick<QwenAccount, "disabled"> | undefined,
+): boolean {
+  return Boolean(account?.disabled);
 }

@@ -45,15 +45,15 @@
     "playwright",
     "llm"
   ],
-  "homepage": "https://github.com/johngbl/qwenproxy#readme",
+  "homepage": "https://github.com/gettyuser/qwen-proxy#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/johngbl/qwenproxy.git"
+    "url": "git+https://github.com/gettyuser/qwen-proxy.git"
   },
   "bugs": {
-    "url": "https://github.com/johngbl/qwenproxy/issues"
+    "url": "https://github.com/gettyuser/qwen-proxy/issues"
   },
-  "author": "johngbl <147551701+johngbl@users.noreply.github.com>",
+  "author": "gettyuser",
   "license": "ISC",
   "dependencies": {
     "@hono/node-server": "^2.1.1",

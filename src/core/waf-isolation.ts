@@ -15,6 +15,7 @@
 import { config } from "./config.ts";
 import { logger } from "./logger.ts";
 import { markAccountRateLimited } from "./account-manager.ts";
+import { recordAccountFailure } from "./account-health.ts";
 import { rotateFingerprintSeed } from "../services/fingerprint.ts";
 
 const ESCALATION_FACTOR = 2;
@@ -77,6 +78,11 @@ export function recordWafHardBlock(accountId: string): WafBlockResult {
 
   if (cooldownMs > 0) {
     markAccountRateLimited(accountId, cooldownMs, "WafChallenge");
+  }
+  try {
+    recordAccountFailure(accountId, "waf");
+  } catch {
+    // Best-effort.
   }
 
   rotateFingerprintSeed(accountId);

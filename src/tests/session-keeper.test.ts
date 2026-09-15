@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { config } from "../core/config.ts";
 import {
   acquireAccountLease,
+  hasActiveAccountLease,
   resetAccountConcurrencyForTests,
 } from "../core/account-concurrency.ts";
 import {
@@ -175,6 +176,163 @@ test("keep-alive still warns for real errors (no over-suppression)", async () =>
     );
   } finally {
     captured.restore();
+    await closePlaywrightForAccount(accountId).catch(() => {});
+  }
+});
+
+// ── Lease-aware keep-alive: deterministic concurrency tests ──────────────────
+
+function trackingPage(): { page: any; nav: { gotoCount: number } } {
+  const nav = { gotoCount: 0 };
+  const page = {
+    isClosed: () => false,
+    url: () => "https://chat.qwen.ai/",
+    goto: async () => { nav.gotoCount++; },
+    mouse: { move: async () => {}, down: async () => {}, up: async () => {} },
+    keyboard: { press: async () => {} },
+    viewportSize: () => ({ width: 1280, height: 720 }),
+    evaluate: async () => undefined,
+  };
+  return { page, nav };
+}
+
+function captureLogs(): { logs: string[]; restore: () => void } {
+  const logs: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]) => {
+    logs.push(args.map((a) => String(a)).join(" "));
+  };
+  return { logs, restore: () => { console.log = original; } };
+}
+
+test("idle account receives keep-alive navigation", async () => {
+  resetAccountConcurrencyForTests();
+  stopSessionKeeper();
+  const accountId = "keeper-idle-nav";
+  const { page, nav } = trackingPage();
+  registerPlaywrightAccountForTests(accountId, page, STALE_ACTIVITY_AT);
+
+  try {
+    assert.equal(hasActiveAccountLease(accountId), false);
+    await runSessionKeeperOnceForTesting();
+    assert.ok(
+      nav.gotoCount >= 1,
+      "idle account must receive a keep-alive navigation",
+    );
+  } finally {
+    await closePlaywrightForAccount(accountId).catch(() => {});
+  }
+});
+
+test("active account is skipped with log during keep-alive cycle", async () => {
+  resetAccountConcurrencyForTests();
+  stopSessionKeeper();
+  const accountId = "keeper-active-skip";
+  const { page, nav } = trackingPage();
+  registerPlaywrightAccountForTests(accountId, page, STALE_ACTIVITY_AT);
+
+  const lease = await acquireAccountLease(accountId, { label: "test-generation" });
+  const captured = captureLogs();
+  try {
+    assert.equal(hasActiveAccountLease(accountId), true);
+    await runSessionKeeperOnceForTesting();
+    assert.equal(
+      nav.gotoCount,
+      0,
+      "active account must NOT receive keep-alive navigation",
+    );
+    assert.ok(
+      captured.logs.some(
+        (l) =>
+          l.includes("[SessionKeeper] skipped active account") &&
+          l.includes(accountId) &&
+          l.includes("reason=active_lease"),
+      ),
+      `expected skip log, got: ${captured.logs.join(" | ")}`,
+    );
+  } finally {
+    captured.restore();
+    lease.release();
+    await closePlaywrightForAccount(accountId).catch(() => {});
+  }
+});
+
+test("long-running generation prevents SessionKeeper from navigating the page", async () => {
+  resetAccountConcurrencyForTests();
+  stopSessionKeeper();
+  const accountId = "keeper-long-gen";
+  const { page, nav } = trackingPage();
+  registerPlaywrightAccountForTests(accountId, page, STALE_ACTIVITY_AT);
+
+  const lease = await acquireAccountLease(accountId, { label: "long-generation" });
+  try {
+    for (let cycle = 0; cycle < 3; cycle++) {
+      await runSessionKeeperOnceForTesting();
+    }
+    assert.equal(
+      nav.gotoCount,
+      0,
+      "no navigation must occur while a generation lease is held",
+    );
+    assert.equal(isPlaywrightInitialized(accountId), true);
+  } finally {
+    lease.release();
+    await closePlaywrightForAccount(accountId).catch(() => {});
+  }
+});
+
+test("idle cleanup cannot close a context with an active lease (eviction path)", async () => {
+  resetAccountConcurrencyForTests();
+  const originalMax = config.playwright.maxActiveContexts;
+  config.playwright.maxActiveContexts = 0;
+  const accountId = "keeper-evict-active";
+
+  try {
+    registerPlaywrightAccountForTests(accountId, stubPage(), STALE_ACTIVITY_AT);
+    const lease = await acquireAccountLease(accountId, { label: "evict-test" });
+
+    try {
+      assert.equal(hasActiveAccountLease(accountId), true);
+      assert.deepEqual(getIdlePlaywrightAccountIds(IDLE_MS), []);
+      assert.equal(await closeIdlePlaywrightAccounts(IDLE_MS), 0);
+      assert.equal(isPlaywrightInitialized(accountId), true);
+    } finally {
+      lease.release();
+    }
+  } finally {
+    config.playwright.maxActiveContexts = originalMax;
+    await closePlaywrightForAccount(accountId).catch(() => {});
+  }
+});
+
+test("after lease release, later SessionKeeper cycle can keep the account alive", async () => {
+  resetAccountConcurrencyForTests();
+  stopSessionKeeper();
+  const accountId = "keeper-post-release";
+  const { page, nav } = trackingPage();
+  registerPlaywrightAccountForTests(accountId, page, STALE_ACTIVITY_AT);
+
+  const lease = await acquireAccountLease(accountId, { label: "temp-generation" });
+  try {
+    await runSessionKeeperOnceForTesting();
+    assert.equal(
+      nav.gotoCount,
+      0,
+      "must not navigate while lease is held",
+    );
+  } finally {
+    lease.release();
+  }
+
+  registerPlaywrightAccountForTests(accountId, page, STALE_ACTIVITY_AT);
+  try {
+    assert.equal(hasActiveAccountLease(accountId), false);
+    await runSessionKeeperOnceForTesting();
+    assert.ok(
+      nav.gotoCount >= 1,
+      "after lease release, the next cycle must perform keep-alive",
+    );
+  } finally {
     await closePlaywrightForAccount(accountId).catch(() => {});
   }
 });

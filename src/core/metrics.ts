@@ -100,6 +100,15 @@ export class Metrics extends EventEmitter {
         "Detected conversation topic changes",
       ],
 
+      // Account pool 2.0 metrics
+      ["pool.requests.success", "counter", "Pool successful requests"],
+      ["pool.requests.failure", "counter", "Pool failed requests"],
+      ["pool.accounts", "gauge", "Configured accounts by state"],
+      ["pool.streams.active", "gauge", "Pool active streams"],
+      ["pool.streams.queued", "gauge", "Pool queued requests"],
+      ["pool.health.avg", "gauge", "Pool average health score"],
+      ["pool.latency.avg", "gauge", "Pool average request latency (ms)"],
+
       // Watchdog metrics
       [
         "watchdog.ram.status",

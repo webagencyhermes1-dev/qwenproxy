@@ -22,13 +22,13 @@ accounts.json.bak
 *.log
 log*.txt
 qwenproxy-api-*.log.txt
+logs/
 
 # Network captures
 network/
 
 # Coverage & cache
 coverage/
-.tmp/
 .cache/
 
 # OS
@@ -36,5 +36,19 @@ coverage/
 Thumbs.db
 
 # IDE / Editor
-AGENTS.md
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+.tmp/
+.opencode/
+
+# Internal dev docs (not needed in public repo)
+DECISIONS.md
+RECOVERY.md
+ROUTING.md
 message*.txt
+AGENTS.md

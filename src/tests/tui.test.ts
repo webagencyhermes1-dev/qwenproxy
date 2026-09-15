@@ -148,8 +148,8 @@ test("TUI StatusView: exposes shortcuts and renders valid box frame", () => {
   const lines = view.render(80, 24);
   assert.ok(lines.length > 0);
   const fullText = stripAnsi(lines.join("\n"));
-  assert.ok(fullText.includes("Sistema"));
-  assert.ok(fullText.includes("Contas"));
+  assert.ok(fullText.includes("System"));
+  assert.ok(fullText.includes("Accounts"));
 });
 
 test("TUI SyncView: handles keyboard toggles and model selection", async () => {
@@ -158,7 +158,7 @@ test("TUI SyncView: handles keyboard toggles and model selection", async () => {
   assert.equal(view.tabNumber, 3);
 
   const shortcuts = view.getShortcuts();
-  assert.ok(shortcuts.some((s) => s.key === "Espaço"));
+  assert.ok(shortcuts.some((s) => s.key === "Space"));
   assert.ok(shortcuts.some((s) => s.key === "Enter"));
 
   // Verify initial selection starts unselected [ ]
@@ -185,7 +185,7 @@ test("TUI AccountsView: navigates accounts and provides cooldown actions", async
   const lines = view.render(80, 24);
   assert.ok(lines.length > 0);
   const fullText = stripAnsi(lines.join("\n"));
-  assert.ok(fullText.includes("Contas"));
+  assert.ok(fullText.includes("Accounts"));
 });
 
 test("TUI ChatView: opens vertical model modal with F2 and selects with Enter", async () => {
@@ -199,7 +199,7 @@ test("TUI ChatView: opens vertical model modal with F2 and selects with Enter", 
   // Open modal with F2
   await view.handleKey({ name: "f2", ctrl: false, shift: false, meta: false });
   const modalRender = view.render(80, 24).join("\n");
-  assert.ok(modalRender.includes("Selecionar Modelo"));
+  assert.ok(modalRender.includes("Select Model"));
 
   // Move down and select with Enter
   await view.handleKey({ name: "down", ctrl: false, shift: false, meta: false });
@@ -270,7 +270,7 @@ test("TUI Markdown: formatMarkdown converts markdown images to clean cards with 
   assert.ok(lines.some((l) => l.includes("🖼️")));
   assert.ok(lines.some((l) => l.includes("Foto de paisagem")));
   assert.ok(lines.some((l) => l.includes("https://cdn.qwenlm.ai/output/landscape.png")));
-  assert.ok(lines.some((l) => l.includes("Clique para abrir a imagem no navegador")));
+  assert.ok(lines.some((l) => l.includes("Click to open the image in your browser")));
 });
 
 test("TUI ChatView: past assistant messages preserve their generating model when switching active model", async () => {
@@ -304,7 +304,7 @@ test("TUI ChatView: renders assistant message with reasoning container correctly
   });
 
   const rendered = view.render(80, 24).join("\n");
-  assert.ok(rendered.includes("Raciocínio"));
+  assert.ok(rendered.includes("Reasoning"));
   assert.ok(rendered.includes("Passo 1"));
   assert.ok(rendered.includes("Aqui está o resultado final."));
 });
@@ -314,12 +314,12 @@ test("TUI ChatView: selects model and its reasoning effort (F2/F3 and mouse)", a
   // 1. Open Model Modal with F2
   await view.handleKey({ name: "f2", ctrl: false, shift: false, meta: false });
   let render = view.render(80, 24).join("\n");
-  assert.ok(render.includes("Selecionar Modelo"));
+  assert.ok(render.includes("Select Model"));
 
   // 2. Select first model (qwen3.8-max) with Enter -> Opens Effort Modal
   await view.handleKey({ name: "return", ctrl: false, shift: false, meta: false });
   render = view.render(80, 24).join("\n");
-  assert.ok(render.includes("Nível de Raciocínio / Effort"));
+  assert.ok(render.includes("Reasoning Level / Effort"));
   assert.ok(render.includes("High (Thinking)"));
   assert.ok(render.includes("Medium (Auto)"));
   assert.ok(render.includes("Low (Fast)"));
@@ -333,7 +333,7 @@ test("TUI ChatView: selects model and its reasoning effort (F2/F3 and mouse)", a
   // 4. Open Effort Modal directly with F3
   await view.handleKey({ name: "f3", ctrl: false, shift: false, meta: false });
   render = view.render(80, 24).join("\n");
-  assert.ok(render.includes("Nível de Raciocínio / Effort"));
+  assert.ok(render.includes("Reasoning Level / Effort"));
 
   // 5. Select Low (Fast) via mouse click on row 11
   await view.handleKey({
@@ -366,12 +366,12 @@ test("TUI ChatView: supports cursor movement and in-place character insertion wi
 test("TUI ChatView: classifyModel dynamically categorizes any model without hardcoded lists", async () => {
   const { classifyModel } = await import("../tui/views/chat-view.ts");
 
-  assert.equal(classifyModel("qwen3.8-max").category, "Texto & Raciocínio");
-  assert.ok(classifyModel("qwen3.8-max").badge.includes("[Texto]"));
-  assert.equal(classifyModel("z-image-turbo").category, "Geração de Imagem");
-  assert.ok(classifyModel("z-image-turbo").badge.includes("[Imagem]"));
-  assert.equal(classifyModel("wan3.0-video").category, "Geração de Vídeo");
-  assert.ok(classifyModel("wan3.0-video").badge.includes("[Vídeo]"));
+  assert.equal(classifyModel("qwen3.8-max").category, "Text & Reasoning");
+  assert.ok(classifyModel("qwen3.8-max").badge.includes("[Text]"));
+  assert.equal(classifyModel("z-image-turbo").category, "Image Generation");
+  assert.ok(classifyModel("z-image-turbo").badge.includes("[Image]"));
+  assert.equal(classifyModel("wan3.0-video").category, "Video Generation");
+  assert.ok(classifyModel("wan3.0-video").badge.includes("[Video]"));
 });
 
 test("TUI LogsView: renders exactly allocated height and switches filters", async () => {
@@ -430,7 +430,7 @@ test("TUI LogsView: supports selecting log line, copying, and rendering scrollba
   // Press 'y' to copy
   view.handleKey({ name: "y", ctrl: false, shift: false, meta: false });
   const copyText = view.render(80, height).join("\n");
-  assert.ok(copyText.includes("Copiado!"), "Copy chip must display feedback notification");
+  assert.ok(copyText.includes("Copied!"), "Copy chip must display feedback notification");
 
   // Press 'Esc' to clear selection
   view.handleKey({ name: "escape", ctrl: false, shift: false, meta: false });
@@ -631,14 +631,14 @@ test("TUI ChatView: clicking on lateral scrollbar navigates history proportional
   assert.strictEqual(bottomClicked, true);
   assert.strictEqual((view as any).scrollOffset, 0, "clicking bottom of scrollbar should scroll to bottom");
 });
-test("TUI ChatView: header removes [Texto] for text models and supports hover on Modelo and Effort buttons", async () => {
+test("TUI ChatView: header removes [Text] for text models and supports hover on Model and Effort buttons", async () => {
   const view = new ChatView();
   const rendered = view.render(100, 24).join("\n");
   const headerLines = rendered.split("\n").slice(0, 3).join("\n");
 
-  // Assert [Texto] is NOT rendered in the header for text/reasoning models
-  assert.ok(!stripAnsi(headerLines).includes("[Texto]"), "Header must not display [Texto]");
-  assert.ok(stripAnsi(headerLines).includes("Modelo:"), "Header must have Modelo label");
+  // Assert [Text] is NOT rendered in the header for text/reasoning models
+  assert.ok(!stripAnsi(headerLines).includes("[Text]"), "Header must not display [Text]");
+  assert.ok(stripAnsi(headerLines).includes("Model:"), "Header must have Model label");
   assert.ok(stripAnsi(headerLines).includes("Effort:"), "Header must have Effort badge");
 
   // Hover over Modelo button
@@ -756,9 +756,9 @@ test("TUI AccountsView: opens Add Account modal with 'a', types credentials, and
   // Open modal with 'a'
   await view.handleKey({ name: "a", ctrl: false, shift: false, meta: false });
   const modalRender = view.render(80, 20).join("\n");
-  assert.ok(modalRender.includes("Adicionar Nova Conta Qwen"));
-  assert.ok(modalRender.includes("E-mail:"));
-  assert.ok(modalRender.includes("Senha:"));
+  assert.ok(modalRender.includes("Add New Qwen Account"));
+  assert.ok(modalRender.includes("Email:"));
+  assert.ok(modalRender.includes("Password:"));
 
   // Type email characters
   await view.handleKey({ name: "u", ctrl: false, shift: false, meta: false, char: "u" });
@@ -775,7 +775,7 @@ test("TUI AccountsView: opens Add Account modal with 'a', types credentials, and
   // Cancel with Esc
   await view.handleKey({ name: "escape", ctrl: false, shift: false, meta: false });
   const closedRender = view.render(80, 20).join("\n");
-  assert.ok(!closedRender.includes("Adicionar Nova Conta Qwen"));
+  assert.ok(!closedRender.includes("Add New Qwen Account"));
 });
 test("TUI AccountsView: switches fields and cancels via mouse clicks in Add Account modal", async () => {
   const view = new AccountsView();
@@ -881,7 +881,7 @@ test("TUI StorageView: mouse hover and click on quick action rows", async () => 
   const view = new StorageView();
   view.render(80, 24);
 
-  // Hover row 15 ([ z ] Zerar Todos os Cooldowns)
+  // Hover row 15 ([ z ] Reset All Cooldowns)
   await view.handleKey({
     name: "hover",
     ctrl: false,
@@ -890,9 +890,9 @@ test("TUI StorageView: mouse hover and click on quick action rows", async () => 
     mouse: { type: "hover", col: 10, row: 15 },
   });
   let render = view.render(80, 24).join("\n");
-  assert.ok(render.includes("Zerar Todos os Cooldowns"));
+  assert.ok(render.includes("Reset All Cooldowns"));
 
-  // Click row 15 ([ z ] Zerar Todos os Cooldowns)
+  // Click row 15 ([ z ] Reset All Cooldowns)
   await view.handleKey({
     name: "click",
     ctrl: false,
@@ -901,7 +901,7 @@ test("TUI StorageView: mouse hover and click on quick action rows", async () => 
     mouse: { type: "click", button: "left", col: 10, row: 15 },
   });
   render = view.render(80, 24).join("\n");
-  assert.ok(render.includes("Cooldowns zerados") || render.includes("destravada"));
+  assert.ok(render.includes("Cooldowns reset") || render.includes("unlocked"));
 });
 test("TUI StorageView: repeated refresh does not duplicate profile stats", async () => {
   const view = new StorageView();
@@ -923,9 +923,9 @@ test("TUI StorageView: optimization logs are in chronological order without time
   assert.equal(logs.length, 3, "should record exactly 3 clean action entries");
 
   // Verify chronological order: Z (first), R (second), B (third)
-  assert.ok(logs[0].includes("Cooldowns zerados"), "first action should be Cooldowns zerados");
-  assert.ok(logs[1].includes("Medições atualizadas"), "second action should be Medições atualizadas");
-  assert.ok(logs[2].includes("Navegadores"), "third action should be Navegadores");
+  assert.ok(logs[0].includes("Cooldowns reset"), "first action should be Cooldowns reset");
+  assert.ok(logs[1].includes("Measurements updated"), "second action should be Measurements updated");
+  assert.ok(logs[2].includes("Browsers"), "third action should be Browsers");
 
   // Verify no timestamp
   for (const l of logs) {
@@ -973,9 +973,9 @@ test("TUI SyncView: mouse click precisely toggles clients, model, and scope", as
   });
   render = view.render(80, 24).join("\n");
   assert.ok(render.includes(glyphs.radioOff));
-  // Verify there is no duplicate "Modelo: Modelo:"
-  assert.ok(!render.includes("Modelo: Modelo:"));
-  // Click row 18 ([ Enter ] Sincronizar)
+  // Verify there is no duplicate "Model: Model:"
+  assert.ok(!render.includes("Model: Model:"));
+  // Click row 18 ([ Enter ] Sync)
   await view.handleKey({
     name: "click",
     ctrl: false,
@@ -1008,7 +1008,7 @@ test("TUI AccountsView: precision mouse click on right panel action buttons", as
   };
   view.render(80, 24, mockSnapshot as any);
 
-  // Click row 18 ([ z ] Zerar Todas) on right panel (col 55)
+  // Click row 18 ([ z ] Reset All) on right panel (col 55)
   await view.handleKey({
     name: "click",
     ctrl: false,
@@ -1017,7 +1017,7 @@ test("TUI AccountsView: precision mouse click on right panel action buttons", as
     mouse: { type: "click", button: "left", col: 55, row: 18 },
   });
   const render = view.render(80, 24, mockSnapshot as any).join("\n");
-  assert.ok(render.includes("Cooldowns zerados"));
+  assert.ok(render.includes("Cooldowns reset"));
 });
 test("TUI ChatView: displays friendly warning and blocks sending when 0 accounts are configured", async () => {
   const view = new ChatView();
@@ -1030,9 +1030,9 @@ test("TUI ChatView: displays friendly warning and blocks sending when 0 accounts
 
   // Render with 0 accounts
   const render = view.render(80, 24, emptySnapshot as any).join("\n");
-  assert.ok(render.includes("Nenhuma conta Qwen configurada"));
-  assert.ok(render.includes("[5] Contas"));
-  assert.ok(render.includes("Sem Contas"));
+  assert.ok(render.includes("No Qwen accounts configured"));
+  assert.ok(render.includes("[5] Accounts"));
+  assert.ok(render.includes("No Accounts"));
 
   // Try to type and submit message with 0 accounts
   await view.handleKey({ name: "h", ctrl: false, shift: false, meta: false, char: "h" });
@@ -1042,7 +1042,7 @@ test("TUI ChatView: displays friendly warning and blocks sending when 0 accounts
   // Should have blocked sending without creating an assistant message
   assert.equal((view as any).messages.length, 0);
   const updatedRender = view.render(80, 24, emptySnapshot as any).join("\n");
-  assert.ok(updatedRender.includes("Nenhuma conta configurada"));
+  assert.ok(updatedRender.includes("No accounts configured"));
 });
 test("TUI App & Chat: single Ctrl+C performs normal function (clears input); q does not exit", async () => {
   const app = new TuiApp(2); // Start in Chat view
@@ -1064,7 +1064,7 @@ test("TUI App & Chat: single Ctrl+C performs normal function (clears input); q d
   assert.equal((app as any).isRunning, false); // start() wasn't called, but app didn't throw/exit
 });
 
-test("TUI Views: uninitialized account shows Standby while initialized without headers shows Aquecendo", () => {
+test("TUI Views: uninitialized account shows Standby while initialized without headers shows Warming", () => {
   const statusView = new StatusView();
   const accountsView = new AccountsView();
 
@@ -1078,13 +1078,13 @@ test("TUI Views: uninitialized account shows Standby while initialized without h
   };
 
   const statusRender = statusView.render(100, 24, snapshot).join("\n");
-  assert.ok(statusRender.includes("Pronto"), "Ready account must show Pronto");
-  assert.ok(statusRender.includes("Aquecendo..."), "Warming account must show Aquecendo...");
+  assert.ok(statusRender.includes("Ready"), "Ready account must show Ready");
+  assert.ok(statusRender.includes("Warming..."), "Warming account must show Warming...");
   assert.ok(statusRender.includes("Standby"), "Uninitialized account must show Standby");
 
   const accountsRender = accountsView.render(100, 24, snapshot).join("\n");
-  assert.ok(accountsRender.includes("Pronto"), "AccountsView must show Pronto");
-  assert.ok(accountsRender.includes("Aquecendo..."), "AccountsView must show Aquecendo...");
+  assert.ok(accountsRender.includes("Ready"), "AccountsView must show Ready");
+  assert.ok(accountsRender.includes("Warming..."), "AccountsView must show Warming...");
   assert.ok(accountsRender.includes("Standby"), "AccountsView must show Standby");
 });
 test("TUI AccountsView: pressing 'd' opens confirmation modal, 'n' cancels without deleting", async () => {
@@ -1101,15 +1101,15 @@ test("TUI AccountsView: pressing 'd' opens confirmation modal, 'n' cancels witho
   await view.handleKey({ name: "d", ctrl: false, shift: false, meta: false });
   assert.equal(view.isCapturingText(), true, "modal must be capturing text/input");
   let render = view.render(100, 24, snapshot).join("\n");
-  assert.ok(render.includes("Confirmar Remoção de Conta"), "modal title must be displayed");
+  assert.ok(render.includes("Confirm Account Removal"), "modal title must be displayed");
   assert.ok(render.includes("keep@test.com"), "account email must be mentioned");
-  assert.ok(render.includes("Sim, Confirmar"), "confirm button must be present");
+  assert.ok(render.includes("Yes, Confirm"), "confirm button must be present");
 
   // 2. Press 'n' - cancels without deletion
   await view.handleKey({ name: "n", ctrl: false, shift: false, meta: false });
   assert.equal(view.isCapturingText(), false, "modal must be closed");
   render = view.render(100, 24, snapshot).join("\n");
-  assert.ok(render.includes("cancelada"), "status message must indicate cancellation");
+  assert.ok(render.includes("cancelled"), "status message must indicate cancellation");
 });
 
 test("TUI AccountsView: pressing 'x' opens confirmation modal for account chat deletion", async () => {
@@ -1126,7 +1126,7 @@ test("TUI AccountsView: pressing 'x' opens confirmation modal for account chat d
   await view.handleKey({ name: "x", ctrl: false, shift: false, meta: false });
   assert.equal(view.isCapturingText(), true);
   let render = view.render(100, 24, snapshot).join("\n");
-  assert.ok(render.includes("Apagar Chats"), "modal must prompt for chat deletion");
+  assert.ok(render.includes("Delete") && render.includes("Chats"), "modal must prompt for chat deletion");
   assert.ok(render.includes("chat@test.com"));
 
   // Press 'Esc' to cancel
@@ -1134,7 +1134,7 @@ test("TUI AccountsView: pressing 'x' opens confirmation modal for account chat d
   assert.equal(view.isCapturingText(), false);
 });
 
-test("TUI AccountsView: confirmation modal mouse hover and click on Confirmar and Cancelar buttons", async () => {
+test("TUI AccountsView: confirmation modal mouse hover and click on Confirm and Cancel buttons", async () => {
   const view = new AccountsView();
   const snapshot: any = {
     online: true,
@@ -1152,7 +1152,7 @@ test("TUI AccountsView: confirmation modal mouse hover and click on Confirmar an
   view.render(100, 24, snapshot);
   const leftPad = (view as any).lastConfirmModalLeftPad;
 
-  // 2. Hover over "Sim, Confirmar" button (terminal row 9)
+  // 2. Hover over "Yes, Confirm" button (terminal row 9)
   await view.handleKey({
     name: "hover",
     ctrl: false,
@@ -1162,7 +1162,7 @@ test("TUI AccountsView: confirmation modal mouse hover and click on Confirmar an
   });
   assert.equal((view as any).confirmDialogHovered, "confirm", "must hover confirm button on row 9");
 
-  // 3. Hover over "Cancelar" button (terminal row 9)
+  // 3. Hover over "Cancel" button (terminal row 9)
   await view.handleKey({
     name: "hover",
     ctrl: false,
@@ -1172,7 +1172,7 @@ test("TUI AccountsView: confirmation modal mouse hover and click on Confirmar an
   });
   assert.equal((view as any).confirmDialogHovered, "cancel", "must hover cancel button on row 9");
 
-  // 4. Click on "Cancelar" button
+  // 4. Click on "Cancel" button
   await view.handleKey({
     name: "click",
     ctrl: false,
@@ -1221,17 +1221,17 @@ test("TUI StorageView: pressing 'l' opens confirmation modal for deleting all ch
   await view.handleKey({ name: "l", ctrl: false, shift: false, meta: false });
   assert.equal(view.isCapturingText(), true);
   let render = view.render(100, 24).join("\n");
-  assert.ok(render.includes("Confirmar Exclusão de Chats Remotos"));
-  assert.ok(render.includes("TODAS as contas"));
+  assert.ok(render.includes("Confirm Remote Chat Deletion"));
+  assert.ok(render.includes("ALL accounts"));
 
   // Press 'n' to cancel
   await view.handleKey({ name: "n", ctrl: false, shift: false, meta: false });
   assert.equal(view.isCapturingText(), false);
   const logs = (view as any).actionLogs;
-  assert.ok(logs[logs.length - 1].includes("cancelada"));
+  assert.ok(logs[logs.length - 1].includes("cancelled"));
 });
 
-test("TUI StorageView: confirmation modal mouse hover and click on Confirmar and Cancelar buttons", async () => {
+test("TUI StorageView: confirmation modal mouse hover and click on Confirm and Cancel buttons", async () => {
   const view = new StorageView();
   view.render(100, 24);
 
@@ -1242,7 +1242,7 @@ test("TUI StorageView: confirmation modal mouse hover and click on Confirmar and
   view.render(100, 24);
   const leftPad = (view as any).lastConfirmModalLeftPad;
 
-  // 2. Hover over "Sim, Confirmar" button (terminal row 9)
+  // 2. Hover over "Yes, Confirm" button (terminal row 9)
   await view.handleKey({
     name: "hover",
     ctrl: false,
@@ -1252,7 +1252,7 @@ test("TUI StorageView: confirmation modal mouse hover and click on Confirmar and
   });
   assert.equal((view as any).confirmDialogHovered, "confirm", "must hover confirm button on row 9 in StorageView");
 
-  // 3. Hover over "Cancelar" button (terminal row 9)
+  // 3. Hover over "Cancel" button (terminal row 9)
   await view.handleKey({
     name: "hover",
     ctrl: false,
@@ -1262,7 +1262,7 @@ test("TUI StorageView: confirmation modal mouse hover and click on Confirmar and
   });
   assert.equal((view as any).confirmDialogHovered, "cancel", "must hover cancel button on row 9 in StorageView");
 
-  // 4. Click on "Cancelar" button
+  // 4. Click on "Cancel" button
   await view.handleKey({
     name: "click",
     ctrl: false,

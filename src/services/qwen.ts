@@ -1490,6 +1490,31 @@ export async function syncQwenRequestPersonalization(
   // instruction pode ser vazia para limpar personalization
 
   const cacheKey = accountId || "global";
+  const bypassCache = metadata.forceSync === true;
+
+  // Fast path (Cycle 5/6 optimization): compute the sync hash from the
+  // instruction alone — pure function, no browser I/O — and return early on
+  // memory-cache hit BEFORE any header fetch or page navigation. The previous
+  // code paid getBasicHeaders + getQwenHeaders on every request even when the
+  // personalization was unchanged (~40k chars re-synced per turn).
+  const earlySent = textSize(instruction);
+  const earlySyncHash = earlySent.hash ? `${earlySent.hash}:${QWEN_SAFE_SETTINGS_HASH}` : null;
+  if (!bypassCache && earlySyncHash) {
+    const earlyCached = lastSyncedPersonalizationHashes.get(cacheKey);
+    if (earlyCached === earlySyncHash) {
+      rememberActivePersonalization(cacheKey, instruction, metadata, "memory");
+      return true;
+    }
+    // DB cache also needs no browser I/O — check before any network work.
+    if (!earlyCached) {
+      const earlyDbHash = getPersonalizationHashFromDb(cacheKey);
+      if (earlyDbHash === earlySyncHash) {
+        lastSyncedPersonalizationHashes.set(cacheKey, earlySyncHash);
+        rememberActivePersonalization(cacheKey, instruction, metadata, "db");
+        return true;
+      }
+    }
+  }
 
   // Proactive token renewal: refresh BEFORE attempting personalization
   // to avoid 401 errors that waste time on retry
@@ -1515,9 +1540,9 @@ export async function syncQwenRequestPersonalization(
 
   const sent = textSize(instruction);
   const syncHash = sent.hash ? `${sent.hash}:${QWEN_SAFE_SETTINGS_HASH}` : null;
-  const bypassCache = metadata.forceSync === true;
 
-  // 1. Check memory cache (skipped on forceSync)
+  // 1. Check memory cache (skipped on forceSync) — re-checked here because a
+  // concurrent request may have synced while we were fetching headers.
   const cachedHash = lastSyncedPersonalizationHashes.get(cacheKey);
   if (!bypassCache && syncHash && cachedHash === syncHash) {
     rememberActivePersonalization(cacheKey, instruction, metadata, "memory");
@@ -2126,11 +2151,20 @@ function isQwenQuotaLimitMessage(details: string): boolean {
   return (
     normalized.includes("allocated quota exceeded") ||
     normalized.includes("quota exceeded") ||
+    normalized.includes("quota exhausted") ||
     normalized.includes("increase your quota") ||
     normalized.includes("token-limit") ||
     normalized.includes("insufficient quota") ||
     normalized.includes("rate limit") ||
-    normalized.includes("ratelimited")
+    normalized.includes("ratelimited") ||
+    normalized.includes("upper limit") ||
+    normalized.includes("limit for today") ||
+    normalized.includes("usage limit") ||
+    normalized.includes("usage_limit") ||
+    normalized.includes("maximum usage") ||
+    normalized.includes("max usage") ||
+    normalized.includes("daily limit") ||
+    normalized.includes("daily usage")
   );
 }
 
@@ -2189,19 +2223,40 @@ function parseQwenJsonError(
     return error;
   }
 
-  // Anti-bot detection: FAIL_SYS_USER_VALIDATE / RGV587_ERROR
-  if (
-    typeof details === "string" &&
-    (details.includes("FAIL_SYS_USER_VALIDATE") ||
-      details.includes("RGV587_ERROR") ||
-      details.includes("user validate"))
-  ) {
-    const error = new RetryableQwenStreamError(
-      `Qwen anti-bot: ${details}`,
-      0,
-    );
-    error.upstreamCode = "waf_challenge";
-    return error;
+  // Anti-bot detection (canonical): every recognized challenge form
+  // normalizes to waf_challenge. Case-insensitive; covers codes, "user
+  // validate", CAPTCHA / security / human verification messages, and TMD
+  // markers. Sanitized message never carries raw challenge payloads.
+  if (typeof details === "string") {
+    const lower = details.toLowerCase();
+    if (
+      lower.includes("fail_sys_user_validate") ||
+      lower.includes("rgv587_error") ||
+      lower.includes("user validate") ||
+      lower.includes("_____tmd_____") ||
+      lower.includes("tmd anti-bot") ||
+      lower.includes("tmd anti_bot") ||
+      lower.includes("aliyun_waf") ||
+      lower.includes("denyfromx5") ||
+      lower.includes("captcha") ||
+      lower.includes("security verification") ||
+      lower.includes("security-verification") ||
+      lower.includes("verify you are human") ||
+      lower.includes("verify you're human") ||
+      lower.includes("human verification") ||
+      lower.includes("anti-bot") ||
+      lower.includes("anti_bot")
+    ) {
+      const error = new RetryableQwenStreamError(
+        `Qwen anti-bot: ${details.substring(0, 200)}`,
+        0,
+      );
+      error.upstreamCode = "waf_challenge";
+      (error as unknown as Record<string, unknown>).forceNewChat = true;
+      (error as unknown as Record<string, unknown>).retryWithFullPrompt = true;
+      (error as unknown as Record<string, unknown>).switchAccount = true;
+      return error;
+    }
   }
 
   if (
@@ -2289,11 +2344,20 @@ function isWafChallengeResponse(value: string): boolean {
   return (
     normalized.includes("aliyun_waf") ||
     normalized.includes("_____tmd_____") ||
+    normalized.includes("tmd anti-bot") ||
+    normalized.includes("tmd anti_bot") ||
     normalized.includes("fail_sys_user_validate") ||
     normalized.includes("rgv587_error") ||
+    normalized.includes("user validate") ||
     normalized.includes("denyfromx5") ||
     normalized.includes("captcha") ||
-    normalized.includes("security verification")
+    normalized.includes("security verification") ||
+    normalized.includes("security-verification") ||
+    normalized.includes("verify you are human") ||
+    normalized.includes("verify you're human") ||
+    normalized.includes("human verification") ||
+    normalized.includes("anti-bot") ||
+    normalized.includes("anti_bot")
   );
 }
 

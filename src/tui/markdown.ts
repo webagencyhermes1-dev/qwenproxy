@@ -47,9 +47,9 @@ export function formatImageCard(alt: string, url: string, maxWidth: number): str
   const cleanAlt =
     alt && alt !== "Generated image" && alt !== "image"
       ? ` ${alt.trim()} `
-      : " Imagem Gerada ";
+      : " Generated Image ";
   const innerW = cardW - 2;
-  const linkLabel = `[ 🔗 Clique para abrir a imagem no navegador ]`;
+  const linkLabel = `[ 🔗 Click to open the image in your browser ]`;
   const osc8 = `\x1b]8;;${url}\x1b\\${theme.cyan(theme.underline(linkLabel))}\x1b]8;;\x1b\\`;
   const labelVisualW = stringWidth(linkLabel);
   const paddingRight = " ".repeat(Math.max(0, innerW - labelVisualW - 2));

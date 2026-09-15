@@ -66,6 +66,53 @@ test("quota: without a wait hint it still uses the midnight-based cooldown (neve
   assert.equal(action.reason, "quota_or_rate_limit");
 });
 
+test("quota: daily usage-limit phrasing variants rotate with a midnight cooldown", () => {
+  // Production 2026-09: "you've reached the maximum usage limits for today"
+  // arrived with a non-RateLimited code and escaped quota handling entirely —
+  // no midnight cooldown, and sticky sessions broke out of rotation instead
+  // of shifting accounts. Every daily-limit phrasing must behave identically.
+  const variants: Array<[string, string]> = [
+    ["QuotaExceeded", "you have reached the maximum usage limits for today"],
+    ["quota_exceeded", "maximum usage limit reached"],
+    ["usage_limit_exceeded", "daily usage limit exceeded"],
+    ["UsageLimit", "Daily limit exceeded, please try tomorrow"],
+    ["QuotaExceeded", "quota exhausted for today"],
+    ["SomeNewCode", "you have reached the upper limit for today"],
+  ];
+  for (const [code, details] of variants) {
+    const err = Object.assign(new Error(`Qwen upstream error: ${code}: ${details}`), {
+      upstreamCode: code,
+    });
+    const action = classifyRetryAction(err);
+    assert.equal(action.reason, "quota_or_rate_limit", `${code}: ${details}`);
+    assert.equal(action.retryable, true);
+    assert.equal(action.switchAccount, true);
+    assert.equal(action.accountCooldownReason, "RateLimited");
+    assert.ok(
+      action.accountCooldownMs !== undefined && action.accountCooldownMs > 0,
+      "exhausted account must be cooled until midnight",
+    );
+  }
+});
+
+test("quota: SSE usage-limit errors classify as quota with account switch", async () => {
+  const { throwFromSseUpstreamError } = await import("../routes/chat/retry-policy.ts");
+  assert.throws(
+    () =>
+      throwFromSseUpstreamError(
+        "usage_limit_exceeded",
+        "you have reached the maximum usage limits for today",
+      ),
+    (err: unknown) => {
+      const action = classifyRetryAction(err);
+      assert.equal(action.reason, "quota_or_rate_limit");
+      assert.equal(action.switchAccount, true);
+      assert.equal(action.accountCooldownReason, "RateLimited");
+      return true;
+    },
+  );
+});
+
 test("quota: temporary ('alta demanda') keeps the short same-account retry", () => {
   const err = Object.assign(
     new Error("quota_limit: O serviço está com alta demanda no momento."),

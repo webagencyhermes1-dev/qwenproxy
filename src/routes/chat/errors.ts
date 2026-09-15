@@ -9,16 +9,31 @@ export interface ParsedQwenErrorPayload {
   status: number;
 }
 
+/**
+ * Canonical HTML/text WAF-challenge detector. Mirrors the retry-policy
+ * canonical matcher so every challenge form normalizes to `waf_challenge`
+ * before retry decisions are made. Details returned to callers stay
+ * sanitized — raw WAF HTML is never forwarded downstream or logged.
+ */
 function isWafChallenge(value: string): boolean {
   const normalized = value.toLowerCase();
   return (
     normalized.includes("aliyun_waf") ||
     normalized.includes("_____tmd_____") ||
+    normalized.includes("tmd anti-bot") ||
+    normalized.includes("tmd anti_bot") ||
     normalized.includes("fail_sys_user_validate") ||
     normalized.includes("rgv587_error") ||
+    normalized.includes("user validate") ||
     normalized.includes("denyfromx5") ||
     normalized.includes("captcha") ||
-    normalized.includes("security verification")
+    normalized.includes("security verification") ||
+    normalized.includes("security-verification") ||
+    normalized.includes("verify you are human") ||
+    normalized.includes("verify you're human") ||
+    normalized.includes("human verification") ||
+    normalized.includes("anti-bot") ||
+    normalized.includes("anti_bot")
   );
 }
 

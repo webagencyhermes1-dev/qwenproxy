@@ -10,13 +10,13 @@ function parseInitialTab(): number {
   const tabArgIdx = args.findIndex((a) => a === "--tab" || a === "-t");
   if (tabArgIdx !== -1 && args[tabArgIdx + 1]) {
     const parsed = parseInt(args[tabArgIdx + 1], 10);
-    if (!isNaN(parsed) && parsed >= 1 && parsed <= 6) {
+    if (!isNaN(parsed) && parsed >= 1 && parsed <= 7) {
       return parsed;
     }
   }
 
   // Positional numeric argument (e.g. `npm run tui 2`)
-  const firstNumeric = args.find((a) => /^[1-6]$/.test(a));
+  const firstNumeric = args.find((a) => /^[1-7]$/.test(a));
   if (firstNumeric) {
     return parseInt(firstNumeric, 10);
   }
@@ -27,9 +27,9 @@ function parseInitialTab(): number {
 async function main() {
   if (!process.stdout.isTTY || !process.stdin.isTTY) {
     console.log(
-      "\x1b[33m[QwenProxy TUI]\x1b[0m A interface interativa TUI requer uma sessão de terminal interativo.",
+      "\x1b[33m[QwenProxy TUI]\x1b[0m The interactive TUI requires an interactive terminal session.",
     );
-    console.log("Execute diretamente no seu terminal: npm run tui");
+    console.log("Run directly in your terminal: npm run tui");
     process.exit(0);
   }
 
@@ -44,7 +44,7 @@ async function main() {
     try {
       await app.stop();
     } catch {}
-    console.error("[QwenProxy TUI] Erro inesperado:", err);
+    console.error("[QwenProxy TUI] Unexpected error:", err);
     process.exit(1);
   });
 
@@ -56,7 +56,7 @@ async function main() {
     try {
       await app.stop();
     } catch {}
-    console.error("[QwenProxy TUI] Promessa rejeitada:", err);
+    console.error("[QwenProxy TUI] Unhandled rejection:", err);
     process.exit(1);
   });
 
@@ -64,6 +64,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("[QwenProxy TUI] Falha ao inicializar:", err);
+  console.error("[QwenProxy TUI] Failed to start:", err);
   process.exit(1);
 });

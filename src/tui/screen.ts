@@ -297,11 +297,11 @@ export class Screen {
       // Terminal size warning
       const warnLines = [
         "",
-        theme.yellow("  ⚠️  Terminal muito pequeno para a interface QwenProxy."),
-        theme.muted(`  Tamanho atual: ${cols}x${rows} | Mínimo recomendado: 80x24`),
-        theme.cyan("  Por favor, expanda a janela do seu terminal."),
+        theme.yellow("  ⚠️  Terminal too small for the QwenProxy UI."),
+        theme.muted(`  Current size: ${cols}x${rows} | Minimum recommended: 80x24`),
+        theme.cyan("  Please expand your terminal window."),
         "",
-        theme.muted("  Pressione Ctrl+C duas vezes para sair."),
+        theme.muted("  Press Ctrl+C twice to exit."),
       ];
       process.stdout.write(ANSI.cursorHome + warnLines.join("\n") + "\n");
       return;

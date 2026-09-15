@@ -185,6 +185,25 @@ test("classifyRetryAction: temporary quota (alta demanda) retries same account",
   assert.equal(action.reason, "quota_or_rate_limit");
 });
 
+test("classifyRetryAction: 'high demand / try again later' never switches accounts", () => {
+  const variants = [
+    "Service is currently experiencing high demand. Please try again later.",
+    "The service is under high demand, try again later.",
+    "Alta demanda no serviço. Tente novamente mais tarde.",
+  ];
+  for (const message of variants) {
+    const err = Object.assign(new Error(`RateLimited: ${message}`), {
+      upstreamCode: "RateLimited",
+    });
+    const action = classifyRetryAction(err);
+    assert.equal(action.reason, "quota_or_rate_limit", message);
+    assert.equal(action.retryable, true, message);
+    assert.equal(action.switchAccount, false, message);
+    assert.equal(action.accountCooldownReason, "RateLimitTemporary", message);
+    assert.ok(action.retryAfterMs <= 3_000, message);
+  }
+});
+
 test("classifyRetryAction: real quota exhaustion prefers account switch", () => {
   const err = Object.assign(
     new Error("RateLimited: You've reached the upper limit for today's usage."),
@@ -196,17 +215,19 @@ test("classifyRetryAction: real quota exhaustion prefers account switch", () => 
   assert.equal(action.reason, "quota_or_rate_limit");
 });
 
-test("classifyRetryAction: WAF challenges retry the same account immediately", () => {
+test("classifyRetryAction: WAF challenges fail over to another account immediately", () => {
   const err = Object.assign(
     new Error("Qwen returned an anti-bot challenge instead of an SSE response."),
     { upstreamCode: "waf_challenge" },
   );
   const action = classifyRetryAction(err);
   assert.equal(action.retryable, true);
-  assert.equal(action.switchAccount, false);
+  assert.equal(action.switchAccount, true);
+  assert.equal(action.forceNewChat, true);
+  assert.equal(action.retryWithFullPrompt, true);
   assert.equal(action.retryAfterMs, 0);
-  assert.equal(action.accountCooldownMs, undefined);
-  assert.equal(action.accountCooldownReason, undefined);
+  assert.equal(action.accountCooldownReason, "WafChallenge");
+  assert.ok(action.accountCooldownMs !== undefined && action.accountCooldownMs > 0);
   assert.equal(action.reason, "anti_bot");
 });
 

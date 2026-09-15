@@ -1,4 +1,5 @@
 import { config } from "../core/config.ts";
+import { hasActiveAccountLease } from "../core/account-concurrency.ts";
 
 import {
   closeIdlePlaywrightAccounts,
@@ -24,6 +25,12 @@ async function runKeepAliveCycle(): Promise<void> {
     if (config.sessionKeeper.enabled) {
       const accountIds = getActivePlaywrightAccountIds();
       for (const accountId of accountIds) {
+        if (hasActiveAccountLease(accountId)) {
+          console.log(
+            `[SessionKeeper] skipped active account | account=${accountId} | reason=active_lease`,
+          );
+          continue;
+        }
         await keepAlivePlaywrightAccount(accountId).catch((error) => {
           // Shutdown/eviction closes contexts while a cycle is in flight; the
           // resulting "already closed" rejection is benign. The old substring
@@ -37,6 +44,14 @@ async function runKeepAliveCycle(): Promise<void> {
             `[SessionKeeper] Keep-alive failed for ${accountId}: ${message}`,
           );
         });
+        // TOCTOU check: a lease may have been acquired during the keep-alive.
+        // Log a warning so operators can detect races (the keep-alive itself is
+        // lightweight and unlikely to interfere, but the signal is useful).
+        if (hasActiveAccountLease(accountId)) {
+          console.warn(
+            `[SessionKeeper] Lease acquired during keep-alive | account=${accountId} | possible race`,
+          );
+        }
         await sleep(humanDelay(250, 900));
       }
     }

@@ -62,16 +62,16 @@ export class StorageView implements TuiView {
   public getShortcuts(): Array<{ key: string; label: string }> {
     if (this.confirmDialog) {
       return [
-        { key: "S / Enter", label: "Confirmar" },
-        { key: "N / Esc", label: "Cancelar" },
+        { key: "Y / Enter", label: "Confirm" },
+        { key: "N / Esc", label: "Cancel" },
       ];
     }
     return [
-      { key: "p", label: "Podar Caches" },
-      { key: "b", label: "Limpar Navegadores" },
-      { key: "z", label: "Zerar Cooldowns" },
-      { key: "l", label: "Limpar Chats Qwen" },
-      { key: "r", label: "Atualizar Disco" },
+      { key: "p", label: "Prune Caches" },
+      { key: "b", label: "Clean Browsers" },
+      { key: "z", label: "Reset Cooldowns" },
+      { key: "l", label: "Clear Qwen Chats" },
+      { key: "r", label: "Refresh Disk" },
     ];
   }
   public async refresh(): Promise<void> {
@@ -116,7 +116,7 @@ export class StorageView implements TuiView {
       );
     } catch (err: any) {
       this.addLog(
-        theme.red(`✗ Erro ao calcular armazenamento: ${err?.message || String(err)}`),
+        theme.red(`✗ Error calculating storage: ${err?.message || String(err)}`),
       );
     } finally {
       this.isScanning = false;
@@ -126,7 +126,7 @@ export class StorageView implements TuiView {
   public async handleKey(key: KeyEvent): Promise<boolean | void> {
     // 0. Confirm Dialog Active
     if (this.confirmDialog) {
-      if (key.name === "s" || key.name === "S") {
+      if (key.name === "y" || key.name === "Y") {
         const dialog = this.confirmDialog;
         this.confirmDialog = null;
         this.confirmDialogHovered = null;
@@ -136,14 +136,14 @@ export class StorageView implements TuiView {
       if (key.name === "escape" || key.name === "n" || key.name === "N") {
         this.confirmDialog = null;
         this.confirmDialogHovered = null;
-        this.addLog(theme.muted("Ação cancelada"));
+        this.addLog(theme.muted("Action cancelled"));
         return true;
       }
       if (key.name === "enter" || key.name === "return") {
         if (this.confirmDialogHovered === "cancel") {
           this.confirmDialog = null;
           this.confirmDialogHovered = null;
-          this.addLog(theme.muted("Ação cancelada"));
+          this.addLog(theme.muted("Action cancelled"));
           return true;
         }
         const dialog = this.confirmDialog;
@@ -196,7 +196,7 @@ export class StorageView implements TuiView {
           if (relCol >= 35 && relCol <= 60) {
             this.confirmDialog = null;
             this.confirmDialogHovered = null;
-            this.addLog(theme.muted("Ação cancelada"));
+            this.addLog(theme.muted("Action cancelled"));
             return true;
           }
         }
@@ -250,7 +250,7 @@ export class StorageView implements TuiView {
     if ((key.name === "z" || key.name === "Z") && !key.ctrl) {
       const cleared = resetAllCooldowns();
       this.addLog(
-        theme.green(`✓ Cooldowns zerados: ${cleared} conta(s) destravada(s)`),
+        theme.green(`✓ Cooldowns reset: ${cleared} account(s) unlocked`),
       );
       return true;
     }
@@ -259,7 +259,7 @@ export class StorageView implements TuiView {
     if ((key.name === "r" || key.name === "R") && !key.ctrl) {
       await this.refresh();
       this.addLog(
-        theme.green(`✓ Medições atualizadas: ${formatBytes(this.profilesTotalBytes)} em ${this.profilesCount} perfil(is)`),
+        theme.green(`✓ Measurements updated: ${formatBytes(this.profilesTotalBytes)} across ${this.profilesCount} profile(s)`),
       );
       return true;
     }
@@ -268,14 +268,14 @@ export class StorageView implements TuiView {
       try {
         const res = pruneAllPlaywrightProfiles();
         const orphanRes = cleanupOrphanProfiles();
-        let logMsg = `✓ Caches limpos: ${formatBytes(res.totalFreedBytes)} liberados em ${res.totalFreedFiles} arquivos (${res.profilesCleaned} perfis)`;
+        let logMsg = `✓ Caches cleaned: ${formatBytes(res.totalFreedBytes)} freed across ${res.totalFreedFiles} files (${res.profilesCleaned} profiles)`;
         if (orphanRes.removedCount > 0) {
-          logMsg += ` + ${orphanRes.removedCount} perfil(is) órfão(s) removido(s)`;
+          logMsg += ` + ${orphanRes.removedCount} orphan profile(s) removed`;
         }
         this.addLog(theme.green(logMsg));
         await this.refresh();
       } catch (err: any) {
-        this.addLog(theme.red(`✗ Falha ao limpar perfis: ${err?.message || String(err)}`));
+        this.addLog(theme.red(`✗ Failed to clean profiles: ${err?.message || String(err)}`));
       }
       return true;
     }
@@ -287,20 +287,20 @@ export class StorageView implements TuiView {
         if (res.freedBytes > 0 || res.unusedDirs.length > 0) {
           this.addLog(
             theme.green(
-              `✓ Navegadores limpos: ${formatBytes(res.freedBytes)} recuperados em disco (${res.unusedDirs.length} versões removidas)`,
+              `✓ Browsers cleaned: ${formatBytes(res.freedBytes)} reclaimed (${res.unusedDirs.length} versions removed)`,
             ),
           );
         } else {
           this.addLog(
             theme.green(
-              `✓ Navegadores verificados: nenhum navegador antigo encontrado`,
+              `✓ Browsers checked: no old browsers found`,
             ),
           );
         }
         await this.refresh();
       } catch (err: any) {
         this.addLog(
-          theme.red(`✗ Falha ao remover navegadores: ${err?.message || String(err)}`),
+          theme.red(`✗ Failed to remove browsers: ${err?.message || String(err)}`),
         );
       }
       return true;
@@ -308,21 +308,21 @@ export class StorageView implements TuiView {
     // Delete all remote chats with 'l' or 'L' (requires confirmation)
     if ((key.name === "l" || key.name === "L") && !key.ctrl) {
       this.confirmDialog = {
-        title: "⚠️  Confirmar Exclusão de Chats Remotos",
-        message: "Apagar TODOS os chats remotos de TODAS as contas no Qwen?",
-        detail: "Esta ação apagará permanentemente todas as conversas em chat.qwen.ai.",
+        title: "⚠️  Confirm Remote Chat Deletion",
+        message: "Delete ALL remote chats for ALL accounts on Qwen?",
+        detail: "This action will permanently delete all conversations on chat.qwen.ai.",
         onConfirm: async () => {
-          this.addLog(theme.yellow("⏳ Apagando chats no Qwen de todas as contas..."));
+          this.addLog(theme.yellow("⏳ Deleting chats on Qwen for all accounts..."));
           try {
             const { deleteChatsForConfiguredAccounts } = await import("../../services/chat-cleanup.ts");
             const res = await deleteChatsForConfiguredAccounts(true);
             this.addLog(
               theme.green(
-                `✓ Todos os chats remotos foram apagados no Qwen (${res.succeeded}/${res.attempted} contas)`,
+                `✓ All remote chats were deleted on Qwen (${res.succeeded}/${res.attempted} accounts)`,
               ),
             );
           } catch (err: any) {
-            this.addLog(theme.red(`✗ Falha ao apagar chats: ${err?.message || String(err)}`));
+            this.addLog(theme.red(`✗ Failed to delete chats: ${err?.message || String(err)}`));
           }
         },
       };
@@ -347,28 +347,28 @@ export class StorageView implements TuiView {
     // Left Panel: Storage Diagnostics
     const unusedStatus =
       this.unusedBrowsersCount > 0
-        ? theme.yellow(`${glyphs.bullet} ${formatBytes(this.reclaimableBrowserBytes)} (${this.unusedBrowsersCount} versões)`)
-        : theme.green("✓ Nenhum");
+        ? theme.yellow(`${glyphs.bullet} ${formatBytes(this.reclaimableBrowserBytes)} (${this.unusedBrowsersCount} versions)`)
+        : theme.green("✓ None");
 
     const leftContent: string[] = [
       "",
-      `  ${theme.bold(theme.white("Armazenamento dos Perfis:"))}`,
-      `    ${theme.dim("Perfis Qwen:")}         ${theme.cyan(formatBytes(this.profilesTotalBytes))} ${theme.muted(`(${this.profilesCount} conta${this.profilesCount === 1 ? "" : "s"})`)}`,
-      `    ${theme.dim("Navegador Ativo:")}     ${theme.green(`${glyphs.bullet} ${this.activeBrowser}`)}`,
-      `    ${theme.dim("Navegadores Antigos:")} ${unusedStatus}`,
-      `    ${theme.dim("Integridade:")}         ${theme.green("✓ Sessões salvas")}`,
+      `  ${theme.bold(theme.white("Profile Storage:"))}`,
+      `    ${theme.dim("Qwen Profiles:")}       ${theme.cyan(formatBytes(this.profilesTotalBytes))} ${theme.muted(`(${this.profilesCount} account${this.profilesCount === 1 ? "" : "s"})`)}`,
+      `    ${theme.dim("Active Browser:")}      ${theme.green(`${glyphs.bullet} ${this.activeBrowser}`)}`,
+      `    ${theme.dim("Old Browsers:")}        ${unusedStatus}`,
+      `    ${theme.dim("Integrity:")}           ${theme.green("✓ Sessions saved")}`,
       "",
-      `  ${theme.bold(theme.white("Ações Rápidas:"))}`,
-      `    ${this.hoveredActionRow === 13 ? theme.bgHover(` ${theme.cyan("[ P ] Podar Caches")} `) : `${theme.cyan("[ P ]")} Podar Caches`}`,
-      `    ${this.hoveredActionRow === 14 ? theme.bgHover(` ${theme.yellow("[ B ] Limpar Navegadores")} `) : `${theme.yellow("[ B ]")} Limpar Navegadores`}`,
-      `    ${this.hoveredActionRow === 15 ? theme.bgHover(` ${theme.green("[ Z ] Zerar Todos os Cooldowns")} `) : `${theme.green("[ Z ]")} Zerar Todos os Cooldowns`}`,
-      `    ${this.hoveredActionRow === 16 ? theme.bgHover(` ${theme.red("[ L ] Limpar Todos os Chats (Qwen)")} `) : `${theme.red("[ L ]")} Limpar Todos os Chats (Qwen)`}`,
-      `    ${this.hoveredActionRow === 17 ? theme.bgHover(` ${theme.muted("[ R ] Atualizar Disco")} `) : `${theme.muted("[ R ]")} Atualizar Disco`}`,
+      `  ${theme.bold(theme.white("Quick Actions:"))}`,
+      `    ${this.hoveredActionRow === 13 ? theme.bgHover(` ${theme.cyan("[ P ] Prune Caches")} `) : `${theme.cyan("[ P ]")} Prune Caches`}`,
+      `    ${this.hoveredActionRow === 14 ? theme.bgHover(` ${theme.yellow("[ B ] Clean Browsers")} `) : `${theme.yellow("[ B ]")} Clean Browsers`}`,
+      `    ${this.hoveredActionRow === 15 ? theme.bgHover(` ${theme.green("[ Z ] Reset All Cooldowns")} `) : `${theme.green("[ Z ]")} Reset All Cooldowns`}`,
+      `    ${this.hoveredActionRow === 16 ? theme.bgHover(` ${theme.red("[ L ] Clear All Chats (Qwen)")} `) : `${theme.red("[ L ]")} Clear All Chats (Qwen)`}`,
+      `    ${this.hoveredActionRow === 17 ? theme.bgHover(` ${theme.muted("[ R ] Refresh Disk")} `) : `${theme.muted("[ R ]")} Refresh Disk`}`,
       "",
     ];
 
     const leftBox = drawBox({
-      title: "Espaço em Disco",
+      title: "Disk Space",
       width: leftW,
       height: contentH,
       borderColor: theme.borderInactive,
@@ -379,31 +379,31 @@ export class StorageView implements TuiView {
     // Right Panel: Account Profiles & Optimization Logs
     const rightContent: string[] = [
       "",
-      `  ${theme.bold(theme.white("Perfis de Conta no Disco:"))}`,
-      `  ${theme.dim("#   Conta                 Tamanho       Arquivos")}`,
+      `  ${theme.bold(theme.white("On-Disk Account Profiles:"))}`,
+      `  ${theme.dim("#   Account               Size          Files")}`,
       `  ${theme.dim("──────────────────────────────────────────────────────────")}`,
     ];
 
     if (this.profileStats.length === 0) {
-      rightContent.push(`  ${theme.muted("Nenhum perfil de navegador inicializado ainda.")}`);
+      rightContent.push(`  ${theme.muted("No browser profiles initialized yet.")}`);
     } else {
       this.profileStats.forEach((p, idx) => {
         const num = pad(String(idx + 1) + ".", 4);
         const rawName = accountMap.get(p.name) || maskAccountIdentifier(p.name);
         const name = pad(rawName, 22);
         rightContent.push(
-          `  ${theme.dim(num)}${theme.white(name)}  ${theme.cyan(pad(p.size, 12))}  ${theme.muted(p.files + " arq")}`,
+          `  ${theme.dim(num)}${theme.white(name)}  ${theme.cyan(pad(p.size, 12))}  ${theme.muted(p.files + " files")}`,
         );
       });
     }
 
     rightContent.push("");
-    rightContent.push(`  ${theme.bold(theme.white("Histórico de Otimizações:"))}`);
+    rightContent.push(`  ${theme.bold(theme.white("Optimization History:"))}`);
     rightContent.push(`  ${theme.dim("──────────────────────────────────────────────────────────")}`);
 
     if (this.actionLogs.length === 0) {
-      rightContent.push(theme.muted("  Nenhuma otimização executada nesta sessão."));
-      rightContent.push(theme.muted("  Execute uma das Ações Rápidas ao lado para otimizar o disco."));
+      rightContent.push(theme.muted("  No optimizations run in this session."));
+      rightContent.push(theme.muted("  Run one of the Quick Actions to optimize disk."));
     } else {
       const maxLogs = Math.max(1, contentH - 12);
       const visibleLogs = this.actionLogs.slice(-maxLogs);
@@ -412,7 +412,7 @@ export class StorageView implements TuiView {
       }
     }
     const rightBox = drawBox({
-      title: "Perfis & Histórico",
+      title: "Profiles & History",
       width: rightW,
       height: contentH,
       borderColor: theme.borderInactive,
@@ -435,12 +435,12 @@ export class StorageView implements TuiView {
       this.lastConfirmModalStartRow = 4;
       const confirmBtn =
         this.confirmDialogHovered === "confirm"
-          ? theme.bgHover(theme.red(" [ S / Enter ] Sim, Confirmar "))
-          : ` ${theme.red("[ S / Enter ] Sim, Confirmar")} `;
+          ? theme.bgHover(theme.red(" [ Y / Enter ] Yes, Confirm "))
+          : ` ${theme.red("[ Y / Enter ] Yes, Confirm")} `;
       const cancelBtn =
         this.confirmDialogHovered === "cancel"
-          ? theme.bgHover(theme.green(" [ N / Esc ] Cancelar "))
-          : ` ${theme.green("[ N / Esc ] Cancelar")} `;
+          ? theme.bgHover(theme.green(" [ N / Esc ] Cancel "))
+          : ` ${theme.green("[ N / Esc ] Cancel")} `;
 
       const modalContent = [
         "",

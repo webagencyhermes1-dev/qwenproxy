@@ -83,10 +83,10 @@ export class SyncView implements TuiView {
 
   public getShortcuts(): Array<{ key: string; label: string }> {
     return [
-      { key: "Espaço", label: "Marcar/Desmarcar" },
-      { key: "Enter", label: "Sincronizar" },
-      { key: "r", label: "Restaurar Backups" },
-      { key: "a", label: "Alternar Todos" },
+      { key: "Space", label: "Check/Uncheck" },
+      { key: "Enter", label: "Sync" },
+      { key: "r", label: "Restore Backups" },
+      { key: "a", label: "Toggle All" },
     ];
   }
 
@@ -153,13 +153,13 @@ export class SyncView implements TuiView {
           this.selectedRowIndex = 5;
           return true;
         }
-        // Row 18: Sincronizar button
+        // Row 18: Sync button
         if (row === 18) {
           this.selectedRowIndex = 6;
           this.executeSync();
           return true;
         }
-        // Row 19: Restaurar button
+        // Row 19: Restore button
         if (row === 19) {
           this.selectedRowIndex = 7;
           this.executeRollback();
@@ -213,7 +213,7 @@ export class SyncView implements TuiView {
         c.selected = !allSelected;
       }
       this.actionLog.unshift(
-        allSelected ? "Desmarcados todos os clientes." : "Selecionados todos os clientes.",
+        allSelected ? "Unchecked all clients." : "Selected all clients.",
       );
       return true;
     }
@@ -241,12 +241,12 @@ export class SyncView implements TuiView {
       .map((c) => c.id);
 
     if (selectedTargets.length === 0) {
-      this.actionLog.unshift(theme.yellow("⚠ Nenhum cliente selecionado para sincronizar."));
+      this.actionLog.unshift(theme.yellow("⚠ No clients selected to sync."));
       return;
     }
     const currentModel = this.availableModels[this.modelIndex] || "qwen3.8-max";
     this.actionLog.unshift(
-      theme.cyan(`⏳ Sincronizando [${selectedTargets.join(", ")}] com modelo ${currentModel}...`),
+      theme.cyan(`⏳ Syncing [${selectedTargets.join(", ")}] with model ${currentModel}...`),
     );
     try {
       const res = syncAllClients({
@@ -258,17 +258,17 @@ export class SyncView implements TuiView {
         if (clientRes && clientRes.success) {
           successCount++;
           this.actionLog.unshift(
-            theme.green(`✓ [${key}] ${clientRes.message || "Configurado com sucesso"}`),
+            theme.green(`✓ [${key}] ${clientRes.message || "Configured successfully"}`),
           );
         } else if (clientRes) {
           this.actionLog.unshift(
-            theme.red(`✗ [${key}] Falha: ${clientRes.error || "Erro desconhecido"}`),
+            theme.red(`✗ [${key}] Failed: ${clientRes.error || "Unknown error"}`),
           );
         }
       }
 
       this.actionLog.unshift(
-        theme.green(`🎉 Concluído: ${successCount} cliente(s) sincronizado(s) com zero perdas!`),
+        theme.green(`🎉 Done: ${successCount} client(s) synced with zero loss!`),
       );
       this.detectClients();
     } catch (err: any) {
@@ -276,15 +276,15 @@ export class SyncView implements TuiView {
   }
 
   private executeRollback(): void {
-    this.actionLog.unshift(theme.yellow("⏳ Restaurando backups anteriores de configuração..."));
+    this.actionLog.unshift(theme.yellow("⏳ Restoring previous config backups..."));
     try {
       const res = restoreAllClients();
       this.actionLog.unshift(
-        theme.green(`✓ Rollback concluído: ${res.restoredCount} arquivo(s) restaurados com sucesso.`),
+        theme.green(`✓ Rollback done: ${res.restoredCount} file(s) restored successfully.`),
       );
       this.detectClients();
     } catch (err: any) {
-      this.actionLog.unshift(theme.red(`✗ Erro ao restaurar backups: ${err?.message || String(err)}`));
+      this.actionLog.unshift(theme.red(`✗ Error restoring backups: ${err?.message || String(err)}`));
     }
   }
 
@@ -297,7 +297,7 @@ export class SyncView implements TuiView {
     // Left Panel: Options and Selectors
     const leftContent: string[] = [
       "",
-      `  ${theme.bold("Clientes:")} (Espaço para marcar)`,
+      `  ${theme.bold("Clients:")} (Space to check)`,
       "",
     ];
 
@@ -309,11 +309,11 @@ export class SyncView implements TuiView {
 
       let status: string;
       if (c.synced) {
-        status = theme.green(`${glyphs.check} Sincronizado`);
+        status = theme.green(`${glyphs.check} Synced`);
       } else if (c.detected) {
-        status = theme.yellow(`${glyphs.bullet} Outro provedor`);
+        status = theme.yellow(`${glyphs.bullet} Other provider`);
       } else {
-        status = theme.muted(`${glyphs.circle} Não instalado`);
+        status = theme.muted(`${glyphs.circle} Not installed`);
       }
 
       const line = `${pointer}${check} ${name} ${status}`;
@@ -321,7 +321,7 @@ export class SyncView implements TuiView {
     });
 
     leftContent.push("");
-    leftContent.push(`  ${theme.bold("Modelo:")}`);
+    leftContent.push(`  ${theme.bold("Model:")}`);
 
     // Row index 4: Model Selector
     const isModelFocused = this.selectedRowIndex === 4;
@@ -339,24 +339,24 @@ export class SyncView implements TuiView {
     const isScopeFocused = this.selectedRowIndex === 5;
     const scopePointer = isScopeFocused ? theme.cyan(`${glyphs.pointer} `) : "  ";
     const scopeCheck = this.syncAllModels ? theme.green(glyphs.radioOn) : theme.muted(glyphs.radioOff);
-    const scopeLine = `${scopePointer}${scopeCheck} Registrar todos os modelos`;
+    const scopeLine = `${scopePointer}${scopeCheck} Register all models`;
     leftContent.push(isScopeFocused ? theme.bgSelected(scopeLine) : scopeLine);
     leftContent.push("");
-    leftContent.push(`  ${theme.bold("Ações:")}`);
-    // Row 18: Sincronizar
+    leftContent.push(`  ${theme.bold("Actions:")}`);
+    // Row 18: Sync
     const isSyncFocused = this.selectedRowIndex === 6;
     const isSyncHovered = this.hoveredActionRow === 18;
-    const syncLine = `    ${isSyncHovered || isSyncFocused ? theme.bgHover(` ${theme.cyan("[ Enter ] Sincronizar")} `) : `${theme.cyan("[ Enter ]")} Sincronizar`}`;
+    const syncLine = `    ${isSyncHovered || isSyncFocused ? theme.bgHover(` ${theme.cyan("[ Enter ] Sync")} `) : `${theme.cyan("[ Enter ]")} Sync`}`;
     leftContent.push(syncLine);
 
-    // Row 19: Restaurar
+    // Row 19: Restore
     const isRestoreFocused = this.selectedRowIndex === 7;
     const isRestoreHovered = this.hoveredActionRow === 19;
-    const restoreLine = `    ${isRestoreHovered || isRestoreFocused ? theme.bgHover(` ${theme.yellow("[ R ] Restaurar")} `) : `${theme.yellow("[ R ]")} Restaurar`}`;
+    const restoreLine = `    ${isRestoreHovered || isRestoreFocused ? theme.bgHover(` ${theme.yellow("[ R ] Restore")} `) : `${theme.yellow("[ R ]")} Restore`}`;
     leftContent.push(restoreLine);
 
     const leftBox = drawBox({
-      title: "Configurar",
+      title: "Configure",
       width: leftW,
       height: contentH,
       borderColor: theme.borderActive,
@@ -367,19 +367,19 @@ export class SyncView implements TuiView {
     // Right Panel: Action Log & Backups
     const rightContent: string[] = [
       "",
-      `  ${theme.bold("Histórico:")}`,
+      `  ${theme.bold("History:")}`,
       `  ${theme.dim("───────────────────────────────────────")}`,
     ];
 
     if (this.actionLog.length === 0) {
       rightContent.push("");
-      rightContent.push(theme.muted("  Nenhuma sincronização recente executada nesta sessão."));
+      rightContent.push(theme.muted("  No recent syncs run in this session."));
       rightContent.push("");
       rightContent.push(
-        theme.muted("  Pressione [ Enter ] para sincronizar os clientes selecionados."),
+        theme.muted("  Press [ Enter ] to sync the selected clients."),
       );
       rightContent.push(
-        theme.muted("  Backups (.bak) são criados automaticamente antes de cada alteração."),
+        theme.muted("  Backups (.bak) are created automatically before each change."),
       );
     } else {
       for (const log of this.actionLog.slice(0, contentH - 5)) {
@@ -387,7 +387,7 @@ export class SyncView implements TuiView {
       }
     }
     const rightBox = drawBox({
-      title: "Histórico & Backups",
+      title: "History & Backups",
       width: rightW,
       height: contentH,
       borderColor: theme.borderInactive,

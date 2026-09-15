@@ -32,7 +32,7 @@ function buildToolMessages(): Message[] {
   ];
 }
 
-test("tiered: 500-message conversation compresses to <100k", () => {
+test("tiered: 500-message conversation compresses to <200k", () => {
   const messages = buildMessages(250, 4000); // 500 messages, ~2M chars
   const total = messages.reduce((s, m) => s + String(m.content).length, 0);
   assert.ok(total > 1_000_000, `total=${total}`);
@@ -42,10 +42,10 @@ test("tiered: 500-message conversation compresses to <100k", () => {
     messages,
     currentTurn: messages[messages.length - 2],
     rollingSummary: "Summary of earlier work",
-    tokenBudget: 100_000,
+    tokenBudget: 200_000,
   });
-  assert.ok(result.totalChars <= 100_000, `total=${result.totalChars}`);
-  assert.ok(result.payload.length <= 100_000);
+  assert.ok(result.totalChars <= 200_000, `total=${result.totalChars}`);
+  assert.ok(result.payload.length <= 200_000);
 });
 
 test("tiered: T0 is byte-identical", () => {
@@ -56,7 +56,7 @@ test("tiered: T0 is byte-identical", () => {
     messages: buildMessages(5, 100),
     currentTurn: { role: "user", content: "hi" },
     rollingSummary: "",
-    tokenBudget: 100_000,
+    tokenBudget: 200_000,
   });
   assert.equal(result.t0, sys);
 });
@@ -69,9 +69,8 @@ test("tiered: T1 is exactly last 3 exchanges", () => {
     messages,
     currentTurn: messages[messages.length - 1],
     rollingSummary: "",
-    tokenBudget: 100_000,
+    tokenBudget: 200_000,
   });
-  // Last 3 exchanges = 6 messages (user+assistant x3).
   assert.equal(result.t1.length, 6);
   assert.ok(String(result.t1[0].content).includes("Question 7"));
 });
@@ -91,7 +90,7 @@ test("tiered: tool call/result pairs stay together", () => {
     messages: all,
     currentTurn: { role: "user", content: "continue" },
     rollingSummary: "",
-    tokenBudget: 100_000,
+    tokenBudget: 200_000,
   });
   const hasCall = [...result.t1, ...result.t2].some(
     (m) => Array.isArray(m.tool_calls) && m.tool_calls.length > 0,
@@ -109,7 +108,7 @@ test("tiered: refs contains every retained message", () => {
     messages,
     currentTurn: messages[messages.length - 1],
     rollingSummary: "sum",
-    tokenBudget: 100_000,
+    tokenBudget: 200_000,
   });
   const retained = result.t1.length + result.t2.length;
   assert.equal(Object.keys(result.refs).length, retained);
@@ -126,14 +125,14 @@ test("failover: no-personalization envelope keeps system prefix verbatim", () =>
     messages,
     currentTurn: messages[messages.length - 1],
     rollingSummary: "",
-    tokenBudget: 100_000,
+    tokenBudget: 200_000,
     usePersonalization: false,
   });
   assert.ok(prompt.startsWith(sys), "system prefix must be verbatim T0");
   assert.ok(prompt.includes(toolsText));
   assert.ok(prompt.includes("User:"));
   assert.ok(prompt.includes("Assistant:"));
-  assert.ok(prompt.length <= 100_000);
+  assert.ok(prompt.length <= 200_000);
   assert.ok(Object.keys(compressed.refs).length > 0);
 });
 
@@ -147,13 +146,13 @@ test("failover: personalization mode keeps system out of the prompt", () => {
     messages,
     currentTurn: messages[messages.length - 1],
     rollingSummary: "prior summary",
-    tokenBudget: 100_000,
+    tokenBudget: 200_000,
     usePersonalization: true,
   });
   assert.ok(!prompt.includes(sys), "system must ride personalization, not inline");
   assert.ok(prompt.includes("prior summary"));
   assert.ok(prompt.includes("Question 9"));
-  assert.ok(prompt.length <= 100_000);
+  assert.ok(prompt.length <= 200_000);
 });
 
 test("failover: tool call/result pairs render with tags intact", () => {
@@ -168,7 +167,7 @@ test("failover: tool call/result pairs render with tags intact", () => {
     messages,
     currentTurn: { role: "user", content: "continue" },
     rollingSummary: "",
-    tokenBudget: 100_000,
+    tokenBudget: 200_000,
     usePersonalization: true,
   });
   assert.ok(prompt.includes("Tool Response (read_file):"));
@@ -183,11 +182,11 @@ test("failover: 2M-char conversation renders under budget", () => {
     messages,
     currentTurn: messages[messages.length - 1],
     rollingSummary: "summary",
-    tokenBudget: 100_000,
+    tokenBudget: 200_000,
     usePersonalization: false,
   });
   assert.ok(prompt.startsWith("System: agent"));
-  assert.ok(prompt.length <= 100_000, `prompt=${prompt.length}`);
+  assert.ok(prompt.length <= 200_000, `prompt=${prompt.length}`);
 });
 
 test("semantic retention: planted fact at message 100 survives failover", () => {
@@ -225,9 +224,9 @@ test("semantic retention: planted fact at message 100 survives failover", () => 
     messages,
     currentTurn,
     rollingSummary: "",
-    tokenBudget: 100_000,
+    tokenBudget: 200_000,
   });
-  assert.ok(result.totalChars <= 100_000);
+  assert.ok(result.totalChars <= 200_000);
   const t12 = [...result.t1, ...result.t2].map((m) => String(m.content ?? ""));
   const refTexts = Object.values(result.refs).map((m) => String(m.content ?? ""));
   const inT12 = t12.some((t) => t.includes(MARKER));
@@ -249,14 +248,14 @@ test("tiered: a single 2M-char paste is trimmed to budget instead of throwing", 
     messages: [giant],
     currentTurn: giant,
     rollingSummary: "",
-    tokenBudget: 100_000,
+    tokenBudget: 200_000,
   });
-  assert.ok(result.totalChars <= 100_000, `total=${result.totalChars}`);
-  assert.ok(result.payload.length <= 100_000, `payload=${result.payload.length}`);
+  assert.ok(result.totalChars <= 200_000, `total=${result.totalChars}`);
+  assert.ok(result.payload.length <= 200_000, `payload=${result.payload.length}`);
   const kept = result.t1[result.t1.length - 1];
   assert.ok(kept, "the current turn must still be present");
   assert.ok(
-    String((kept as Message).content).length < 100_000,
+    String((kept as Message).content).length < 200_000,
     `content=${String((kept as Message).content).length}`,
   );
   assert.ok(
@@ -274,9 +273,9 @@ test("failover: single 2M-char paste is served under budget, not errored", () =>
     messages: [giant],
     currentTurn: giant,
     rollingSummary: "",
-    tokenBudget: 100_000,
+    tokenBudget: 200_000,
     usePersonalization: false,
   });
-  assert.ok(prompt.length <= 100_000, `prompt=${prompt.length}`);
+  assert.ok(prompt.length <= 200_000, `prompt=${prompt.length}`);
   assert.ok(prompt.includes("[Context truncated"));
 });

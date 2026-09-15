@@ -5,14 +5,17 @@
 import { config, type ChatMode } from "../core/config.ts";
 import { loadAccounts, type QwenAccount } from "../core/accounts.ts";
 import {
+  buildSchedulerCandidates,
   getAccountCooldownInfo,
   clearAllAccountCooldowns,
   clearAccountCooldown,
+  getPoolStats,
   isAccountHeadersReady,
 } from "../core/account-manager.ts";
 import { isPlaywrightInitialized } from "../services/playwright.ts";
 import { getAccountConcurrencySnapshot } from "../core/account-concurrency.ts";
 import { getRssUsageSnapshot } from "../core/memory-usage.ts";
+import { performanceMetrics } from "../core/performance-metrics.ts";
 import type { ProxyStatusSnapshot } from "./types.ts";
 
 export function maskAccountIdentifier(idOrEmail: string): string {
@@ -46,8 +49,16 @@ let cachedAccounts: Array<{
   cooldownUntil: number | null;
   onCooldown: boolean;
   remainingCooldownMs: number;
+  cooldownReason: string | null;
   headersReady: boolean;
   isInitialized: boolean;
+  state: string;
+  health: number;
+  activeStreams: number;
+  requests: number;
+  success: number;
+  failure: number;
+  lastUsed: number | null;
 }> = [];
 let lastAccountsFetch = 0;
 let isHealthCheckPending = false;
@@ -55,6 +66,7 @@ let lastOnlineState = false;
 let lastOverallStatus = "offline";
 let lastServerReadyAccounts: Set<string> | null = null;
 let lastServerActiveAccounts: Set<string> | null = null;
+let cachedPool: ProxyStatusSnapshot["pool"] = null;
 export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
   const port = config.server?.port || 7936;
   const configuredHost = config.server?.host;
@@ -104,6 +116,56 @@ export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
       rawAccounts = [];
     }
 
+    // Pool 2.0 enrichment: derived state + persistent health + live load.
+    // Single batched pass (health = 1 SELECT, concurrency = in-memory).
+    let states: Record<string, string> = {};
+    let poolSummary: ProxyStatusSnapshot["pool"] = null;
+    try {
+      const stats = getPoolStats();
+      states = stats.states as Record<string, string>;
+      poolSummary = {
+        total: stats.total,
+        ready: stats.ready,
+        warming: stats.warming,
+        busy: stats.busy,
+        cooldown: stats.cooldown,
+        authError: stats.authError,
+        broken: stats.broken,
+        disabled: stats.disabled,
+        activeStreams: stats.totalActiveStreams,
+        queued: stats.queuedRequests,
+        successRate: stats.successRate,
+        averageHealth: stats.averageHealth,
+      };
+    } catch {
+      // Best-effort; table still renders with legacy fields.
+    }
+    let candidates: Map<string, {
+      activeStreams: number;
+      queuedRequests: number;
+      healthScore: number;
+      success: number;
+      failure: number;
+      lastUsed: number | null;
+    }> = new Map();
+    try {
+      const built = buildSchedulerCandidates(rawAccounts);
+      candidates = new Map(
+        built.map((cand) => [
+          cand.account.id,
+          {
+            activeStreams: cand.activeStreams,
+            queuedRequests: cand.queuedRequests,
+            healthScore: cand.health.healthScore,
+            success: cand.health.successCount,
+            failure: cand.health.failureCount,
+            lastUsed: cand.health.lastRequestAt,
+          },
+        ]),
+      );
+    } catch {
+      // Best-effort.
+    }
     cachedAccounts = rawAccounts.map((acc) => {
       const cooldownInfo = getAccountCooldownInfo(acc.id);
       const onCooldown = Boolean(cooldownInfo?.onCooldown);
@@ -114,6 +176,17 @@ export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
       const isInitialized = lastServerActiveAccounts !== null
         ? lastServerActiveAccounts.has(acc.id)
         : isPlaywrightInitialized(acc.id);
+      const extra = candidates.get(acc.id);
+      // Legacy tri-state preserved for existing views/tests; state adds detail.
+      let state = states[acc.id];
+      if (!state) {
+        state = onCooldown
+          ? "COOLDOWN"
+          : !headersReady
+            ? isInitialized ? "WARMING" : "WARMING"
+            : extra && extra.activeStreams > 0 ? "BUSY" : "READY";
+        if (!headersReady && !isInitialized && !onCooldown) state = "WARMING";
+      }
       return {
         id: acc.id,
         emailOrName: maskAccountIdentifier(acc.email || acc.id),
@@ -121,10 +194,20 @@ export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
         cooldownUntil: acc.cooldown_until || null,
         onCooldown,
         remainingCooldownMs,
+        cooldownReason:
+          cooldownInfo?.reason ?? acc.cooldown_reason ?? null,
         headersReady,
         isInitialized,
+        state,
+        health: extra?.healthScore ?? 100,
+        activeStreams: extra?.activeStreams ?? 0,
+        requests: (extra?.success ?? 0) + (extra?.failure ?? 0),
+        success: extra?.success ?? 0,
+        failure: extra?.failure ?? 0,
+        lastUsed: extra?.lastUsed ?? null,
       };
     });
+    cachedPool = poolSummary;
   }
   const accounts = cachedAccounts;
   const online = lastOnlineState;
@@ -161,6 +244,8 @@ export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
     activeStreams,
     waitingStreams,
     accounts,
+    pool: cachedPool,
+    performance: performanceMetrics.getSnapshot(),
   };
 }
 
@@ -219,7 +304,7 @@ export async function streamChatCompletions(
       throw fetchErr;
     }
     throw new Error(
-      `O servidor QwenProxy está iniciando ou indisponível (:7936). Verifique o status ou a aba [6] Logs.`,
+      `QwenProxy server is starting or unavailable (:7936). Check status or the [6] Logs tab.`,
     );
   }
 

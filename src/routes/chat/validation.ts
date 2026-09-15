@@ -39,6 +39,21 @@ export interface ParsedRequest {
   currentMessageCount: number;
 }
 
+/**
+ * Parse the X-QwenProxy-Active-Tools header into a Set of tool names.
+ * Format: comma-separated tool names (e.g. "read_file,write_file,bash").
+ * Returns undefined if the header is absent or empty (no trimming).
+ */
+function parseActiveToolNames(c: Context): Set<string> | undefined {
+  const header = c.req.header("x-qwenproxy-active-tools");
+  if (!header || header.trim().length === 0) return undefined;
+  const names = header
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return names.length > 0 ? new Set(names) : undefined;
+}
+
 export async function parseRequestBody(c: Context): Promise<ParsedRequest> {
   const body: OpenAIRequest = await c.req.json();
   logIncomingChatRequest(c, body);
@@ -62,7 +77,7 @@ export async function parseRequestBody(c: Context): Promise<ParsedRequest> {
     currentFiles,
   } = await buildPromptFromMessages(messages, uploadHeaders);
 
-  const toolInstructions = injectToolInstructions(body);
+  const toolInstructions = injectToolInstructions(body, parseActiveToolNames(c));
   const shouldParseToolCalls = toolInstructions.length > 0;
 
   const systemPrompt = systemPromptParts.join("") + buildResponseFormatInstruction(body);
@@ -485,9 +500,18 @@ function buildResponseFormatInstruction(body: OpenAIRequest): string {
   return "";
 }
 
-function injectToolInstructions(body: OpenAIRequest): string {
+function injectToolInstructions(body: OpenAIRequest, activeToolNames?: Set<string>): string {
   const bodyAny = body as any;
-  const declaredTools = Array.isArray(bodyAny.tools) ? bodyAny.tools : [];
+  let declaredTools = Array.isArray(bodyAny.tools) ? bodyAny.tools : [];
+  
+  // Filter tools if active tool names are specified (X-QwenProxy-Active-Tools header)
+  if (activeToolNames && activeToolNames.size > 0 && declaredTools.length > 0) {
+    declaredTools = declaredTools.filter((t: any) => {
+      const toolName = t.type === "function" ? t.function?.name : t.name;
+      return toolName && activeToolNames.has(toolName);
+    });
+  }
+  
   const shouldParseToolCalls = declaredTools.length > 0;
 
   if (!shouldParseToolCalls) return "";

@@ -203,8 +203,8 @@ const envSchema = z
     // the full prompt (potentially 2M+ chars) is compressed to a budget using
     // T0 (system) + T1 (recent verbatim) + T2 (BM25 retrieval) + T3 (summary).
     CONTEXT_COMPRESSION_ENABLED: z.string().default("true"),
-    CONTEXT_COMPRESSION_THRESHOLD: z.string().default("100000"),
-    CONTEXT_COMPRESSION_BUDGET: z.string().default("100000"),
+    CONTEXT_COMPRESSION_THRESHOLD: z.string().default("200000"),
+    CONTEXT_COMPRESSION_BUDGET: z.string().default("200000"),
     CONTEXT_COMPRESSION_RECENT_EXCHANGES: z.string().default("3"),
     CONTEXT_COMPRESSION_CHUNK_SIZE: z.string().default("500"),
     CONTEXT_COMPRESSION_MAX_CHUNKS: z.string().default("8"),

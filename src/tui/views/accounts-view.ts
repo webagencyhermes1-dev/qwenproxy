@@ -15,11 +15,12 @@ import { ServerManager } from "../server-manager.ts";
 import { config } from "../../core/config.ts";
 export class AccountsView implements TuiView {
   public readonly id = "accounts";
-  public readonly title = "Contas";
+  public readonly title = "Accounts";
   public readonly tabNumber = 5;
 
   private statusData: ProxyStatusSnapshot | null = null;
   private selectedIndex = 0;
+  private scrollOffset = 0;
   private statusMessage = "";
   private statusMessageTimer: NodeJS.Timeout | null = null;
   private isAddModalOpen = false;
@@ -33,6 +34,7 @@ export class AccountsView implements TuiView {
   private modalHoveredField: "email" | "password" | "save" | "cancel" | null = null;
   private lastModalLeftPad = 0;
   private lastLeftW = 46;
+  private lastContentH = 0;
   private confirmDialog: {
     type: "remove_account" | "delete_account_chats" | "delete_all_chats";
     title: string;
@@ -43,6 +45,24 @@ export class AccountsView implements TuiView {
   private confirmDialogHovered: "confirm" | "cancel" | null = null;
   private lastConfirmModalLeftPad = 0;
   private lastConfirmModalStartRow = 0;
+  private accounts: Array<{ id: string; emailOrName: string; [key: string]: unknown }> = [];
+
+  /**
+   * Ensure the selected account is visible within the viewport by adjusting scrollOffset.
+   */
+  private ensureSelectedVisible(contentH: number): void {
+    const accounts = this.statusData?.accounts || [];
+    if (accounts.length === 0) return;
+    const visibleRows = Math.max(1, contentH - 4); // account for header/footer
+    if (this.selectedIndex < this.scrollOffset) {
+      this.scrollOffset = this.selectedIndex;
+    } else if (this.selectedIndex >= this.scrollOffset + visibleRows) {
+      this.scrollOffset = this.selectedIndex - visibleRows + 1;
+    }
+    const maxScroll = Math.max(0, accounts.length - visibleRows);
+    this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxScroll));
+  }
+
   constructor() {
     this.refresh();
   }
@@ -57,24 +77,24 @@ export class AccountsView implements TuiView {
   public getShortcuts(): Array<{ key: string; label: string }> {
     if (this.confirmDialog) {
       return [
-        { key: "S / Enter", label: "Confirmar" },
-        { key: "N / Esc", label: "Cancelar" },
+        { key: "Y / Enter", label: "Confirm" },
+        { key: "N / Esc", label: "Cancel" },
       ];
     }
     if (this.isAddModalOpen) {
       return [
-        { key: "↑↓/Mouse", label: "Alternar" },
-        { key: "Enter", label: "Salvar" },
-        { key: "Esc", label: "Cancelar" },
+        { key: "↑↓/Mouse", label: "Switch" },
+        { key: "Enter", label: "Save" },
+        { key: "Esc", label: "Cancel" },
       ];
     }
     return [
-      { key: "a", label: "Adicionar Conta" },
-      { key: "d", label: "Remover Conta" },
-      { key: "x", label: "Limpar Chats" },
-      { key: "l", label: "Limpar Todos Chats" },
-      { key: "c", label: "Zerar Cooldown" },
-      { key: "z", label: "Zerar Todas" },
+      { key: "a", label: "Add Account" },
+      { key: "d", label: "Remove Account" },
+      { key: "x", label: "Clear Chats" },
+      { key: "l", label: "Clear All Chats" },
+      { key: "c", label: "Reset Cooldown" },
+      { key: "z", label: "Reset All" },
     ];
   }
 
@@ -100,7 +120,7 @@ export class AccountsView implements TuiView {
     const email = this.addEmailInput.trim();
     const password = this.addPasswordInput.trim();
     if (!email || !password) {
-      this.setStatusMessage(theme.yellow("[!] E-mail e senha são obrigatórios"));
+      this.setStatusMessage(theme.yellow("[!] Email and password are required"));
       return;
     }
 
@@ -112,7 +132,7 @@ export class AccountsView implements TuiView {
       this.addEmailCursor = 0;
       this.addPasswordCursor = 0;
       await this.refresh();
-      this.setStatusMessage(theme.green(`✓ Conta ${email} salva! Conectando...`));
+      this.setStatusMessage(theme.green(`✓ Account ${email} saved! Connecting...`));
 
       if (process.stdout.isTTY && !process.env.NODE_TEST_CONTEXT) {
         const sManager = ServerManager.getInstance();
@@ -139,13 +159,13 @@ export class AccountsView implements TuiView {
         }
       }
     } catch (err: any) {
-      this.setStatusMessage(theme.red(`✗ Erro ao salvar: ${err?.message || String(err)}`));
+      this.setStatusMessage(theme.red(`✗ Error saving: ${err?.message || String(err)}`));
     }
   }
   public async handleKey(key: KeyEvent): Promise<boolean | void> {
     // 0. Confirm Dialog Active
     if (this.confirmDialog) {
-      if (key.name === "s" || key.name === "S") {
+      if (key.name === "y" || key.name === "Y") {
         const dialog = this.confirmDialog;
         this.confirmDialog = null;
         this.confirmDialogHovered = null;
@@ -155,14 +175,14 @@ export class AccountsView implements TuiView {
       if (key.name === "escape" || key.name === "n" || key.name === "N") {
         this.confirmDialog = null;
         this.confirmDialogHovered = null;
-        this.setStatusMessage(theme.muted("Ação cancelada"));
+        this.setStatusMessage(theme.muted("Action cancelled"));
         return true;
       }
       if (key.name === "enter" || key.name === "return") {
         if (this.confirmDialogHovered === "cancel") {
           this.confirmDialog = null;
           this.confirmDialogHovered = null;
-          this.setStatusMessage(theme.muted("Ação cancelada"));
+          this.setStatusMessage(theme.muted("Action cancelled"));
           return true;
         }
         const dialog = this.confirmDialog;
@@ -215,7 +235,7 @@ export class AccountsView implements TuiView {
           if (relCol >= 35 && relCol <= 60) {
             this.confirmDialog = null;
             this.confirmDialogHovered = null;
-            this.setStatusMessage(theme.muted("Ação cancelada"));
+            this.setStatusMessage(theme.muted("Action cancelled"));
             return true;
           }
         }
@@ -437,14 +457,14 @@ export class AccountsView implements TuiView {
     if ((key.name === "d" || key.name === "D") && !key.ctrl) {
       const selected = accounts[this.selectedIndex];
       if (!selected) {
-        this.setStatusMessage(theme.yellow("[!] Nenhuma conta selecionada para remover"));
+        this.setStatusMessage(theme.yellow("[!] No account selected to remove"));
         return true;
       }
       this.confirmDialog = {
         type: "remove_account",
-        title: "⚠️  Confirmar Remoção de Conta",
-        message: `Deseja remover a conta ${selected.emailOrName}?`,
-        detail: "A conta será excluída do banco de dados e sua sessão encerrada.",
+        title: "⚠️  Confirm Account Removal",
+        message: `Remove account ${selected.emailOrName}?`,
+        detail: "The account will be deleted from the database and its session closed.",
         onConfirm: async () => {
           removeAccount(selected.id);
           try {
@@ -454,7 +474,7 @@ export class AccountsView implements TuiView {
             removePlaywrightProfile(getAccountProfilePath(selected.id));
           } catch {}
           await this.refresh();
-          this.setStatusMessage(theme.green(`✓ Conta ${selected.emailOrName} removida com sucesso`));
+          this.setStatusMessage(theme.green(`✓ Account ${selected.emailOrName} removed successfully`));
         },
       };
       return true;
@@ -464,23 +484,23 @@ export class AccountsView implements TuiView {
     if ((key.name === "x" || key.name === "X") && !key.ctrl) {
       const selected = accounts[this.selectedIndex];
       if (!selected) {
-        this.setStatusMessage(theme.yellow("[!] Nenhuma conta selecionada"));
+        this.setStatusMessage(theme.yellow("[!] No account selected"));
         return true;
       }
       this.confirmDialog = {
         type: "delete_account_chats",
-        title: "⚠️  Apagar Chats Remotos no Qwen",
-        message: `Apagar TODOS os chats no Qwen da conta ${selected.emailOrName}?`,
-        detail: "Esta ação é irreversível e limpará todas as conversas em chat.qwen.ai.",
+        title: "⚠️  Delete Remote Chats on Qwen",
+        message: `Delete ALL chats on Qwen for account ${selected.emailOrName}?`,
+        detail: "This action is irreversible and will clear all conversations on chat.qwen.ai.",
         onConfirm: async () => {
-          this.setStatusMessage(theme.yellow(`⏳ Apagando chats no Qwen para ${selected.emailOrName}...`));
+          this.setStatusMessage(theme.yellow(`⏳ Deleting chats on Qwen for ${selected.emailOrName}...`));
           try {
             const { deleteChatsForAccountId } = await import("../../services/chat-cleanup.ts");
             await deleteChatsForAccountId(selected.id);
             await this.refresh();
-            this.setStatusMessage(theme.green(`✓ Todos os chats de ${selected.emailOrName} foram apagados no Qwen!`));
+            this.setStatusMessage(theme.green(`✓ All chats for ${selected.emailOrName} were deleted on Qwen!`));
           } catch (err: any) {
-            this.setStatusMessage(theme.red(`✗ Falha ao apagar chats: ${err?.message || String(err)}`));
+            this.setStatusMessage(theme.red(`✗ Failed to delete chats: ${err?.message || String(err)}`));
           }
         },
       };
@@ -490,23 +510,23 @@ export class AccountsView implements TuiView {
     // Delete chats of all accounts with 'l' or 'L' (requires confirmation)
     if ((key.name === "l" || key.name === "L") && !key.ctrl) {
       if (accounts.length === 0) {
-        this.setStatusMessage(theme.yellow("[!] Nenhuma conta configurada"));
+        this.setStatusMessage(theme.yellow("[!] No accounts configured"));
         return true;
       }
       this.confirmDialog = {
         type: "delete_all_chats",
-        title: "⚠️  Apagar Chats de TODAS as Contas",
-        message: `Apagar TODOS os chats remotos de TODAS as ${accounts.length} contas no Qwen?`,
-        detail: "Esta ação é irreversível e limpará o histórico no chat.qwen.ai.",
+        title: "⚠️  Delete Chats for ALL Accounts",
+        message: `Delete ALL remote chats for ALL ${accounts.length} accounts on Qwen?`,
+        detail: "This action is irreversible and will clear history on chat.qwen.ai.",
         onConfirm: async () => {
-          this.setStatusMessage(theme.yellow(`⏳ Apagando chats no Qwen de todas as contas...`));
+          this.setStatusMessage(theme.yellow(`⏳ Deleting chats on Qwen for all accounts...`));
           try {
             const { deleteChatsForConfiguredAccounts } = await import("../../services/chat-cleanup.ts");
             const res = await deleteChatsForConfiguredAccounts(true);
             await this.refresh();
-            this.setStatusMessage(theme.green(`✓ Chats apagados no Qwen: ${res.succeeded}/${res.attempted} contas limpas!`));
+            this.setStatusMessage(theme.green(`✓ Chats deleted on Qwen: ${res.succeeded}/${res.attempted} accounts cleared!`));
           } catch (err: any) {
-            this.setStatusMessage(theme.red(`✗ Falha ao apagar chats: ${err?.message || String(err)}`));
+            this.setStatusMessage(theme.red(`✗ Failed to delete chats: ${err?.message || String(err)}`));
           }
         },
       };
@@ -514,13 +534,15 @@ export class AccountsView implements TuiView {
     }
 
     // Mouse hover on account rows or right panel actions
-    if (key.name === "hover" && key.mouse) {
+if (key.name === "hover" && key.mouse) {
       const { row, col } = key.mouse;
       const leftW = this.lastLeftW || 46;
 
       // Account list rows start at row 8 (row 4=box border, 5=blank, 6=header, 7=divider)
-      if (col >= 2 && col <= leftW - 1 && row >= 8 && row < 8 + accounts.length) {
-        const hoverIdx = row - 8;
+      const visibleRows = Math.max(1, this.lastContentH - 4);
+      const maxVisible = Math.min(accounts.length - this.scrollOffset, visibleRows);
+      if (col >= 2 && col <= leftW - 1 && row >= 8 && row < 8 + maxVisible) {
+        const hoverIdx = this.scrollOffset + (row - 8);
         if (this.hoveredAccountIndex !== hoverIdx) {
           this.hoveredAccountIndex = hoverIdx;
           return true;
@@ -550,10 +572,12 @@ export class AccountsView implements TuiView {
     if (key.name === "click" && key.mouse) {
       const { row, col } = key.mouse;
       const leftW = this.lastLeftW || 46;
+      const visibleRows = Math.max(1, this.lastContentH - 4);
+      const startIdx = Math.max(0, Math.min(this.scrollOffset, Math.max(0, accounts.length - visibleRows)));
 
-      // Click on account row (rows 8, 9, ...)
-      if (col >= 2 && col <= leftW - 1 && row >= 8 && row < 8 + accounts.length) {
-        this.selectedIndex = row - 8;
+      // Click on account row
+      if (col >= 2 && col <= leftW - 1 && row >= 8 && row < 8 + Math.min(accounts.length - this.scrollOffset, visibleRows)) {
+        this.selectedIndex = this.scrollOffset + (row - 8);
         return true;
       }
       // Right panel action buttons click (rows 15, 16, 17, 18)
@@ -597,10 +621,29 @@ export class AccountsView implements TuiView {
       return true;
     }
 
+    // Page up/down for scrolling through accounts
+    if (key.name === "pageup" || (key.name === "up" && key.ctrl)) {
+      if (accounts.length > 0) {
+        const visibleRows = Math.max(1, this.lastContentH - 4); // account for header/footer
+        this.scrollOffset = Math.max(0, this.scrollOffset - visibleRows);
+        this.ensureSelectedVisible(this.lastContentH);
+      }
+      return true;
+    }
+    if (key.name === "pagedown" || (key.name === "down" && key.ctrl)) {
+      if (accounts.length > 0) {
+        const visibleRows = Math.max(1, this.lastContentH - 4);
+        const maxScroll = Math.max(0, accounts.length - visibleRows);
+        this.scrollOffset = Math.min(maxScroll, this.scrollOffset + visibleRows);
+        this.ensureSelectedVisible(this.lastContentH);
+      }
+      return true;
+    }
+
     // Refresh with 'r' or 'R'
     if ((key.name === "r" || key.name === "R") && !key.ctrl) {
       await this.refresh();
-      this.setStatusMessage(theme.green("✓ Lista de contas atualizada"));
+      this.setStatusMessage(theme.green("✓ Account list refreshed"));
       return true;
     }
 
@@ -608,7 +651,7 @@ export class AccountsView implements TuiView {
     if ((key.name === "z" || key.name === "Z") && !key.ctrl) {
       const cleared = resetAllCooldowns();
       await this.refresh();
-      this.setStatusMessage(theme.green(`✓ Cooldowns zerados: ${cleared} conta(s) liberada(s)`));
+      this.setStatusMessage(theme.green(`✓ Cooldowns reset: ${cleared} account(s) released`));
       return true;
     }
 
@@ -616,13 +659,13 @@ export class AccountsView implements TuiView {
     if ((key.name === "c" || key.name === "C") && !key.ctrl) {
       const selected = accounts[this.selectedIndex];
       if (!selected) {
-        this.setStatusMessage(theme.yellow("[!] Nenhuma conta selecionada"));
+        this.setStatusMessage(theme.yellow("[!] No account selected"));
         return true;
       }
       resetAccountCooldownById(selected.id);
       await this.refresh();
       this.setStatusMessage(
-        theme.green(`✓ Cooldown da conta ${selected.emailOrName} zerado com sucesso`),
+        theme.green(`✓ Cooldown for account ${selected.emailOrName} reset successfully`),
       );
       return true;
     }
@@ -630,6 +673,7 @@ export class AccountsView implements TuiView {
 
   public render(width: number, height: number, snapshot?: ProxyStatusSnapshot | null): string[] {
     const contentH = Math.max(12, height);
+    this.lastContentH = contentH;
     const leftW = Math.max(46, Math.floor(width * 0.54));
     this.lastLeftW = leftW;
     const rightW = Math.max(30, width - leftW - 1);
@@ -639,38 +683,62 @@ export class AccountsView implements TuiView {
     }
     const data = snapshot || this.statusData;
     const accounts = data?.accounts || [];
+    this.accounts = accounts; // Store for ensureSelectedVisible
     const selected = accounts[this.selectedIndex];
 
-    // Left Panel: Accounts List Table
+    // Left Panel: Accounts List Table (Pool 2.0 compact: state/health/load).
     const leftContent: string[] = [
       "",
-      `  ${theme.dim("#   Conta                 Status")}`,
+      `  ${theme.dim("#  Account      State     H  Strm S/F  Cd")}`,
       `  ${theme.dim("───────────────────────────────────────")}`,
     ];
 
     if (accounts.length === 0) {
       leftContent.push("");
-      leftContent.push(`  ${theme.yellow("Nenhuma conta configurada ainda.")}`);
-      leftContent.push(`  ${theme.muted("Pressione ")}${theme.cyan("'A'")}${theme.muted(" ou use a opção ao lado para adicionar.")}`);
+      leftContent.push(`  ${theme.yellow("No accounts configured yet.")}`);
+      leftContent.push(`  ${theme.muted("Press ")}${theme.cyan("'A'")}${theme.muted(" or use the side option to add.")}`);
     } else {
-      accounts.forEach((acc, idx) => {
-        const isFocused = idx === this.selectedIndex;
-        const isHovered = idx === this.hoveredAccountIndex;
-        const pointer = isFocused ? theme.cyan(`${glyphs.pointer} `) : "  ";
-        const num = pad(String(idx + 1) + ".", 4);
-        const name = pad(truncate(acc.emailOrName, 20), 22);
+      const visibleRows = Math.max(1, contentH - 4);
+      const maxScroll = Math.max(0, accounts.length - visibleRows);
+      const startIdx = Math.max(0, Math.min(this.scrollOffset, Math.max(0, accounts.length - visibleRows)));
+      const endIdx = Math.min(accounts.length, startIdx + visibleRows);
+      const visibleAccounts = accounts.slice(startIdx, endIdx);
 
-        let status = theme.green(`${glyphs.bullet} Pronto   `);
-        if (acc.onCooldown) {
+      visibleAccounts.forEach((acc, idx) => {
+        const actualIdx = startIdx + idx;
+        const isFocused = actualIdx === this.selectedIndex;
+        const isHovered = actualIdx === this.hoveredAccountIndex;
+        const pointer = isFocused ? theme.cyan(`${glyphs.pointer} `) : "  ";
+        const num = pad(String(actualIdx + 1) + ".", 3);
+        const name = pad(truncate(acc.emailOrName, 12), 13);
+        const health = typeof acc.health === "number" ? acc.health : 100;
+        const streams = acc.activeStreams ?? 0;
+        const sf = `${acc.success ?? 0}/${acc.failure ?? 0}`;
+
+        let status = theme.green(`${glyphs.bullet} Ready `);
+        const state = acc.state ?? (acc.onCooldown ? "COOLDOWN" : acc.headersReady ? "READY" : "WARMING");
+        if (state === "COOLDOWN" || acc.onCooldown) {
           const mins = Math.max(1, Math.round(acc.remainingCooldownMs / 60000));
-          status = theme.yellow(`⚠️ ${mins}m cd   `);
+          status = theme.yellow(`⚠️ ${mins}m cd`);
+        } else if (state === "BUSY") {
+          status = theme.cyan(`● Busy   `);
+        } else if (state === "AUTH_ERROR") {
+          status = theme.red(`✗ Auth   `);
+        } else if (state === "BROKEN") {
+          status = theme.red(`✗ Broken `);
+        } else if (state === "DISABLED") {
+          status = theme.muted(`⊘ Disab. `);
+        } else if (state === "SESSION_EXPIRED") {
+          status = theme.yellow(`◐ Expired`);
         } else if (!acc.headersReady) {
           status = acc.isInitialized
-            ? theme.yellow(`◐ Aquecendo...`)
+            ? theme.yellow(`◐ Warming...`)
             : theme.muted(`○ Standby     `);
         }
 
-        const line = `${pointer}${num}${name}${status}`;
+        const hStr = pad(String(health), 3);
+        const sStr = pad(String(streams), 4);
+        const line = `${pointer}${num}${name}${status} ${hStr}${sStr} ${truncate(sf, 7)}`;
         if (isHovered) {
           leftContent.push(theme.bgHover(line));
         } else if (isFocused) {
@@ -679,10 +747,17 @@ export class AccountsView implements TuiView {
           leftContent.push(line);
         }
       });
+
+      // Scroll indicator
+      if (accounts.length > visibleRows) {
+        const scrollPercent = accounts.length > 0 ? Math.round((this.scrollOffset / (accounts.length - visibleRows)) * 100) : 0;
+        leftContent.push("");
+        leftContent.push(`  ${theme.muted(`↕ ${this.scrollOffset + 1}-${Math.min(accounts.length, this.scrollOffset + visibleRows)} of ${accounts.length} (${scrollPercent}%)`)}`);
+      }
     }
 
     const leftBox = drawBox({
-      title: `Contas (${accounts.length})`,
+      title: `Accounts (${accounts.length})`,
       width: leftW,
       height: contentH,
       borderColor: theme.borderActive,
@@ -694,47 +769,55 @@ export class AccountsView implements TuiView {
     // Right Panel: Selected Account Details
     const rightContent: string[] = [
       "",
-      `  ${theme.bold("Detalhes:")}`,
+      `  ${theme.bold("Details:")}`,
       `  ${theme.dim("─────────────────────────────────")}`,
     ];
 
     if (!selected) {
       rightContent.push("");
-      rightContent.push(theme.muted("  Nenhuma conta configurada."));
+      rightContent.push(theme.muted("  No accounts configured."));
       rightContent.push("");
       rightContent.push("");
       rightContent.push("");
       rightContent.push("");
       rightContent.push(`  ${theme.dim("─────────────────────────────────")}`);
-      rightContent.push(`  ${this.hoveredActionRow === 15 ? theme.bgHover(` ${theme.cyan("[ A ] Adicionar Conta")} `) : `${theme.cyan("[ A ]")} Adicionar Conta`}`);
+      rightContent.push(`  ${this.hoveredActionRow === 15 ? theme.bgHover(` ${theme.cyan("[ A ] Add Account")} `) : `${theme.cyan("[ A ]")} Add Account`}`);
     } else {
       const email = truncate(selected.emailOrName, 18);
-      rightContent.push(`  ${theme.bold("Conta:")}      ${theme.cyan(email)}`);
-      rightContent.push(`  ${theme.bold("Sistema ID:")} ${theme.muted(selected.id.slice(0, 14))}`);
-      rightContent.push(`  ${theme.bold("Nível:")}      ${selected.priority}`);
+      rightContent.push(`  ${theme.bold("Account:")}    ${theme.cyan(email)}`);
+      rightContent.push(`  ${theme.bold("System ID:")} ${theme.muted(selected.id.slice(0, 14))}`);
+      rightContent.push(`  ${theme.bold("Level:")}      ${selected.priority}`);
 
+      const stateLabel = selected.state ?? (selected.onCooldown ? "COOLDOWN" : "READY");
       const cdStatus = selected.onCooldown
-        ? theme.yellow(`[!] Cooldown ${Math.round(selected.remainingCooldownMs / 60000)}m`)
-        : theme.green(`${glyphs.check} Disponível`);
-      rightContent.push(`  ${theme.bold("Estado:")}     ${cdStatus}`);
+        ? theme.yellow(`[!] Cooldown ${Math.round(selected.remainingCooldownMs / 60000)}m${selected.cooldownReason ? ` (${truncate(String(selected.cooldownReason), 18)})` : ""}`)
+        : theme.green(`${glyphs.check} Available`);
+      rightContent.push(`  ${theme.bold("State:")}      ${cdStatus} ${theme.dim(`[${stateLabel}]`)}`);
+      const healthVal = typeof selected.health === "number" ? selected.health : 100;
+      rightContent.push(`  ${theme.bold("Health:")}     ${healthVal}/100  Strm:${selected.activeStreams ?? 0}  S/F:${selected.success ?? 0}/${selected.failure ?? 0}`);
+      if (selected.lastUsed) {
+        const agoS = Math.max(0, Math.round((Date.now() - selected.lastUsed) / 1000));
+        const ago = agoS >= 3600 ? `${Math.floor(agoS / 3600)}h${Math.floor((agoS % 3600) / 60)}m` : agoS >= 60 ? `${Math.floor(agoS / 60)}m` : `${agoS}s`;
+        rightContent.push(`  ${theme.bold("Last used:")} ${ago} ago`);
+      }
 
       const hStatus = selected.headersReady
-        ? theme.green(`${glyphs.check} Capturados`)
+        ? theme.green(`${glyphs.check} Captured`)
         : selected.isInitialized
-          ? theme.yellow(`◐ Aquecendo...`)
-          : theme.muted(`${glyphs.circle} Standby (Sob Demanda)`);
+          ? theme.yellow(`◐ Warming...`)
+          : theme.muted(`${glyphs.circle} Standby (On Demand)`);
       rightContent.push(`  ${theme.bold("Headers:")}    ${hStatus}`);
       rightContent.push("");
       rightContent.push(`  ${theme.dim("─────────────────────────────────")}`);
-      rightContent.push(`  ${this.hoveredActionRow === 15 ? theme.bgHover(` ${theme.cyan("[ A ] Adicionar Conta")} `) : `${theme.cyan("[ A ]")} Adicionar Conta`}`);
-      rightContent.push(`  ${this.hoveredActionRow === 16 ? theme.bgHover(` ${theme.red("[ D ] Remover Conta")} `) : `${theme.red("[ D ]")} Remover Conta`}`);
-      rightContent.push(`  ${this.hoveredActionRow === 17 ? theme.bgHover(` ${theme.yellow("[ C ] Zerar Cooldown")} `) : `${theme.yellow("[ C ]")} Zerar Cooldown`}`);
-      rightContent.push(`  ${this.hoveredActionRow === 18 ? theme.bgHover(` ${theme.green("[ Z ] Zerar Todas")} `) : `${theme.green("[ Z ]")} Zerar Todas`}`);
-      rightContent.push(`  ${this.hoveredActionRow === 19 ? theme.bgHover(` ${theme.peach("[ X ] Limpar Chats (Conta)")} `) : `${theme.peach("[ X ]")} Limpar Chats (Conta)`}`);
-      rightContent.push(`  ${this.hoveredActionRow === 20 ? theme.bgHover(` ${theme.red("[ L ] Limpar Todos os Chats")} `) : `${theme.red("[ L ]")} Limpar Todos os Chats`}`);
+      rightContent.push(`  ${this.hoveredActionRow === 15 ? theme.bgHover(` ${theme.cyan("[ A ] Add Account")} `) : `${theme.cyan("[ A ]")} Add Account`}`);
+      rightContent.push(`  ${this.hoveredActionRow === 16 ? theme.bgHover(` ${theme.red("[ D ] Remove Account")} `) : `${theme.red("[ D ]")} Remove Account`}`);
+      rightContent.push(`  ${this.hoveredActionRow === 17 ? theme.bgHover(` ${theme.yellow("[ C ] Reset Cooldown")} `) : `${theme.yellow("[ C ]")} Reset Cooldown`}`);
+      rightContent.push(`  ${this.hoveredActionRow === 18 ? theme.bgHover(` ${theme.green("[ Z ] Reset All")} `) : `${theme.green("[ Z ]")} Reset All`}`);
+      rightContent.push(`  ${this.hoveredActionRow === 19 ? theme.bgHover(` ${theme.peach("[ X ] Clear Chats (Account)")} `) : `${theme.peach("[ X ]")} Clear Chats (Account)`}`);
+      rightContent.push(`  ${this.hoveredActionRow === 20 ? theme.bgHover(` ${theme.red("[ L ] Clear All Chats")} `) : `${theme.red("[ L ]")} Clear All Chats`}`);
     }
     const rightBox = drawBox({
-      title: "Inspeção de Conta",
+      title: "Account Inspector",
       width: rightW,
       height: contentH,
       borderColor: theme.borderInactive,
@@ -764,7 +847,7 @@ export class AccountsView implements TuiView {
       let emailDisplay: string;
       if (isEmail) {
         if (this.addEmailInput.length === 0) {
-          emailDisplay = `${theme.inverse(" ")} ${theme.dim("(digite o e-mail)")}`;
+          emailDisplay = `${theme.inverse(" ")} ${theme.dim("(enter email)")}`;
         } else {
           const before = this.addEmailInput.slice(0, this.addEmailCursor);
           const at = this.addEmailInput[this.addEmailCursor] || " ";
@@ -774,7 +857,7 @@ export class AccountsView implements TuiView {
       } else {
         emailDisplay = this.addEmailInput
           ? (emailHover ? theme.bgHover(` ${this.addEmailInput} `) : theme.cyan(` ${this.addEmailInput} `))
-          : (emailHover ? theme.bgHover(" (digite o e-mail) ") : theme.muted(" (digite o e-mail) "));
+          : (emailHover ? theme.bgHover(" (enter email) ") : theme.muted(" (enter email) "));
       }
 
       // Render Password field with clean cursor
@@ -782,7 +865,7 @@ export class AccountsView implements TuiView {
       const maskedPass = "•".repeat(this.addPasswordInput.length);
       if (isPass) {
         if (this.addPasswordInput.length === 0) {
-          passDisplay = `${theme.inverse(" ")} ${theme.dim("(digite a senha)")}`;
+          passDisplay = `${theme.inverse(" ")} ${theme.dim("(enter password)")}`;
         } else {
           const before = maskedPass.slice(0, this.addPasswordCursor);
           const at = maskedPass[this.addPasswordCursor] || " ";
@@ -792,27 +875,27 @@ export class AccountsView implements TuiView {
       } else {
         passDisplay = this.addPasswordInput
           ? (passHover ? theme.bgHover(` ${maskedPass} `) : theme.cyan(` ${maskedPass} `))
-          : (passHover ? theme.bgHover(" (digite a senha) ") : theme.muted(" (digite a senha) "));
+          : (passHover ? theme.bgHover(" (enter password) ") : theme.muted(" (enter password) "));
       }
       const saveBtn =
         this.modalHoveredField === "save"
-          ? theme.bgHover(theme.green(" [ Enter ] Salvar "))
-          : theme.green("[ Enter ] Salvar");
+          ? theme.bgHover(theme.green(" [ Enter ] Save "))
+          : theme.green("[ Enter ] Save");
 
       const cancelBtn =
         this.modalHoveredField === "cancel"
-          ? theme.bgHover(theme.red(" [ Esc ] Cancelar "))
-          : theme.muted("[ Esc ] Cancelar");
+          ? theme.bgHover(theme.red(" [ Esc ] Cancel "))
+          : theme.muted("[ Esc ] Cancel");
       const modalContent = [
         "",
-        `  ${theme.bold("E-mail:")}  ${emailDisplay}`,
-        `  ${theme.bold("Senha:")}   ${passDisplay}`,
+        `  ${theme.bold("Email:")}  ${emailDisplay}`,
+        `  ${theme.bold("Password:")}   ${passDisplay}`,
         "",
-        `  ${saveBtn}   ${cancelBtn}   ${theme.dim("(↑↓/mouse alternar)")}`,
+        `  ${saveBtn}   ${cancelBtn}   ${theme.dim("(↑↓/mouse to switch)")}`,
       ];
 
       const modalBox = drawBox({
-        title: "Adicionar Nova Conta Qwen (Login)",
+        title: "Add New Qwen Account (Login)",
         width: modalW,
         height: Math.min(contentH, 11),
         borderColor: theme.borderActive,
@@ -830,12 +913,12 @@ export class AccountsView implements TuiView {
       this.lastConfirmModalStartRow = 4;
       const confirmBtn =
         this.confirmDialogHovered === "confirm"
-          ? theme.bgHover(theme.red(" [ S / Enter ] Sim, Confirmar "))
-          : ` ${theme.red("[ S / Enter ] Sim, Confirmar")} `;
+          ? theme.bgHover(theme.red(" [ Y / Enter ] Yes, Confirm "))
+          : ` ${theme.red("[ Y / Enter ] Yes, Confirm")} `;
       const cancelBtn =
         this.confirmDialogHovered === "cancel"
-          ? theme.bgHover(theme.green(" [ N / Esc ] Cancelar "))
-          : ` ${theme.green("[ N / Esc ] Cancelar")} `;
+          ? theme.bgHover(theme.green(" [ N / Esc ] Cancel "))
+          : ` ${theme.green("[ N / Esc ] Cancel")} `;
 
       const modalContent = [
         "",

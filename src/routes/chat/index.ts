@@ -357,13 +357,13 @@ export async function chatCompletions(c: Context) {
             ttlMs: STICKY_TTL_MS,
           });
         } else if (existing.accountId !== streamResult.activeAccountId) {
-          // Failover: validate compressed payload fits 100k via tiered assembly
-          // (string replay already compressed in account.ts; this is the
-          // Message-level check + refs for reversibility).
-          try {
-            const { assembleCompressedContext } = await import(
-              "../../services/context/tiered.ts"
-            );
+            // Failover: validate compressed payload fits budget via tiered assembly
+            // (string replay already compressed in account.ts; this is the
+            // Message-level check + refs for reversibility).
+            try {
+              const { assembleCompressedContext, TIERED_DEFAULT_BUDGET } = await import(
+                "../../services/context/tiered.ts"
+              );
             const { getRollingSummary } = await import(
               "../../services/context/summary.ts"
             );
@@ -379,7 +379,7 @@ export async function chatCompletions(c: Context) {
               messages,
               currentTurn: lastMsg,
               rollingSummary: getRollingSummary().get(stickyKey),
-              tokenBudget: 100_000,
+              tokenBudget: TIERED_DEFAULT_BUDGET,
             });
             console.warn(
               `[Session] Failover compressed | key=${stickyKey} | from=${existing.accountId} | to=${streamResult.activeAccountId} | total=${compressed.totalChars} | t2=${compressed.t2.length} | refs=${Object.keys(compressed.refs).length}`,
@@ -425,7 +425,7 @@ export async function chatCompletions(c: Context) {
     // A failover replay (account switch / missing thread parent) hides its
     // real cost behind the thread-native delta numbers: surface it explicitly
     // so the 📤 line shows what was actually sent upstream (tiered compressed
-    // context, 100k budget — never the raw full history).
+    // context, 200k budget — never the raw full history).
     const replayed = streamResult.replayedFullContext === true;
     const replayedChars =
       replayed && typeof streamResult.failoverPromptChars === "number"

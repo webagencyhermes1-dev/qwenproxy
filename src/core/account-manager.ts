@@ -1,10 +1,36 @@
 import {
   QwenAccount,
+  isAccountDisabledRecord,
   loadAccounts,
   updateAccountCooldown,
 } from "./accounts.ts";
 import { getAccountsByPriority } from "./account-priority.ts";
 import { formatCooldownUntil } from "./logger.ts";
+import { config } from "./config.ts";
+import { metrics } from "./metrics.ts";
+import {
+  getAccountConcurrencySnapshot,
+  hasActiveAccountLease,
+  isAccountBusy,
+  isAccountTemporarilyBusy,
+} from "./account-concurrency.ts";
+import {
+  getAccountHealth,
+  getAllAccountHealth,
+  getPoolHealthAggregates,
+} from "./account-health.ts";
+import {
+  deriveAccountState,
+  isAccountEffectivelyBroken,
+  isAccountFlaggedAuthError,
+  isAccountFlaggedSessionExpired,
+  type AccountState,
+} from "./account-state.ts";
+import {
+  pickSchedulerCandidate,
+  rankSchedulerCandidates,
+  type SchedulerCandidate,
+} from "./account-scheduler.ts";
 
 let currentIndex = 0;
 
@@ -75,6 +101,14 @@ export function markAccountRateLimited(
     console.log(
       `⏱️  [AccountManager] Cooldown set | ${accountId} | reason=${cooldownReason} | ${Math.round(duration / 1000)}s | until=${formatCooldownUntil(new Date(until))}`,
     );
+  }
+
+  // An account just left the active pool: check whether we need to warm a
+  // replacement so the ready-account floor is maintained.
+  if (duration > 60_000) {
+    void import("./readiness-guard.ts")
+      .then((m) => m.triggerReadinessCheck())
+      .catch(() => {});
   }
 }
 
@@ -197,6 +231,90 @@ export function syncCooldownsFromDb(accounts: QwenAccount[]): void {
   }
 }
 
+/**
+ * Build enriched scheduler candidates from existing truth. All inputs are
+ * in-memory (cooldown map, ready set, concurrency snapshot, health cache,
+ * priority order) — no browser or per-account DB reads per request.
+ */
+export function buildSchedulerCandidates(
+  accounts: QwenAccount[],
+): SchedulerCandidate[] {
+  const prioritized = getAccountsByPriority(accounts);
+  const priorityIndex = new Map<string, number>();
+  prioritized.forEach((a, i) => {
+    if (!priorityIndex.has(a.id)) priorityIndex.set(a.id, i);
+  });
+  const snapshot = new Map(
+    getAccountConcurrencySnapshot().map((s) => [s.accountId, s]),
+  );
+  const maxStreams = Math.max(
+    1,
+    config.concurrency.maxStreamsPerAccount || 1,
+  );
+  const healthById = getAllAccountHealth(accounts.map((a) => a.id));
+
+  return accounts.map((account) => {
+    const slot = snapshot.get(account.id);
+    const activeStreams = slot?.active ?? 0;
+    const queuedRequests = slot?.waiting ?? 0;
+    const limit = slot?.limit ?? maxStreams;
+    const saturated =
+      isAccountBusy(account.id) || isAccountTemporarilyBusy(account.id);
+    return {
+      account,
+      priorityIndex: priorityIndex.get(account.id) ?? Number.MAX_SAFE_INTEGER,
+      disabled: isAccountDisabledRecord(account),
+      broken: isAccountEffectivelyBroken(account.id),
+      authError: isAccountFlaggedAuthError(account.id),
+      onCooldown: isAccountOnCooldown(account.id),
+      headersReady: isAccountHeadersReady(account.id),
+      initialized: isAccountHeadersReady(account.id),
+      saturated,
+      active: hasActiveAccountLease(account.id),
+      activeStreams,
+      queuedRequests,
+      maxStreams: limit,
+      health:
+        healthById.get(account.id) ?? getAccountHealth(account.id),
+    };
+  });
+}
+
+function pickFromCandidates(
+  candidates: SchedulerCandidate[],
+  triedSet?: Set<string>,
+): QwenAccount | null {
+  const ranked = rankSchedulerCandidates(candidates, {
+    triedAccountIds: triedSet,
+    allowSaturatedFallback: true,
+  });
+  if (ranked.length === 0) return null;
+  const span = Math.max(1, candidates.length);
+  const picked =
+    pickSchedulerCandidate(ranked, currentIndex, span) ?? ranked[0];
+  // Advance the cursor in priority space (historic semantics: the next pick
+  // scans forward from the account after the one just returned).
+  currentIndex = (picked.priorityIndex + 1) % span;
+  return picked.account;
+}
+
+function shortestCooldownFallback(
+  accounts: QwenAccount[],
+  triedSet?: Set<string>,
+): QwenAccount | null {
+  let best: QwenAccount | null = null;
+  let bestRemaining = Infinity;
+  for (const account of accounts) {
+    if (triedSet?.has(account.id)) continue;
+    const info = getAccountCooldownInfo(account.id);
+    if (info && info.remainingMs < bestRemaining) {
+      bestRemaining = info.remainingMs;
+      best = account;
+    }
+  }
+  return best;
+}
+
 export function getNextAccount(): QwenAccount | null {
   const accounts = loadAccounts();
   if (accounts.length === 0) {
@@ -205,35 +323,13 @@ export function getNextAccount(): QwenAccount | null {
 
   syncCooldownsFromDb(accounts);
 
-  // Ordena por prioridade (contas que funcionaram bem vêm primeiro)
-  const prioritized = getAccountsByPriority(accounts);
-  // Gate: once ANY usable account has captured headers, only ready accounts rotate.
-  // If all ready accounts are on cooldown, anyReady degrades to false so non-ready
-  // accounts can be initialized on-demand instead of falsely reporting pool exhaustion.
-  const anyReady = anyUsableAccountHeadersReady(accounts);
+  const candidates = buildSchedulerCandidates(accounts);
+  const picked = pickFromCandidates(candidates);
+  if (picked) return picked;
 
-  for (let i = 0; i < prioritized.length; i++) {
-    const account = prioritized[currentIndex % prioritized.length];
-    currentIndex = (currentIndex + 1) % prioritized.length;
-    if (
-      !isAccountOnCooldown(account.id) &&
-      passesHeadersReadyGate(account.id, anyReady)
-    ) {
-      return account;
-    }
-  }
-
-  // All accounts on cooldown — return the one with the shortest remaining cooldown.
-  let best: QwenAccount | null = null;
-  let bestRemaining = Infinity;
-  for (const account of prioritized) {
-    const info = getAccountCooldownInfo(account.id);
-    if (info && info.remainingMs < bestRemaining) {
-      bestRemaining = info.remainingMs;
-      best = account;
-    }
-  }
-  return best;
+  // All eligible accounts excluded (cooldown/disabled/broken/auth) — return
+  // the one with the shortest remaining cooldown so callers can report wait.
+  return shortestCooldownFallback(getAccountsByPriority(accounts));
 }
 
 export function getNextAvailableAccount(
@@ -251,39 +347,141 @@ export function getNextAvailableAccount(
     triedSet = new Set(triedAccountIds ? [triedAccountIds] : []);
   }
 
-  // Ordena por prioridade (contas que funcionaram bem vêm primeiro)
-  const prioritized = getAccountsByPriority(accounts);
-  // Gate: once ANY untried, non-cooldown account has captured headers, only ready accounts rotate.
-  // If all ready accounts are on cooldown or tried, anyReady degrades to false so non-ready
-  // accounts can be initialized on-demand instead of falsely reporting pool exhaustion.
-  const anyReady = anyUsableAccountHeadersReady(accounts, triedSet);
-
-  // 1. Try to find an untried account that is NOT on cooldown
-  for (let i = 0; i < prioritized.length; i++) {
-    const idx = (currentIndex + i) % prioritized.length;
-    const account = prioritized[idx];
-    if (triedSet.has(account.id)) continue;
-    if (
-      !isAccountOnCooldown(account.id) &&
-      passesHeadersReadyGate(account.id, anyReady)
-    ) {
-      currentIndex = (idx + 1) % prioritized.length;
-      return account;
-    }
-  }
+  const candidates = buildSchedulerCandidates(accounts);
+  const picked = pickFromCandidates(candidates, triedSet);
+  if (picked) return picked;
 
   // 2. If all untried accounts are on cooldown, return the untried one with the shortest remaining cooldown
-  let best: QwenAccount | null = null;
-  let bestRemaining = Infinity;
-  for (const account of prioritized) {
-    if (triedSet.has(account.id)) continue;
-    const info = getAccountCooldownInfo(account.id);
-    if (info && info.remainingMs < bestRemaining) {
-      bestRemaining = info.remainingMs;
-      best = account;
+  return shortestCooldownFallback(getAccountsByPriority(accounts), triedSet);
+}
+
+/** Derive the display lifecycle state for one account (no I/O beyond caches). */
+export function getAccountStateSnapshot(accountId: string): AccountState {
+  const accounts = loadAccounts();
+  const account = accounts.find((a) => a.id === accountId);
+  const candidates = account ? buildSchedulerCandidates([account]) : [];
+  const c = candidates[0];
+  if (!c) return "WARMING";
+  return deriveAccountState({
+    disabled: c.disabled,
+    onCooldown: c.onCooldown,
+    headersReady: c.headersReady,
+    initialized: c.initialized,
+    busy: c.saturated || c.active,
+    authError: c.authError,
+    sessionExpired: isAccountFlaggedSessionExpired(accountId),
+    broken: c.broken,
+  });
+}
+
+export interface PoolStats {
+  total: number;
+  ready: number;
+  warming: number;
+  busy: number;
+  cooldown: number;
+  authError: number;
+  broken: number;
+  disabled: number;
+  sessionExpired: number;
+  totalActiveStreams: number;
+  queuedRequests: number;
+  successRate: number;
+  failureRate: number;
+  averageLatencyMs: number;
+  averageHealth: number;
+  states: Record<string, AccountState>;
+}
+
+/** Pool-wide aggregates for /health, /metrics and the TUI. */
+export function getPoolStats(): PoolStats {
+  const accounts = loadAccounts();
+  if (accounts.length > 0) syncCooldownsFromDb(accounts);
+  const candidates = buildSchedulerCandidates(accounts);
+  const states: Record<string, AccountState> = {};
+  let ready = 0;
+  let warming = 0;
+  let busy = 0;
+  let cooldown = 0;
+  let authError = 0;
+  let broken = 0;
+  let disabled = 0;
+  let sessionExpired = 0;
+  let totalActiveStreams = 0;
+  let queuedRequests = 0;
+  let healthSum = 0;
+
+  for (const c of candidates) {
+    const state = deriveAccountState({
+      disabled: c.disabled,
+      onCooldown: c.onCooldown,
+      headersReady: c.headersReady,
+      initialized: c.initialized,
+      busy: c.saturated || c.active,
+      authError: c.authError,
+      sessionExpired: isAccountFlaggedSessionExpired(c.account.id),
+      broken: c.broken,
+    });
+    states[c.account.id] = state;
+    switch (state) {
+      case "READY": ready++; break;
+      case "WARMING": warming++; break;
+      case "BUSY": busy++; break;
+      case "COOLDOWN": cooldown++; break;
+      case "AUTH_ERROR": authError++; break;
+      case "BROKEN": broken++; break;
+      case "DISABLED": disabled++; break;
+      case "SESSION_EXPIRED": sessionExpired++; break;
     }
+    totalActiveStreams += c.activeStreams;
+    queuedRequests += c.queuedRequests;
+    healthSum += c.health.healthScore;
   }
-  return best;
+
+  const agg = getPoolHealthAggregates(accounts.map((a) => a.id));
+  const stats: PoolStats = {
+    total: accounts.length,
+    ready,
+    warming,
+    busy,
+    cooldown,
+    authError,
+    broken,
+    disabled,
+    sessionExpired,
+    totalActiveStreams,
+    queuedRequests,
+    successRate: agg.successRate,
+    failureRate: agg.failureRate,
+    averageLatencyMs: agg.averageLatencyMs,
+    averageHealth:
+      accounts.length > 0 ? Math.round(healthSum / accounts.length) : 100,
+    states,
+  };
+
+  // Pool gauges for Prometheus (best-effort; /metrics renders them).
+  try {
+    metrics.gauge("pool.accounts", stats.total, { state: "total" });
+    metrics.gauge("pool.accounts", stats.ready, { state: "ready" });
+    metrics.gauge("pool.accounts", stats.warming, { state: "warming" });
+    metrics.gauge("pool.accounts", stats.busy, { state: "busy" });
+    metrics.gauge("pool.accounts", stats.cooldown, { state: "cooldown" });
+    metrics.gauge("pool.accounts", stats.authError, { state: "auth_error" });
+    metrics.gauge("pool.accounts", stats.broken, { state: "broken" });
+    metrics.gauge("pool.accounts", stats.disabled, { state: "disabled" });
+    metrics.gauge("pool.streams.active", stats.totalActiveStreams);
+    metrics.gauge("pool.streams.queued", stats.queuedRequests);
+    metrics.gauge("pool.health.avg", stats.averageHealth);
+    metrics.gauge("pool.latency.avg", stats.averageLatencyMs);
+  } catch {
+    // Best-effort.
+  }
+  return stats;
+}
+
+/** Test isolation: reset rotation offset (cooldown/health/state reset separately). */
+export function resetAccountManagerForTests(): void {
+  currentIndex = 0;
 }
 
 export function getCooldownStatus(): Record<

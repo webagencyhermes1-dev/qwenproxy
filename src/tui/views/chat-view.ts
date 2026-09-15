@@ -28,12 +28,12 @@ export function classifyModel(modelId: string): { badge: string; category: strin
     lower.includes("t2i") ||
     lower.includes("i2i")
   ) {
-    return { badge: theme.lavender("[Imagem]"), category: "Geração de Imagem" };
+    return { badge: theme.lavender("[Image]"), category: "Image Generation" };
   }
   if (lower.includes("video") || lower.includes("t2v") || lower.includes("i2v")) {
-    return { badge: theme.peach("[Vídeo] "), category: "Geração de Vídeo" };
+    return { badge: theme.peach("[Video] "), category: "Video Generation" };
   }
-  return { badge: theme.cyan("[Texto] "), category: "Texto & Raciocínio" };
+  return { badge: theme.cyan("[Text] "), category: "Text & Reasoning" };
 }
 
 export class ChatView implements TuiView {
@@ -76,19 +76,19 @@ export class ChatView implements TuiView {
     {
       id: "high",
       label: "High (Thinking)",
-      desc: "Raciocínio profundo ativado (ideal para código)",
+      desc: "Deep reasoning enabled (ideal for code)",
       badge: theme.green("[High]"),
     },
     {
       id: "medium",
       label: "Medium (Auto)",
-      desc: "Raciocínio dinâmico (Qwen decide quando pensar)",
+      desc: "Dynamic reasoning (Qwen decides when to think)",
       badge: theme.yellow("[Medium]"),
     },
     {
       id: "low",
       label: "Low (Fast)",
-      desc: "Raciocínio desativado (respostas ultrarrápidas)",
+      desc: "Reasoning disabled (ultra-fast responses)",
       badge: theme.cyan("[Low]"),
     },
   ];
@@ -147,20 +147,20 @@ export class ChatView implements TuiView {
   public getShortcuts(): Array<{ key: string; label: string }> {
     if (this.isModelModalOpen) {
       return [
-        { key: "Enter", label: `${glyphs.enter} Escolher` },
-        { key: "Esc", label: `${glyphs.cross} Fechar` },
+        { key: "Enter", label: `${glyphs.enter} Select` },
+        { key: "Esc", label: `${glyphs.cross} Close` },
       ];
     }
     if (this.isEffortModalOpen) {
       return [
-        { key: "Enter", label: `${glyphs.enter} Confirmar` },
-        { key: "Esc", label: `${glyphs.cross} Manter` },
+        { key: "Enter", label: `${glyphs.enter} Confirm` },
+        { key: "Esc", label: `${glyphs.cross} Keep` },
       ];
     }
     return [
-      { key: "Enter", label: `${glyphs.enter} Enviar` },
-      { key: "Esc", label: `${glyphs.cross} Parar` },
-      { key: "Ctrl+L", label: `${glyphs.broom} Limpar` },
+      { key: "Enter", label: `${glyphs.enter} Send` },
+      { key: "Esc", label: `${glyphs.cross} Stop` },
+      { key: "Ctrl+L", label: `${glyphs.broom} Clear` },
     ];
   }
 
@@ -171,13 +171,13 @@ export class ChatView implements TuiView {
     this.isModelModalOpen = false;
 
     const info = classifyModel(chosen);
-    if (info.category === "Texto & Raciocínio") {
+    if (info.category === "Text & Reasoning") {
       this.isEffortModalOpen = true;
       const effIdx = this.availableEfforts.findIndex((e) => e.id === this.selectedEffort);
       this.effortSelectedIndex = effIdx !== -1 ? effIdx : 0;
-      this.statusNote = `Modelo ${chosen} escolhido. Escolha o esforço de raciocínio (Effort):`;
+      this.statusNote = `Model ${chosen} selected. Choose the reasoning effort:`;
     } else {
-      this.statusNote = `Modelo alterado para ${chosen}`;
+      this.statusNote = `Model changed to ${chosen}`;
     }
     this.onNeedsRender?.();
   }
@@ -249,7 +249,7 @@ export class ChatView implements TuiView {
           this.selectedEffort = this.availableEfforts[row - 9].id;
           this.isEffortModalOpen = false;
           const currentM = this.availableModels[this.selectedModelIndex];
-          this.statusNote = `Modelo: ${currentM} | Effort: ${this.availableEfforts[row - 9].label}`;
+          this.statusNote = `Model: ${currentM} | Effort: ${this.availableEfforts[row - 9].label}`;
           this.onNeedsRender?.();
           return true;
         }
@@ -274,7 +274,7 @@ export class ChatView implements TuiView {
         this.selectedEffort = this.availableEfforts[this.effortSelectedIndex].id;
         this.isEffortModalOpen = false;
         const currentM = this.availableModels[this.selectedModelIndex];
-        this.statusNote = `Modelo: ${currentM} | Effort: ${this.availableEfforts[this.effortSelectedIndex].label}`;
+        this.statusNote = `Model: ${currentM} | Effort: ${this.availableEfforts[this.effortSelectedIndex].label}`;
         this.onNeedsRender?.();
         return true;
       }
@@ -351,7 +351,7 @@ export class ChatView implements TuiView {
     if (key.name === "f3") {
       const currentM = this.availableModels[this.selectedModelIndex] || "qwen3.8-max";
       const info = classifyModel(currentM);
-      if (info.category === "Texto & Raciocínio") {
+      if (info.category === "Text & Reasoning") {
         this.isEffortModalOpen = true;
         const idx = this.availableEfforts.findIndex((e) => e.id === this.selectedEffort);
         this.effortSelectedIndex = idx !== -1 ? idx : 0;
@@ -503,7 +503,7 @@ export class ChatView implements TuiView {
     // 6. Clear history with Ctrl+L
     if (key.ctrl && key.name === "l") {
       this.messages = [];
-      this.statusNote = "Histórico do chat limpo.";
+      this.statusNote = "Chat history cleared.";
       this.onNeedsRender?.();
       return true;
     }
@@ -546,19 +546,19 @@ export class ChatView implements TuiView {
 
       // Block submitting if there are 0 accounts configured
       if (this.lastSnapshot && this.lastSnapshot.accounts.length === 0) {
-        this.statusNote = theme.yellow("[!] Adicione uma conta na aba [5] Contas antes de iniciar o chat.");
+        this.statusNote = theme.yellow("[!] Add an account in the [5] Accounts tab before starting chat.");
         this.onNeedsRender?.();
         return true;
       }
 
       const serverState = ServerManager.getInstance().getState();
       if (serverState === "warming") {
-        this.statusNote = theme.yellow("Aguarde: inicializando proxy...");
+        this.statusNote = theme.yellow("Please wait: starting proxy...");
         this.onNeedsRender?.();
         return true;
       }
       if (serverState === "error") {
-        this.statusNote = theme.red("Servidor com erro. Verifique a aba Logs.");
+        this.statusNote = theme.red("Server error. Check the Logs tab.");
         this.onNeedsRender?.();
         return true;
       }
@@ -590,7 +590,7 @@ export class ChatView implements TuiView {
   private async sendMessage(userText: string): Promise<void> {
     const serverState = ServerManager.getInstance().getState();
     if (serverState === "warming") {
-      this.statusNote = theme.yellow("Aguarde: inicializando proxy...");
+      this.statusNote = theme.yellow("Please wait: starting proxy...");
       return;
     }
 
@@ -623,7 +623,7 @@ export class ChatView implements TuiView {
       .map((m) => ({ role: m.role, content: m.content }));
 
     try {
-      const isReasoning = classifyModel(model).category === "Texto & Raciocínio";
+      const isReasoning = classifyModel(model).category === "Text & Reasoning";
       const result = await streamChatCompletions({
         model,
         reasoning_effort: isReasoning ? this.selectedEffort : undefined,
@@ -651,7 +651,7 @@ export class ChatView implements TuiView {
         current.totalTimeMs = result.totalTimeMs;
       }
       this.statusNote = theme.green(
-        `✓ Resposta concluída em ${(result.totalTimeMs / 1000).toFixed(2)}s (TTFB: ${result.ttfbMs}ms)`,
+        `✓ Response completed in ${(result.totalTimeMs / 1000).toFixed(2)}s (TTFB: ${result.ttfbMs}ms)`,
       );
     } catch (err: any) {
       const current = this.messages[assistantMsgIndex];
@@ -670,7 +670,7 @@ export class ChatView implements TuiView {
         rawMsg.includes("Target page, context or browser has been closed") ||
         rawMsg.includes("browserType.launchPersistentContext")
       ) {
-        rawMsg = "Falha ao iniciar o navegador da conta. Feche outras instâncias do QwenProxy ou do Chrome e execute 'qpx reset'.";
+        rawMsg = "Failed to start the account browser. Close other QwenProxy or Chrome instances and run 'qpx reset'.";
       }
 
       if (current) {
@@ -699,7 +699,7 @@ export class ChatView implements TuiView {
     const currentModel = this.availableModels[this.selectedModelIndex] || "qwen3.8-max";
     const currentInfo = classifyModel(currentModel);
     const totalModels = this.availableModels.length;
-    const isReasoning = currentInfo.category === "Texto & Raciocínio";
+    const isReasoning = currentInfo.category === "Text & Reasoning";
 
     const modelLabel = `[ ${currentModel} ]`;
     const styledModel = this.hoveredHeaderBtn === "model"
@@ -725,19 +725,19 @@ export class ChatView implements TuiView {
             : theme.cyan(effortLabel);
     }
 
-    const shortcutsLabel = `[ F2: Modelo${isReasoning ? " | F3: Effort" : ""} (${this.selectedModelIndex + 1}/${totalModels}) ]`;
+    const shortcutsLabel = `[ F2: Model${isReasoning ? " | F3: Effort" : ""} (${this.selectedModelIndex + 1}/${totalModels}) ]`;
     const styledShortcuts = theme.yellow(shortcutsLabel);
 
-    // Non-text models show their category badge ([Imagem] / [Vídeo]), while text models omit [Texto]
+    // Non-text models show their category badge ([Image] / [Video]), while text models omit [Text]
     const nonTextBadge = !isReasoning && currentInfo.badge ? `${currentInfo.badge}  ` : "";
     const nonTextCategory = !isReasoning ? theme.muted(`• ${currentInfo.category}`) : "";
 
     const headerLine = hasAccounts
-      ? `  ${theme.bold("Modelo:")} ${styledModel}  ${nonTextBadge}${isReasoning ? styledEffort : nonTextCategory}   ${styledShortcuts}`
-      : `  ${theme.bold("Modelo:")} ${styledModel}   ${theme.yellow("[ [!] Sem Contas: Adicione em [5] Contas ]")}`;
+      ? `  ${theme.bold("Model:")} ${styledModel}  ${nonTextBadge}${isReasoning ? styledEffort : nonTextCategory}   ${styledShortcuts}`
+      : `  ${theme.bold("Model:")} ${styledModel}   ${theme.yellow("[ [!] No Accounts: Add in [5] Accounts ]")}`;
 
     // Compute dynamic interactive column bounds:
-    const modelStart = 1 + stringWidth("  Modelo: ") + 1; // col 12
+    const modelStart = 1 + stringWidth("  Model: ") + 1; // col 12
     const modelEnd = modelStart + stringWidth(modelLabel) - 1;
     this.modelBtnStartCol = modelStart;
     this.modelBtnEndCol = modelEnd;
@@ -779,7 +779,7 @@ export class ChatView implements TuiView {
       modalLines.push("");
 
       const modalBox = drawBox({
-        title: "Selecionar Modelo [ Enter: Escolher  •  Esc: Fechar ]",
+        title: "Select Model [ Enter: Select  •  Esc: Close ]",
         width,
         height: chatHeight,
         borderColor: theme.borderActive,
@@ -790,8 +790,8 @@ export class ChatView implements TuiView {
     } else if (this.isEffortModalOpen) {
       const modalLines: string[] = [
         "",
-        `  ${theme.bold("Modelo:")} ${theme.cyan(currentModel)} (${currentInfo.category})`,
-        `  ${theme.dim("Escolha o nível de esforço de raciocínio (reasoning_effort):")}`,
+        `  ${theme.bold("Model:")} ${theme.cyan(currentModel)} (${currentInfo.category})`,
+        `  ${theme.dim("Choose the reasoning effort level (reasoning_effort):")}`,
         "",
       ];
       for (let i = 0; i < this.availableEfforts.length; i++) {
@@ -806,7 +806,7 @@ export class ChatView implements TuiView {
       modalLines.push("");
 
       const modalBox = drawBox({
-        title: "Nível de Raciocínio / Effort [ Enter: Confirmar  •  Esc: Manter ]",
+        title: "Reasoning Level / Effort [ Enter: Confirm  •  Esc: Keep ]",
         width,
         height: chatHeight,
         borderColor: theme.borderActive,
@@ -819,15 +819,15 @@ export class ChatView implements TuiView {
 
       if (this.lastSnapshot && this.lastSnapshot.accounts.length === 0) {
         chatContent.push("");
-        chatContent.push(`  ${theme.yellow("[!] Nenhuma conta Qwen configurada no servidor.")}`);
-        chatContent.push(`  ${theme.muted("   Pressione ")}${theme.cyan("Tab")}${theme.muted(" para ir até ")}${theme.bold(theme.white("[5] Contas"))}${theme.muted(" e pressione ")}${theme.bold(theme.white("'A'"))}${theme.muted(" para adicionar seu e-mail e senha.")}`);
+        chatContent.push(`  ${theme.yellow("[!] No Qwen accounts configured on the server.")}`);
+        chatContent.push(`  ${theme.muted("   Press ")}${theme.cyan("Tab")}${theme.muted(" to go to ")}${theme.bold(theme.white("[5] Accounts"))}${theme.muted(" and press ")}${theme.bold(theme.white("'A'"))}${theme.muted(" to add your email and password.")}`);
       } else if (this.messages.length === 0) {
         chatContent.push("");
         const serverState = ServerManager.getInstance().getState();
         if (serverState === "warming") {
-          chatContent.push(theme.yellow("  [!] Inicializando proxy..."));
+          chatContent.push(theme.yellow("  [!] Starting proxy..."));
         } else {
-          chatContent.push(theme.muted("  Digite sua mensagem..."));
+          chatContent.push(theme.muted("  Type your message..."));
         }
       }
       for (const msg of this.messages) {
@@ -836,7 +836,7 @@ export class ChatView implements TuiView {
           const userLines = msg.content.split(/\r?\n/);
           for (let u = 0; u < userLines.length; u++) {
             if (u === 0) {
-              chatContent.push(`  ${theme.blue(glyphs.pointer + " Você:")} ${theme.white(userLines[u])}`);
+              chatContent.push(`  ${theme.blue(glyphs.pointer + " You:")} ${theme.white(userLines[u])}`);
             } else {
               chatContent.push(`    ${theme.white(userLines[u])}`);
             }
@@ -856,10 +856,10 @@ export class ChatView implements TuiView {
               if (this.isGenerating && !msg.content && this.messages.indexOf(msg) === this.messages.length - 1) {
                 const spinner = this.spinnerFrames[this.spinnerIndex] || "⠋";
                 rLines.push("");
-                rLines.push(` ${theme.yellow(`${spinner} Raciocinando...`)}`);
+                rLines.push(` ${theme.yellow(`${spinner} Reasoning...`)}`);
               }
               thinkLines = drawBox({
-                title: "🧠 Raciocínio",
+                title: "🧠 Reasoning",
                 width: thinkWidth,
                 borderColor: theme.borderInactive,
                 titleColor: theme.muted,
@@ -894,7 +894,7 @@ export class ChatView implements TuiView {
             }
           } else if (this.isGenerating && !msg.reasoning && this.messages.indexOf(msg) === this.messages.length - 1) {
             const spinner = this.spinnerFrames[this.spinnerIndex] || "⠋";
-            chatContent.push(`    ${theme.yellow(`${spinner} Pensando...`)}`);
+            chatContent.push(`    ${theme.yellow(`${spinner} Thinking...`)}`);
           }
 
           if (msg.totalTimeMs) {
@@ -969,7 +969,7 @@ export class ChatView implements TuiView {
     }
 
     const historyBox = drawBox({
-      title: `Conversa (${this.messages.length})`,
+      title: `Conversation (${this.messages.length})`,
       width,
       height: chatHeight,
       borderColor: theme.borderInactive,
@@ -992,15 +992,15 @@ export class ChatView implements TuiView {
 
     const inputContent = [`${theme.cyan(inputPrompt)}${displayInput}`];
     const actionLabel = !hasAccounts
-      ? "[!] Nenhuma conta configurada — adicione uma conta na aba [5] Contas"
-      : currentInfo.category === "Geração de Imagem"
-        ? "Prompt da Imagem"
-        : currentInfo.category === "Geração de Vídeo"
-          ? "Prompt do Vídeo"
-          : "Mensagem";
+      ? "[!] No accounts configured — add an account in the [5] Accounts tab"
+      : currentInfo.category === "Image Generation"
+        ? "Image Prompt"
+        : currentInfo.category === "Video Generation"
+          ? "Video Prompt"
+          : "Message";
 
     const inputTitle = this.isGenerating
-      ? `${spinner} Gerando... (Esc para cancelar)`
+      ? `${spinner} Generating... (Esc to cancel)`
       : actionLabel;
 
     const inputBox = drawBox({

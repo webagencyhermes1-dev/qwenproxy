@@ -28,7 +28,40 @@ export interface ProxyStatusSnapshot {
     cooldownUntil: number | null;
     onCooldown: boolean;
     remainingCooldownMs: number;
+    cooldownReason?: string | null;
     headersReady: boolean;
     isInitialized?: boolean;
+    /** Pool 2.0 lifecycle state (derived, never a credential). */
+    state?: string;
+    health?: number;
+    activeStreams?: number;
+    requests?: number;
+    success?: number;
+    failure?: number;
+    lastUsed?: number | null;
   }>;
+  pool?: {
+    total: number;
+    ready: number;
+    warming: number;
+    busy: number;
+    cooldown: number;
+    authError: number;
+    broken: number;
+    disabled: number;
+    activeStreams: number;
+    queued: number;
+    successRate: number;
+    averageHealth: number;
+  } | null;
+  performance?: {
+    avgLatencyMs: number;
+    avgTtfbMs: number;
+    tokensPerSecond: number;
+    totalRequests: number;
+    totalPromptTokens: number;
+    totalCompletionTokens: number;
+    totalTokens: number;
+    recentRequests: number;
+  } | null;
 }

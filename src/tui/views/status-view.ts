@@ -41,8 +41,8 @@ export class StatusView implements TuiView {
 
   public getShortcuts(): Array<{ key: string; label: string }> {
     return [
-      { key: "r", label: "Recarregar" },
-      { key: "z", label: "Zerar Cooldowns" },
+      { key: "r", label: "Reload" },
+      { key: "z", label: "Reset Cooldowns" },
     ];
   }
 
@@ -77,13 +77,13 @@ export class StatusView implements TuiView {
       if (col >= 2 && col <= leftW - 1) {
         if (row === 13) {
           await this.refresh();
-          this.setMessage(theme.green("✓ Status atualizado"));
+          this.setMessage(theme.green("✓ Status refreshed"));
           return true;
         }
         if (row === 14) {
           const cleared = resetAllCooldowns();
           await this.refresh();
-          this.setMessage(theme.green(`✓ Cooldowns zerados: ${cleared} conta(s) liberada(s)`));
+          this.setMessage(theme.green(`✓ Cooldowns reset: ${cleared} account(s) released`));
           return true;
         }
       }
@@ -91,14 +91,14 @@ export class StatusView implements TuiView {
 
     if ((key.name === "r" || key.name === "R") && !key.ctrl) {
       await this.refresh();
-      this.setMessage(theme.green("✓ Status atualizado"));
+      this.setMessage(theme.green("✓ Status refreshed"));
       return true;
     }
 
     if ((key.name === "z" || key.name === "Z") && !key.ctrl) {
       const cleared = resetAllCooldowns();
       await this.refresh();
-      this.setMessage(theme.green(`✓ Cooldowns zerados: ${cleared} conta(s) liberada(s)`));
+      this.setMessage(theme.green(`✓ Cooldowns reset: ${cleared} account(s) released`));
       return true;
     }
   }
@@ -119,9 +119,9 @@ export class StatusView implements TuiView {
     if (isOnline || serverState === "online") {
       onlineBadge = theme.green(`${glyphs.bullet} Online`);
     } else if (serverState === "warming") {
-      onlineBadge = theme.yellow(`🟡 Iniciando...`);
+      onlineBadge = theme.yellow(`🟡 Starting...`);
     } else if (serverState === "error") {
-      onlineBadge = theme.red(`✗ Erro`);
+      onlineBadge = theme.red(`✗ Error`);
     } else {
       onlineBadge = theme.muted(`${glyphs.circle} Offline`);
     }
@@ -131,23 +131,28 @@ export class StatusView implements TuiView {
 
     const baseUrl = `http://${data?.host || "127.0.0.1"}:${data?.port || 7936}/v1`;
 
+    const pool = data?.pool;
+    const poolLine = pool
+      ? `  ${theme.bold("Pool:")}       R:${pool.ready} W:${pool.warming} B:${pool.busy} C:${pool.cooldown} A:${pool.authError} X:${pool.broken} D:${pool.disabled} H:${pool.averageHealth}`
+      : null;
     const leftContent = [
       "",
       `  ${theme.bold("Status:")}     ${onlineBadge}`,
       `  ${theme.bold("Base URL:")}   ${theme.cyan(baseUrl)}`,
       `  ${theme.bold("Uptime:")}     ${theme.cyan(uptimeStr)}`,
       `  ${theme.bold("RAM:")}        ${theme.cyan(String(data?.rssMb || 0) + " MB")}`,
-      `  ${theme.bold("Conexões:")}   ${data?.activeStreams ? theme.yellow(String(data.activeStreams) + " ativas") : "0 ativas"}`,
+      `  ${theme.bold("Connections:")}   ${data?.activeStreams ? theme.yellow(String(data.activeStreams) + " active") : "0 active"}`,
+      ...(poolLine ? [poolLine] : []),
       "",
-      `  ${theme.bold("Ações:")}`,
-      `    ${this.hoveredActionRow === 13 ? theme.bgHover(` ${theme.cyan("[ R ] Recarregar")} `) : `${theme.cyan("[ R ]")} Recarregar`}`,
-      `    ${this.hoveredActionRow === 14 ? theme.bgHover(` ${theme.yellow("[ Z ] Zerar Cooldowns")} `) : `${theme.yellow("[ Z ]")} Zerar Cooldowns`}`,
+      `  ${theme.bold("Actions:")}`,
+      `    ${this.hoveredActionRow === 13 ? theme.bgHover(` ${theme.cyan("[ R ] Reload")} `) : `${theme.cyan("[ R ]")} Reload`}`,
+      `    ${this.hoveredActionRow === 14 ? theme.bgHover(` ${theme.yellow("[ Z ] Reset Cooldowns")} `) : `${theme.yellow("[ Z ]")} Reset Cooldowns`}`,
       "",
       this.actionMessage ? `  ${this.actionMessage}` : "",
     ];
 
     const leftBox = drawBox({
-      title: "Sistema",
+      title: "System",
       width: leftW,
       height: contentH,
       borderColor: theme.borderInactive,
@@ -160,23 +165,23 @@ export class StatusView implements TuiView {
     const readyCount = accounts.filter((a) => !a.onCooldown && a.headersReady).length;
     const rightContent: string[] = [
       "",
-      `  ${theme.dim("#   Conta                 Status")}`,
+      `  ${theme.dim("#   Account               Status")}`,
       `  ${theme.dim("───────────────────────────────────────")}`,
     ];
 
     if (accounts.length === 0) {
-      rightContent.push(`  ${theme.muted("Nenhuma conta adicionada. (Vá em [5] Contas)")}`);
+      rightContent.push(`  ${theme.muted("No accounts added. (Go to [5] Accounts)")}`);
     } else {
       accounts.slice(0, contentH - 5).forEach((acc, idx) => {
         const num = pad(String(idx + 1), 3);
         const name = pad(truncate(acc.emailOrName, 20), 20);
-        let status = theme.green(`${glyphs.bullet} Pronto`);
+        let status = theme.green(`${glyphs.bullet} Ready`);
         if (acc.onCooldown) {
           const mins = Math.max(1, Math.round(acc.remainingCooldownMs / 60000));
           status = theme.yellow(`⚠️ Cooldown ${mins}m`);
         } else if (!acc.headersReady) {
           status = acc.isInitialized
-            ? theme.yellow(`◐ Aquecendo...`)
+            ? theme.yellow(`◐ Warming...`)
             : theme.muted(`○ Standby`);
         }
         rightContent.push(`  ${num} ${name}  ${status}`);
@@ -184,7 +189,7 @@ export class StatusView implements TuiView {
     }
 
     const rightBox = drawBox({
-      title: `Contas (${readyCount}/${accounts.length})`,
+      title: `Accounts (${readyCount}/${accounts.length})`,
       width: rightW,
       height: contentH,
       borderColor: theme.borderInactive,

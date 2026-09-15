@@ -57,8 +57,15 @@ export function classifyError(err: unknown): QwenProxyError {
       upstreamCode === "ratelimited" ||
       upstreamCode === "rate_limit" ||
       upstreamCode === "rate_limit_exceeded" ||
+      upstreamCode === "quota_exceeded" ||
+      upstreamCode.includes("usage_limit") ||
       message.includes("quota") ||
-      message.includes("upper limit for today");
+      message.includes("upper limit") ||
+      message.includes("limit for today") ||
+      message.includes("usage limit") ||
+      message.includes("maximum usage") ||
+      message.includes("daily limit") ||
+      message.includes("daily usage");
 
     return isActualRateLimit
       ? new UpstreamRateLimit(err.message)

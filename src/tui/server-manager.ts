@@ -1,5 +1,5 @@
 /**
- * QwenProxy TUI - In-Process Server Manager ("Tudo Junto Uma Coisa Só")
+ * QwenProxy TUI - In-Process Server Manager ("All Together As One")
  * Starts and manages the Hono + Playwright proxy server directly within the TUI process.
  */
 
@@ -84,7 +84,7 @@ export class ServerManager {
     const clean = stripAnsi(text).trim();
     if (!clean || clean.length === 0) return;
 
-    const time = new Date().toLocaleTimeString("pt-BR", {
+    const time = new Date().toLocaleTimeString("en-US", {
       hour: "2-digit",
       minute: "2-digit",
       second: "2-digit",
@@ -232,7 +232,7 @@ export class ServerManager {
         this.state = "online";
         this.appendLog(
           "INFO",
-          `✨ [Server] Conectado à instância em execução na porta ${port}`,
+          `✨ [Server] Connected to the running instance on port ${port}`,
         );
         return;
       }
@@ -242,7 +242,7 @@ export class ServerManager {
     this.state = "warming";
     this.appendLog(
       "INFO",
-      `🚀 [Server] Iniciando servidor na porta ${port}...`,
+      `🚀 [Server] Starting server on port ${port}...`,
     );
 
     this.interceptLogs();
@@ -253,14 +253,14 @@ export class ServerManager {
         this.state = "online";
         this.appendLog(
           "INFO",
-          `✨ [Server] QwenProxy pronto e online em http://${cleanHost}:${port}/v1`,
+          `✨ [Server] QwenProxy ready and online at http://${cleanHost}:${port}/v1`,
         );
       } catch (err: any) {
         this.state = "error";
         this.lastError = err?.message || String(err);
         this.appendLog(
           "ERROR",
-          `❌ [Server] Falha ao iniciar servidor: ${this.lastError}`,
+          `❌ [Server] Failed to start server: ${this.lastError}`,
         );
       } finally {
         this.startPromise = null;

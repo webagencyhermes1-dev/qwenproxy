@@ -26,6 +26,7 @@ import { SyncView } from "./views/sync-view.ts";
 import { StorageView } from "./views/storage-view.ts";
 import { AccountsView } from "./views/accounts-view.ts";
 import { LogsView } from "./views/logs-view.ts";
+import { PerformanceView } from "./views/performance-view.ts";
 export class TuiApp {
   private screen: Screen;
   private views: TuiView[] = [];
@@ -46,6 +47,7 @@ export class TuiApp {
       new StorageView(),
       new AccountsView(),
       new LogsView(),
+      new PerformanceView(),
     ];
     const tabIdx = Math.max(0, Math.min(this.views.length - 1, initialTab - 1));
     this.activeViewIndex = tabIdx;
@@ -71,7 +73,7 @@ export class TuiApp {
     const ok = this.screen.start();
     if (!ok) {
       console.error(
-        "[QwenProxy TUI] A interface interativa requer um terminal TTY interativo.",
+        "[QwenProxy TUI] The interactive TUI requires an interactive TTY terminal.",
       );
       process.exit(1);
     }
@@ -85,7 +87,7 @@ export class TuiApp {
         await this.handleKey(key);
         this.requestRender();
       } catch (err: any) {
-        console.error(`[TUI] Erro ao processar tecla: ${err?.message || String(err)}`);
+        console.error(`[TUI] Error processing key: ${err?.message || String(err)}`);
       }
     });
 
@@ -96,7 +98,7 @@ export class TuiApp {
       } catch {}
     });
 
-    // Start server in-process together with TUI ("tudo junto uma coisa só")
+    // Start server in-process together with TUI ("all together as one")
     void ServerManager.getInstance().ensureStarted();
 
     // Initial status fetch
@@ -197,14 +199,14 @@ export class TuiApp {
       this.requestRender();
       return;
     }
-    // Direct tab switching with numbers 1..6 only when NOT typing text in an input
+    // Direct tab switching with numbers 1..7 only when NOT typing text in an input
     const isTypingText =
       activeView.id === "chat" ||
       (typeof (activeView as any).isCapturingText === "function" &&
         (activeView as any).isCapturingText());
 
     if (!isTypingText) {
-      if (!key.ctrl && !key.meta && ["1", "2", "3", "4", "5", "6"].includes(key.name)) {
+      if (!key.ctrl && !key.meta && ["1", "2", "3", "4", "5", "6", "7"].includes(key.name)) {
         const newIdx = parseInt(key.name, 10) - 1;
         if (newIdx !== this.activeViewIndex && this.views[newIdx]) {
           if (activeView.onDeactivate) activeView.onDeactivate();
@@ -235,9 +237,9 @@ export class TuiApp {
     if (this.statusSnapshot?.online || serverState === "online") {
       statusChip = theme.green(`[ ${glyphs.bullet} Online ]`);
     } else if (serverState === "warming") {
-      statusChip = theme.yellow("[ ◐ Iniciando... ]");
+      statusChip = theme.yellow("[ ◐ Starting... ]");
     } else if (serverState === "error") {
-      statusChip = theme.red("[ ✕ Erro ]");
+      statusChip = theme.red("[ ✕ Error ]");
     } else {
       statusChip = theme.muted(`[ ○ Offline ]`);
     }
@@ -275,7 +277,7 @@ export class TuiApp {
     frame.push(...viewLines);
       this.screen.render(frame);
     } catch (err: any) {
-      console.error(`[TUI] Erro na renderização: ${err?.message || String(err)}`);
+      console.error(`[TUI] Render error: ${err?.message || String(err)}`);
     }
   }
 }

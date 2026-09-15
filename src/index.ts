@@ -46,11 +46,36 @@ process.on('unhandledRejection', async (reason: unknown) => {
 import { startServer } from './api/server.js'
 const isTui = process.argv.includes('--tui') || process.env.QWEN_TUI === 'true'
 
+// Auto-import Qwen-Forge accounts on startup (non-fatal if file is absent).
+async function autoImportForgeAccounts(): Promise<void> {
+  try {
+    const { resolveForgeAccountsPath, importForgeAccountsFromPath } = await import('./core/forge-import.ts');
+    const forgePath = resolveForgeAccountsPath();
+    if (!fs.existsSync(forgePath)) return;
+    const summary = importForgeAccountsFromPath(forgePath);
+    if (summary.error) {
+      console.warn(`⚠️  [ForgeImport] ${summary.error}`);
+      return;
+    }
+    if (summary.imported > 0 || summary.alreadyPresent > 0) {
+      console.log(
+        `📥 [ForgeImport] found=${summary.found} imported=${summary.imported} already_present=${summary.alreadyPresent} invalid=${summary.invalid} pool_total=${summary.poolTotal}`,
+      );
+    }
+  } catch (error) {
+    console.warn(
+      `⚠️  [ForgeImport] skipped: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 if (isTui) {
+  await autoImportForgeAccounts()
   const { TuiApp } = await import('./tui/app.ts')
   const app = new TuiApp()
   await app.start()
 } else {
+  await autoImportForgeAccounts()
   startServer().catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error)
     // Expected configuration errors are already formatted with an emoji and

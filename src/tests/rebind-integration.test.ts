@@ -79,9 +79,9 @@ test("rebind: quota exhaust triggers rebind with compressed context, stays", () 
       messages,
       currentTurn: messages[messages.length - 1],
       rollingSummary: "prior work summary",
-      tokenBudget: 100_000,
+      tokenBudget: 200_000,
     });
-    assert.ok(compressed.totalChars <= 100_000);
+    assert.ok(compressed.totalChars <= 200_000);
     assert.equal(compressed.t0, "System: agent instructions");
 
     sticky.rebind(key, next!, null);
