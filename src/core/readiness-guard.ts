@@ -40,6 +40,77 @@ const VALIDATION_BUCKETS = 3;
 /** Accounts currently being warmed by the guard (prevents double-init). */
 const warmingInProgress = new Set<string>();
 
+/**
+ * Recovery/readiness observability (Loop 8). Counters prove that the
+ * thundering-herd coalescing (Loop 6), the bucket-spread validation sweeps
+ * (Loop 6) and the warmup guards are actually engaging in production, and
+ * drive /health/recovery.
+ */
+export interface ReadinessDiagnostics {
+  poolChecksRun: number;
+  coalescedTriggers: number;
+  accountsWarmed: number;
+  warmSkippedAlreadyWarming: number;
+  warmSkippedActiveLease: number;
+  warmupFailures: number;
+  validationSweepsRun: number;
+  accountsRevalidated: number;
+  accountsWarming: number;
+  readyAccounts: number;
+  standbyAccounts: number;
+  lastPoolCheckAt: number | null;
+  lastValidationSweepAt: number | null;
+}
+
+let poolChecksRun = 0;
+let coalescedTriggers = 0;
+let accountsWarmed = 0;
+let warmSkippedAlreadyWarming = 0;
+let warmSkippedActiveLease = 0;
+let warmupFailures = 0;
+let validationSweepsRun = 0;
+let accountsRevalidated = 0;
+let lastPoolCheckAt: number | null = null;
+let lastValidationSweepAt: number | null = null;
+
+/** Snapshot of the guard's counters for /health/recovery and tests. */
+export function getReadinessDiagnostics(): ReadinessDiagnostics {
+  return {
+    poolChecksRun,
+    coalescedTriggers,
+    accountsWarmed,
+    warmSkippedAlreadyWarming,
+    warmSkippedActiveLease,
+    warmupFailures,
+    validationSweepsRun,
+    accountsRevalidated,
+    accountsWarming: warmingInProgress.size,
+    readyAccounts: getReadyAccounts().length,
+    standbyAccounts: getStandbyAccounts().length,
+    lastPoolCheckAt,
+    lastValidationSweepAt,
+  };
+}
+
+/** Test hook: zero the counters (live warming set is untouched). */
+export function resetReadinessCountersForTests(): void {
+  poolChecksRun = 0;
+  coalescedTriggers = 0;
+  accountsWarmed = 0;
+  warmSkippedAlreadyWarming = 0;
+  warmSkippedActiveLease = 0;
+  warmupFailures = 0;
+  validationSweepsRun = 0;
+  accountsRevalidated = 0;
+  lastPoolCheckAt = null;
+  lastValidationSweepAt = null;
+}
+
+/** Test hook: run one recovered-account validation sweep synchronously. */
+export async function runReadinessValidationForTests(): Promise<void> {
+  await validateRecoveredAccounts();
+}
+
 /** True while a pool check is running; bursts of triggers coalesce into one. */
 let poolCheckInFlight = false;
 /** A trigger arrived while a check was running — run one trailing re-check. */
@@ -126,6 +197,7 @@ async function warmAccount(account: QwenAccount): Promise<boolean> {
     console.log(
       `🪶 [ReadinessGuard] Skipping warmup for ${maskEmail(account.email)} (${account.id}) — already warming`,
     );
+    warmSkippedAlreadyWarming++;
     return false;
   }
   // Never warm an account that is actively serving a request — initializing
@@ -134,6 +206,7 @@ async function warmAccount(account: QwenAccount): Promise<boolean> {
     console.log(
       `🪶 [ReadinessGuard] Skipping warmup for ${maskEmail(account.email)} (${account.id}) — active lease`,
     );
+    warmSkippedActiveLease++;
     return false;
   }
   warmingInProgress.add(account.id);
@@ -157,11 +230,13 @@ async function warmAccount(account: QwenAccount): Promise<boolean> {
     }
 
     markAccountHeadersReady(account.id);
+    accountsWarmed++;
     console.log(
       `🪶 [ReadinessGuard] Account ready: ${maskEmail(account.email)} (${account.id})`,
     );
     return true;
   } catch (error) {
+    warmupFailures++;
     console.warn(
       `⚠️  [ReadinessGuard] Warmup failed for ${maskEmail(account.email)}: ${error instanceof Error ? error.message : String(error)}`,
     );
@@ -177,6 +252,8 @@ async function warmAccount(account: QwenAccount): Promise<boolean> {
  * thundering-herd coalescing lives in ensurePoolReadiness below.
  */
 async function runPoolCheck(): Promise<void> {
+  poolChecksRun++;
+  lastPoolCheckAt = Date.now();
   const ready = getReadyAccounts();
   const warming = getWarmingAccounts();
   const standby = getStandbyAccounts();
@@ -213,6 +290,7 @@ async function runPoolCheck(): Promise<void> {
 export async function ensurePoolReadiness(): Promise<void> {
   if (!guardDeps) return;
   if (poolCheckInFlight) {
+    coalescedTriggers++;
     pendingRecheck = true;
     return;
   }
@@ -239,6 +317,8 @@ export function triggerReadinessCheck(): void {
  */
 async function validateRecoveredAccounts(): Promise<void> {
   if (!guardDeps) return;
+  validationSweepsRun++;
+  lastValidationSweepAt = Date.now();
   // Spread validation across sweeps so a whole batch that cleared cooldown at
   // once (shared QWEN_ACCOUNTS expiry, mass rate-limit clearing) is re-warmed
   // over VALIDATION_BUCKETS sweeps instead of N back-to-back Chromium inits.
@@ -261,7 +341,9 @@ async function validateRecoveredAccounts(): Promise<void> {
     console.log(
       `🪶 [ReadinessGuard] Validating recovered account: ${maskEmail(account.email)} (${account.id})`,
     );
-    await warmAccount(account);
+    if (await warmAccount(account)) {
+      accountsRevalidated++;
+    }
   }
 }
 

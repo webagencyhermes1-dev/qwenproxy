@@ -234,4 +234,24 @@ Two brand-new coding sessions fired their first turns at the same moment against
 
 ## Loop 8 — Recovery Metrics and Logging
 
-*(pending)*
+**Symptom from log:**
+```
+[ReadinessGuard] Pool check: 2 ready, 0 warming, 3 standby → warming 1
+[ReadinessGuard] Account ready: user1 (acc-…)        // …but no way to see it from outside
+```
+The recovery stack built in Loops 3/6 (init slot, thundering-herd coalescing, bucket-spread validation sweeps) was invisible in production. `GET /health` reported pool counts, but nothing answered "did the coalescing actually engage? how many sweeps ran? how many accounts did the guard revalidate after cooldown?" — so a regression back into herd behavior would be silent.
+
+**Root cause:** the guards had no counters and no endpoint; observability stopped at aggregate pool state.
+
+**Fix applied:**
+1. **Readiness counters** (`readiness-guard.ts`) — `getReadinessDiagnostics()` now exposes `poolChecksRun`, `coalescedTriggers`, `accountsWarmed`, `warmSkippedAlreadyWarming`, `warmSkippedActiveLease`, `warmupFailures`, `validationSweepsRun`, `accountsRevalidated`, `accountsWarming`, `readyAccounts`, `standbyAccounts`, and last-run timestamps. These prove Loop 6 (a burst → few coalesced checks, never parallel) and the bucket spread (validation sweeps ÷ buckets) are live.
+2. **`GET /health/recovery`** (`api/server.ts`) — surfaces the readiness diagnostics alongside the live lease snapshot (active/queued per account) and pool aggregates. No credentials leak (counters and id-derived numbers only).
+3. **Test-suite registration** (`package.json`) — the loop test files (personalization-lock-skip, playwright-init-slot, readiness-guard, rebind-integration, shared-browser, tiered-context, two-sessions, concurrent-sessions-integration, recovery-metrics) were never in the `test:mock`/`test:mock:fast` scripts; the full suite silently skipped them. Registered now: suite grows 810 → 853 tests, 852 pass + 1 env-dependent skip (server port held by a live dev instance).
+
+**Tests verifying the fix (recovery-metrics.test.ts, new):**
+- Pool check warms a standby → `poolChecksRun`, `accountsWarmed`, `lastPoolCheckAt`, `readyAccounts` all correct.
+- A 5-trigger burst → ≥4 `coalescedTriggers` while ≤2 total `poolChecksRun` and exactly 1 warm.
+- Validation sweep revalidates exactly the account matching the current sweep bucket (`validationSweepsRun`, `accountsRevalidated`).
+- `GET /health/recovery` returns 200 with readiness + leases + pool payload.
+
+**Commit:** `feat(observability): expose recovery metrics via /health/recovery and register loop tests`

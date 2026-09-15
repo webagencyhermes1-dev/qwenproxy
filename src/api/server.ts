@@ -375,6 +375,38 @@ app.get("/health/sessions", async (c) => {
   }
 });
 
+// Recovery observability: readiness guard counters, per-account lease load and
+// the account manager's pool aggregates. Proves the Loop 6 coalescing/validation
+// guards are engaging (vs. a silent thundering herd) and surfaces lease churn.
+app.get("/health/recovery", async (c) => {
+  try {
+    const { getReadinessDiagnostics } = await import("../core/readiness-guard.js");
+    const { getAccountConcurrencySnapshot } = await import(
+      "../core/account-concurrency.js"
+    );
+    const { getPoolStats } = await import("../core/account-manager.js");
+    const leases = getAccountConcurrencySnapshot();
+    return c.json({
+      readiness: getReadinessDiagnostics(),
+      leases,
+      activeLeaseCount: leases.reduce((n, s) => n + s.active, 0),
+      queuedLeaseCount: leases.reduce((n, s) => n + s.waiting, 0),
+      pool: {
+        ready: getPoolStats().ready,
+        warming: getPoolStats().warming,
+        cooldown: getPoolStats().cooldown,
+        broken: getPoolStats().broken,
+      },
+      timestamp: Date.now(),
+    });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message : String(err) },
+      500,
+    );
+  }
+});
+
 // Token TTL diagnostics: inspect real cookie/header lifetimes
 app.get("/diagnostics/tokens", async (c) => {
   const error = verifyApiKey(c);
