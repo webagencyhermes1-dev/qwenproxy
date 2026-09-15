@@ -165,6 +165,30 @@ export async function chatCompletions(c: Context) {
             `[Session] Lookup hit | key=${stickyKey} | account=${observed.accountId} | session=${ctx.sessionId}`,
           );
         }
+      } else if (stickyKey) {
+        // Loop 4 (advisory): health-aware pick for new sessions. The
+        // authoritative pick still lives in account.ts scheduler; this log
+        // proves the new selector agrees without changing routing yet.
+        try {
+          const { loadAccounts } = await import("../../core/accounts.ts");
+          const { selectAccountForNewSession } = await import(
+            "../../services/account/selection.ts"
+          );
+          const ids = loadAccounts().map((a) => a.id);
+          const advisory = selectAccountForNewSession({
+            stickyMap: getStickyMap(),
+            healthTracker: getHealthTracker(),
+            availableAccounts: ids,
+            stickyKey,
+          });
+          if (advisory && logger.isLevelEnabled("info")) {
+            console.log(
+              `[Session] Advisory pick | key=${stickyKey} | account=${advisory} | pool_size=${ids.length}`,
+            );
+          }
+        } catch {
+          // Best-effort.
+        }
       }
     } catch {
       // Observability only; never fail the request.
