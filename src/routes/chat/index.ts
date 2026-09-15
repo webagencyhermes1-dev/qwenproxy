@@ -42,6 +42,8 @@ import { classifyMediaModel } from "../../services/media-generation.ts";
 import { handleMediaChatCompletion } from "./media.ts";
 import { getStickyMap } from "../../services/session/stickyMap.ts";
 import { generateStickyKey } from "../../services/session/key.ts";
+import { getHealthTracker, classify429 } from "../../services/account/health.ts";
+import { isAntiBotError } from "./retry-policy.ts";
 
 
 
@@ -73,6 +75,10 @@ export async function chatCompletions(c: Context) {
   const mark = (name: string, since: number) => {
     timings[name] = Date.now() - since;
   };
+  // Last account that served (or attempted) this request, for health scoring
+  // in the outer catch when the stream result is out of scope.
+  let lastActiveAccountId: string | null = null;
+  const currentStreamAccountIdForHealth = (): string | null => lastActiveAccountId;
 
   try {
     let stepStartedAt = Date.now();
@@ -304,6 +310,7 @@ export async function chatCompletions(c: Context) {
       }
       throw streamResult.error || new Error("All accounts failed");
     }
+    lastActiveAccountId = streamResult.activeAccountId;
 
     for (const [name, value] of Object.entries(
       getContextMeterHeaders(streamResult.tokenEstimationContext.contextMeter),
@@ -369,6 +376,16 @@ export async function chatCompletions(c: Context) {
         if (releaseChatLock) {
           releaseChatLock();
           releaseChatLock = null;
+        }
+        // Loop 3: record success for health scoring (TTFB approx = acquire time;
+        // precise first-chunk timing lands in Loop 8 via streaming layer).
+        try {
+          getHealthTracker().recordSuccess(
+            streamResult.activeAccountId,
+            Date.now() - reqStartedAt,
+          );
+        } catch {
+          // Best-effort.
         }
         streamResult.releaseAccountLease();
       },
@@ -707,6 +724,29 @@ export async function chatCompletions(c: Context) {
     if (releaseChatLock) {
       releaseChatLock();
       releaseChatLock = null;
+    }
+
+    // Loop 3: feed terminal errors into health scoring (burst vs quota).
+    try {
+      const anyErr = err as {
+        upstreamStatus?: number;
+        retryAfterMs?: number;
+        message?: string;
+        activeAccountId?: string;
+      };
+      const acct =
+        anyErr?.activeAccountId ?? currentStreamAccountIdForHealth();
+      if (acct && anyErr?.upstreamStatus === 429) {
+        getHealthTracker().record429(
+          acct,
+          classify429(anyErr.retryAfterMs, anyErr.message),
+          anyErr.retryAfterMs,
+        );
+      } else if (acct && err && isAntiBotError(err)) {
+        getHealthTracker().recordCaptcha(acct);
+      }
+    } catch {
+      // Best-effort.
     }
 
     // The client is already gone; do not turn expected cancellation into a
