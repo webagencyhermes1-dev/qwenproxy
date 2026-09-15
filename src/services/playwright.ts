@@ -154,7 +154,44 @@ export function buildChromiumLaunchArgs(viewport: {
     );
   }
 
+  // Pin the Qwen origin to the known proxied IP so Chromium never resolves
+  // chat.qwen.ai through its own DNS/DoH path (bad-resolution navigations are
+  // a documented source of "BrowserContext disposed"/"Target crashed"
+  // failures). MAP takes effect before any DNS lookup, so expired/poisoned
+  // host entries cannot strand the page.
+  if (config.playwright.hostResolverRules && config.playwright.chatOriginIp) {
+    args.push(
+      `--host-resolver-rules=MAP chat.qwen.ai ${config.playwright.chatOriginIp},MAP qwen.ai ${config.playwright.chatOriginIp}`,
+    );
+  }
+
   return args;
+}
+
+let activeInitSlots = 0;
+let initSlotWaiters: Array<() => void> = [];
+
+/**
+ * Bounds how many per-account Chromium context launches/header captures can
+ * run at once. Every account boots its own persistent-context browser process,
+ * so a burst of cold requests that initialize together forked N renderers off
+ * one host and the resulting OOM cascade killed sibling contexts ("Browser has
+ * been closed", "Session closed"). A global slot (not per-account: initializing
+ * accounts are independent) queues surplus inits until a slot frees.
+ */
+export async function withPlaywrightInitSlot<T>(fn: () => Promise<T>): Promise<T> {
+  const max = config.playwright.maxParallelInit;
+  if (max <= 1) return fn();
+  while (activeInitSlots >= max) {
+    await new Promise<void>((resolve) => initSlotWaiters.push(resolve));
+  }
+  activeInitSlots++;
+  try {
+    return await fn();
+  } finally {
+    activeInitSlots--;
+    initSlotWaiters.shift()?.();
+  }
 }
 
 // Per-account mutexes for browser access. maxHoldMs = 60s: a page operation
@@ -1510,6 +1547,7 @@ export async function initPlaywrightForAccount(
       return;
     }
 
+    await withPlaywrightInitSlot(async () => {
     // If a context limit is configured, make room by closing idle contexts.
     await evictIdlePlaywrightContextsToLimit().catch(() => {});
 
@@ -1690,6 +1728,7 @@ export async function initPlaywrightForAccount(
       cleanupPlaywrightAccountState(account.id);
       throw error;
     }
+    });
   } finally {
     release();
   }

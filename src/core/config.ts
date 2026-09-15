@@ -1,3 +1,5 @@
+import os from "os";
+import path from "path";
 import { z } from "zod";
 
 const envSchema = z
@@ -53,6 +55,21 @@ const envSchema = z
     // drop out of the warm set and get evicted.
     PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("2"),
     PLAYWRIGHT_PREPARE_ALL_ON_STARTUP: z.string().default("false"),
+    // Bounds how many per-account Chromium contexts may be launching and
+    // capturing headers at the same time. Every account starts its own
+    // persistent-context browser process; a burst of cold requests that all
+    // initialize at once forks N renderers off the same host and the OOM/crash
+    // cascade is what kills sibling contexts. 5 is a safe ceiling: an account
+    // init spends ~15-20s, so at 5 that is ~4 accounts per minute booting.
+    PLAYWRIGHT_MAX_PARALLEL_INIT: z.string().default("5"),
+    // DNS bypass for the Qwen origin inside Chromium. Chromium's own DNS/DoH
+    // resolution occasionally lands on a frontier/bad IP for chat.qwen.ai,
+    // which makes navigations fail (net::ERR_NAME_NOT_RESOLVED) or land on a
+    // wrong host and die with "BrowserContext disposed"/"Target crashed".
+    // Pinning the origin to the proxied upstream IP skips resolution entirely.
+    // Set QWEN_HOST_RESOLVER_RULES=false to let Chromium resolve normally.
+    QWEN_HOST_RESOLVER_RULES: z.string().default("true"),
+    QWEN_CHAT_ORIGIN_IP: z.string().default("8.219.122.25"),
     CAPTCHA_SOLVER_ENABLED: z.string().default("true"),
     CAPTCHA_SOLVER_MAX_ATTEMPTS: z.string().default("3"),
     CAPTCHA_SOLVER_TIMEOUT_MS: z.string().default("15000"),
@@ -71,12 +88,12 @@ const envSchema = z
     PAGE_TIMEOUT: z.string().default("60000"),
     HEADERS_TIMEOUT: z.string().default("90000"),
     TIME_TO_FIRST_BYTE: z.string().default("60000"),
-    IDLE_STREAM_TIMEOUT: z.string().default("60000"),
+    IDLE_STREAM_TIMEOUT: z.string().default("300000"),
     // Deadline for the FIRST upstream chunk on thinking models (the reasoning
     // idle of 600s is for gaps AFTER data flows; a stream that produced
     // nothing in this window is dead and should fail fast, retryable).
     QWEN_FIRST_CHUNK_TIMEOUT: z.string().default("60000"),
-    TOTAL_REQUEST_TIMEOUT: z.string().default("600000"),
+    TOTAL_REQUEST_TIMEOUT: z.string().default("900000"),
     // Mid-stream silence window for thinking models: 3 min with ZERO upstream
     // bytes is a dead stream (WAF swallow / dropped connection) — fail fast and
     // let the retry policy rotate accounts. Flowing reasoning chunks RESET this
@@ -114,7 +131,7 @@ const envSchema = z
     // swallows the completion fetch) otherwise chains metadata/header timeouts
     // for minutes; this fails the attempt visibly so the retry loop switches.
     ACQUIRE_DEADLINE_MS: z.string().default("120000"),
-    ACCOUNT_LEASE_MAX_DURATION_MS: z.string().default("600000"),
+    ACCOUNT_LEASE_MAX_DURATION_MS: z.string().default("900000"),
     ACCOUNT_INIT_FAILURE_COOLDOWN_MS: z.string().default("300000"),
     // Timeout before a request waiting on the CHAT lock gives up. The chat lock
     // is held for the entire stream lifetime, so it must cover the longest
@@ -129,7 +146,7 @@ const envSchema = z
     STREAM_DISCONNECT_GRACE_MS: z
       .string()
       .regex(/^\d+$/, "STREAM_DISCONNECT_GRACE_MS must be a number")
-      .default("4000"),
+      .default("60000"),
     CHAT_IN_PROGRESS_RETRY_DELAY_MS: z.string().default("2000"),
     // Temporarily-busy window after a chat_in_progress: long enough to absorb
     // the upstream chat settle (measured ~1-2s), short enough that the next
@@ -175,6 +192,19 @@ const envSchema = z
     // does not enforce a token/request quota; these exist for SDK/tool parsing.
     RATE_LIMIT_REQUESTS: z.string().default("5000"),
     RATE_LIMIT_TOKENS: z.string().default("200000"),
+    // Tiered context compression for failover replay. When the sticky account
+    // is unavailable and the conversation must be replayed onto a new account,
+    // the full prompt (potentially 2M+ chars) is compressed to a budget using
+    // T0 (system) + T1 (recent verbatim) + T2 (BM25 retrieval) + T3 (summary).
+    CONTEXT_COMPRESSION_ENABLED: z.string().default("true"),
+    CONTEXT_COMPRESSION_THRESHOLD: z.string().default("100000"),
+    CONTEXT_COMPRESSION_BUDGET: z.string().default("100000"),
+    CONTEXT_COMPRESSION_RECENT_EXCHANGES: z.string().default("3"),
+    CONTEXT_COMPRESSION_CHUNK_SIZE: z.string().default("500"),
+    CONTEXT_COMPRESSION_MAX_CHUNKS: z.string().default("8"),
+    ENABLE_HEDGING: z.string().default("false"),
+    HEDGE_TTFB_THRESHOLD_MS: z.string().default("30000"),
+    HEDGE_MIN_ELIGIBLE_ACCOUNTS: z.string().default("3"),
   })
 ;
 
@@ -209,6 +239,9 @@ export const config = {
     jsHeapMb: Math.max(64, parseInt(env.PLAYWRIGHT_JS_HEAP_MB)),
     lowMemoryFlags: env.PLAYWRIGHT_LOW_MEMORY_FLAGS !== "false",
     maxActiveContexts: Math.max(0, parseInt(env.PLAYWRIGHT_MAX_ACTIVE_CONTEXTS)),
+    maxParallelInit: Math.max(1, parseInt(env.PLAYWRIGHT_MAX_PARALLEL_INIT)),
+    hostResolverRules: env.QWEN_HOST_RESOLVER_RULES !== "false",
+    chatOriginIp: env.QWEN_CHAT_ORIGIN_IP,
     prepareAllOnStartup: env.PLAYWRIGHT_PREPARE_ALL_ON_STARTUP !== "false",
   },
   captcha: {
@@ -376,6 +409,38 @@ export const config = {
     enabled: env.CONTEXT_METER_ENABLED === "true",
     windowTokens: Math.max(0, parseInt(env.CONTEXT_METER_WINDOW_TOKENS)),
     reportUsage: env.CONTEXT_METER_REPORT_USAGE === "true",
+  },
+  contextCompression: {
+    enabled: env.CONTEXT_COMPRESSION_ENABLED !== "false",
+    /** Only compress when the full prompt exceeds this many chars. */
+    threshold: Math.max(10_000, parseInt(env.CONTEXT_COMPRESSION_THRESHOLD)),
+    /** Target budget for the compressed output. */
+    budget: Math.max(10_000, parseInt(env.CONTEXT_COMPRESSION_BUDGET)),
+    /** Number of recent exchanges kept verbatim (T1). */
+    recentExchanges: Math.max(1, parseInt(env.CONTEXT_COMPRESSION_RECENT_EXCHANGES)),
+    /** BM25 chunk size in characters. */
+    chunkSize: Math.max(100, parseInt(env.CONTEXT_COMPRESSION_CHUNK_SIZE)),
+    /** Max T2 chunks to retrieve. */
+    maxChunks: Math.max(1, parseInt(env.CONTEXT_COMPRESSION_MAX_CHUNKS)),
+  },
+  hedging: {
+    enabled: env.ENABLE_HEDGING === "true",
+    ttfbThresholdMs: Math.max(1000, parseInt(env.HEDGE_TTFB_THRESHOLD_MS)),
+    minEligibleAccounts: Math.max(2, parseInt(env.HEDGE_MIN_ELIGIBLE_ACCOUNTS)),
+  },
+  forge: {
+    /**
+     * Default Qwen-Forge accounts export consumed by `npm run import:accounts`.
+     * Resolution order (see core/forge-import.ts#resolveForgeAccountsPath):
+     * explicit CLI path > QWEN_FORGE_ACCOUNTS_PATH env > this default.
+     * Centralized here so the default exists in exactly one place.
+     */
+    defaultAccountsPath: path.join(
+      os.homedir(),
+      "qwen-forge",
+      "data",
+      "accounts.json",
+    ),
   },
 };
 

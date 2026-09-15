@@ -41,6 +41,24 @@ test("buildChromiumLaunchArgs includes resource-saving background and disk-cache
   );
 });
 
+test("buildChromiumLaunchArgs pins the Qwen origin via host-resolver-rules", () => {
+  const args = buildChromiumLaunchArgs({ width: 1280, height: 720 });
+
+  const rules = args.find((arg) => arg.startsWith("--host-resolver-rules="));
+  assert.ok(
+    rules,
+    "expected a host-resolver-rules arg pinning chat.qwen.ai to the proxied origin IP",
+  );
+  assert.ok(
+    rules.startsWith(`--host-resolver-rules=MAP chat.qwen.ai ${config.playwright.chatOriginIp}`),
+    `rules must map chat.qwen.ai to ${config.playwright.chatOriginIp}`,
+  );
+  assert.ok(
+    rules.includes(`MAP qwen.ai ${config.playwright.chatOriginIp}`),
+    "rules must also map the apex qwen.ai so redirects cannot re-resolve",
+  );
+});
+
 test("prunePlaywrightProfileCaches safely removes transient cache directories while preserving session state", async () => {
   const fs = await import("node:fs");
   const path = await import("node:path");

@@ -90,7 +90,33 @@ The chat input web component was never found. The page.focus then bided its 60s 
 
 ## Loop 3 — Fix Browser Context Crashes and DNS Inside Chromium
 
-*(pending)*
+**Symptom from log:**
+```
+BrowserContext disposed.
+Target page, context or browser has been closed.
+page.evaluate: Target crashed
+```
+Per-account Chromium contexts died mid-flight. A crash on one account cascaded into "Browser has been closed" / "Session closed" on sibling contexts sharing the host, and accounts hit with navigations occasionally failed to resolve `chat.qwen.ai` (Chromium's own DNS/DoH path landing on a frontier/bad IP → `net::ERR_NAME_NOT_RESOLVED`, wrong host, or a page that dies with "BrowserContext disposed").
+
+**Root cause:**
+1. Every account boots its OWN persistent-context Chromium process. A burst of cold requests that all initialized at once forked N renderers off the same host; the OOM/memory pressure is what killed sibling contexts mid-generation.
+2. Chromium resolved `chat.qwen.ai` through its own DNS/DoH, independent of the proxy's working resolution, so navigations could fail or land on a bad IP even when the Node side was fine.
+
+**Fix applied:**
+
+1. **DNS bypass** (`--host-resolver-rules="MAP chat.qwen.ai <ip>,MAP qwen.ai <ip>"`) — Chromium now pins the Qwen origin to the proxied upstream IP and never consults its own resolver. Configuration: `QWEN_HOST_RESOLVER_RULES` (`true` default; set `false` to let Chromium resolve normally) and `QWEN_CHAT_ORIGIN_IP` (default `8.219.122.25`). Root cause of most "browser failed to open chat page" stalls.
+2. **Global init slot** (`withPlaywrightInitSlot`, cap `PLAYWRIGHT_MAX_PARALLEL_INIT` default **5**) — the heavy per-account init body (context launch + session validation + header capture) now runs under a global semaphore. A burst of cold requests serializes surplus inits instead of forking 10+ Chromium processes at once; the OOM cascade that crashed sibling contexts is removed. Cap is configurable; 0/1 disables queueing.
+3. **Host-resolver arg verifiable in unit tests** — `buildChromiumLaunchArgs` output is asserted in `chromium-args.test.ts`; the slot cap is asserted by a 12-task burst in `playwright-init-slot.test.ts`.
+
+**Tests verifying the fix:**
+- `chromium-args.test.ts` — asserts `--host-resolver-rules` maps both `chat.qwen.ai` and apex `qwen.ai` to `config.playwright.chatOriginIp`.
+- `playwright-init-slot.test.ts` (new) — `withPlaywrightInitSlot` never exceeds the cap on a burst of 12 concurrent inits, drains all slots, and preserves thrown errors; config exposes a sane default cap.
+
+**Note:** "Proxy health check" (liveness of the local QwenProxy) is covered by Loop 8 observability (`/health/deep` + readiness metrics); not duplicated here.
+
+**Commit:** `fix(playwright): pin Qwen DNS in Chromium and cap parallel account inits`
+
+---
 
 ## Loop 4 — Fix Session Expiry Handling
 
