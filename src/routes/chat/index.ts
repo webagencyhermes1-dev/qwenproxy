@@ -336,6 +336,82 @@ export async function chatCompletions(c: Context) {
     }
     lastActiveAccountId = streamResult.activeAccountId;
 
+    // Loop 8: sticky set/rebind on success. First turn binds; account mismatch
+    // (failover inside account.ts) rebinds with compressed-context validation.
+    // Same-account turns keep thread-native delta (only touch).
+    if (stickyKey) {
+      try {
+        const sm = getStickyMap();
+        const existing = sm.get(stickyKey);
+        if (!existing) {
+          const { STICKY_TTL_MS } = await import("../../services/session/stickyMap.ts");
+          sm.set(stickyKey, {
+            accountId: streamResult.activeAccountId,
+            proxyId: null,
+            boundAt: Date.now(),
+            lastUsedAt: Date.now(),
+            ttlMs: STICKY_TTL_MS,
+          });
+        } else if (existing.accountId !== streamResult.activeAccountId) {
+          // Failover: validate compressed payload fits 100k via tiered assembly
+          // (string replay already compressed in account.ts; this is the
+          // Message-level check + refs for reversibility).
+          try {
+            const { assembleCompressedContext } = await import(
+              "../../services/context/tiered.ts"
+            );
+            const { getRollingSummary } = await import(
+              "../../services/context/summary.ts"
+            );
+            const lastMsg = messages[messages.length - 1] ?? {
+              role: "user",
+              content: currentPrompt || prompt,
+            };
+            const compressed = assembleCompressedContext({
+              systemPrompt,
+              tools: Array.isArray((body as unknown as { tools?: [] }).tools)
+                ? ((body as unknown as { tools: [] }).tools as never)
+                : [],
+              messages,
+              currentTurn: lastMsg,
+              rollingSummary: getRollingSummary().get(stickyKey),
+              tokenBudget: 100_000,
+            });
+            console.warn(
+              `[Session] Failover compressed | key=${stickyKey} | from=${existing.accountId} | to=${streamResult.activeAccountId} | total=${compressed.totalChars} | t2=${compressed.t2.length} | refs=${Object.keys(compressed.refs).length}`,
+            );
+          } catch (e) {
+            console.warn(
+              `[Session] Failover compression check failed | key=${stickyKey} | error=${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+          sm.rebind(stickyKey, streamResult.activeAccountId, null);
+        } else {
+          sm.touch(stickyKey);
+        }
+        // Async non-blocking index/summary for future T2/T3 (never blocks).
+        void (async () => {
+          try {
+            const { getVectorStore } = await import("../../services/context/vectorStore.ts");
+            const { getRollingSummary } = await import("../../services/context/summary.ts");
+            const lastMsg = messages[messages.length - 1];
+            if (lastMsg) {
+              const text =
+                typeof lastMsg.content === "string"
+                  ? lastMsg.content
+                  : JSON.stringify(lastMsg.content ?? "");
+              await getVectorStore().add(stickyKey!, `${Date.now()}-${reqId}`, text.slice(0, 8000));
+            }
+            await getRollingSummary().update(stickyKey!, messages.slice(-4) as never);
+          } catch {
+            // Best-effort.
+          }
+        })();
+      } catch {
+        // Best-effort.
+      }
+    }
+
     for (const [name, value] of Object.entries(
       getContextMeterHeaders(streamResult.tokenEstimationContext.contextMeter),
     )) {
@@ -685,6 +761,32 @@ export async function chatCompletions(c: Context) {
               );
             }
             retryCtx.triedAccountIds.add(newStreamResult.activeAccountId);
+            lastActiveAccountId = newStreamResult.activeAccountId;
+            // Loop 8: keep sticky binding aligned on retry failover.
+            if (stickyKey) {
+              try {
+                const sm = getStickyMap();
+                const existing = sm.get(stickyKey);
+                if (!existing) {
+                  const { STICKY_TTL_MS } = await import(
+                    "../../services/session/stickyMap.ts"
+                  );
+                  sm.set(stickyKey, {
+                    accountId: newStreamResult.activeAccountId,
+                    proxyId: null,
+                    boundAt: Date.now(),
+                    lastUsedAt: Date.now(),
+                    ttlMs: STICKY_TTL_MS,
+                  });
+                } else if (existing.accountId !== newStreamResult.activeAccountId) {
+                  sm.rebind(stickyKey, newStreamResult.activeAccountId, null);
+                } else {
+                  sm.touch(stickyKey);
+                }
+              } catch {
+                // Best-effort.
+              }
+            }
 
             currentStreamResult = newStreamResult;
             currentParams = {
