@@ -156,3 +156,71 @@ test("the personalization lock releases fast after a normal sync (no leak)", asy
   const lock2 = await acquirePersonalizationLockForTests("mock-account-consecutive");
   lock2();
 });
+
+test("10s lock hold: chat skips personalization fast, never logs Mutex[personalization", async () => {
+  // The holder's natural lifetime is 10s (release timer); the request runs
+  // while the lock is held and must NOT wait on it: 2s acquire budget → skip.
+  const releaseLock = await acquirePersonalizationLockForTests("mock-account");
+  const holdTimer = setTimeout(() => releaseLock(), 10_000);
+
+  const lines: string[] = [];
+  const origWarn = console.warn;
+  const origLog = console.log;
+  const origError = console.error;
+  const capture = (...args: unknown[]) => {
+    lines.push(args.map((a) => String(a)).join(" "));
+  };
+  console.warn = capture as typeof console.warn;
+  console.log = capture as typeof console.log;
+  console.error = capture as typeof console.error;
+
+  const { originalFetch, completionCalls } = mockUpstream();
+  const startedAt = Date.now();
+  try {
+    const res = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "qwen3.6-plus",
+          session_id: "personalization-10s-hold-test",
+          messages: [
+            { role: "system", content: "Agent instructions: be brief." },
+            { role: "user", content: "hi" },
+          ],
+          stream: true,
+        }),
+      }),
+    );
+    const elapsed = Date.now() - startedAt;
+    assert.strictEqual(res.status, 200);
+    await res.text();
+
+    // Must have waited out the 2s skip budget (lock was really contended)..
+    assert.ok(
+      elapsed >= 1_900,
+      `request must actually contend the lock (skip budget ~2s), took ${elapsed}ms`,
+    );
+    // ..but must never wait on the 10s holder.
+    assert.ok(
+      elapsed < 6_000,
+      `request must skip, not wait on the 10s lock hold, took ${elapsed}ms`,
+    );
+    assert.ok(
+      lines.some((l) => l.includes("Skipping personalization sync")),
+      "the skip must be logged",
+    );
+    assert.ok(
+      !lines.some((l) => l.includes("Mutex[personalization")),
+      "silent skip: no Mutex[personalization timeout string may appear",
+    );
+    assert.ok(completionCalls.length >= 1);
+  } finally {
+    console.warn = origWarn;
+    console.log = origLog;
+    console.error = origError;
+    clearTimeout(holdTimer);
+    releaseLock();
+    globalThis.fetch = originalFetch;
+  }
+});

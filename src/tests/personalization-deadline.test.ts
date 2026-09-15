@@ -10,15 +10,17 @@ import {
   unregisterPlaywrightAccountForTests,
 } from "../services/playwright.ts";
 
-test("Personalization Deadline: sync is hard-capped at 5s for every account", () => {
-  // The sync deadline is a hard 5s cap regardless of account warmth or the
+test("Personalization Deadline: sync is hard-capped at 2s for every account", () => {
+  // The sync deadline is a hard 2s cap regardless of account warmth or the
   // navigation timeout — a stuck browser op must never hold the personalization
-  // mutex for minutes (observed: heldFor=62011ms). A normal sync takes ~2s.
-  assert.equal(PERSONALIZATION_SYNC_DEADLINE_MS, 5_000);
+  // mutex (observed: heldFor=62011ms). A normal sync takes ~1s. On timeout the
+  // sync is SKIPPED (`[Personalization] skipped after 2s`) and the request
+  // proceeds; only an explicit fast failure throws PersonalizationSyncError.
+  assert.equal(PERSONALIZATION_SYNC_DEADLINE_MS, 2_000);
 
   const deadlineCold = computePersonalizationDeadlineMs("non-existent-account-id");
   assert.equal(deadlineCold, PERSONALIZATION_SYNC_DEADLINE_MS);
-  assert.equal(deadlineCold, 5_000);
+  assert.equal(deadlineCold, 2_000);
 
   const deadlineUndefined = computePersonalizationDeadlineMs(undefined);
   assert.equal(deadlineUndefined, PERSONALIZATION_SYNC_DEADLINE_MS);
@@ -27,13 +29,13 @@ test("Personalization Deadline: sync is hard-capped at 5s for every account", ()
   assert.equal(computePersonalizationDeadlineMs("cold-acc"), PERSONALIZATION_SYNC_DEADLINE_MS);
 });
 
-test("Personalization Deadline: warm account gets the same 5s hard cap", () => {
+test("Personalization Deadline: warm account gets the same 2s hard cap", () => {
   const warmAccountId = "test-warm-acc-" + Date.now();
   try {
     registerPlaywrightAccountForTests(warmAccountId, {} as any, Date.now());
     const deadlineWarm = computePersonalizationDeadlineMs(warmAccountId);
     assert.equal(deadlineWarm, PERSONALIZATION_SYNC_DEADLINE_MS);
-    assert.equal(deadlineWarm, 5_000);
+    assert.equal(deadlineWarm, 2_000);
   } finally {
     unregisterPlaywrightAccountForTests(warmAccountId);
   }

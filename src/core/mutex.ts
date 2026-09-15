@@ -20,7 +20,11 @@ export class Mutex {
     private readonly maxHoldMs: number = MAX_HOLD_MS,
   ) {}
 
-  async acquire(timeoutMs = 300_000, key = ""): Promise<() => void> {
+  async acquire(
+    timeoutMs = 300_000,
+    key = "",
+    options?: { silentTimeout?: boolean },
+  ): Promise<() => void> {
     // Stale detection: force-release if held beyond the hold limit
     // (leaked lock). The chat lock uses a longer hold so a legitimate
     // long generation (2-3 min with huge contexts) is not force-released
@@ -61,7 +65,14 @@ export class Mutex {
         const index = this.queue.findIndex((e) => e.waiter === waiter);
         if (index !== -1) this.queue.splice(index, 1);
         const heldFor = Date.now() - this.lockedAt;
-        logger.warn(`[Mutex:${this.name}] TIMEOUT key=${logKey} waited=${timeoutMs}ms heldBy=${this.lockedByKey || "unknown"} heldFor=${heldFor}ms queueLeft=${this.queue.length}`);
+        // silentTimeout: the caller treats the timeout as the designed path
+        // (e.g. personalization skip) — debug only, never a warn. The
+        // rejection is unchanged; the caller decides.
+        if (options?.silentTimeout) {
+          logger.debug(`[Mutex:${this.name}] skip key=${logKey} waited=${timeoutMs}ms heldBy=${this.lockedByKey || "unknown"} heldFor=${heldFor}ms queueLeft=${this.queue.length}`);
+        } else {
+          logger.warn(`[Mutex:${this.name}] TIMEOUT key=${logKey} waited=${timeoutMs}ms heldBy=${this.lockedByKey || "unknown"} heldFor=${heldFor}ms queueLeft=${this.queue.length}`);
+        }
         reject(new Error(`Mutex[${this.name}] acquire timeout after ${timeoutMs}ms (held by ${this.lockedByKey || "unknown"} for ${heldFor}ms)`));
       }, timeoutMs);
       this.queue.push({ waiter, enqueuedAt, key: logKey });

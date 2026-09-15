@@ -218,11 +218,12 @@ export function quarantineChallengedAccountOnce(
 }
 
 /**
- * Hard deadline for the personalization sync (5s). A normal sync takes ~2s;
- * beyond 5s the account page/headers are stuck — abandon the sync and
- * release the lock so no other request waits.
+ * Hard deadline for the personalization sync (2s). A normal sync takes ~1s;
+ * beyond 2s the account page/headers are stuck — abandon the sync, SKIP it
+ * (log `[Personalization] skipped after 2s`), release the lock, and proceed
+ * with the chat. The lock must NEVER stall or fail a chat request.
  */
-export const PERSONALIZATION_SYNC_DEADLINE_MS = 5_000;
+export const PERSONALIZATION_SYNC_DEADLINE_MS = 2_000;
 export const PERSONALIZATION_LOCK_ACQUIRE_TIMEOUT_MS = 2_000;
 
 export function computePersonalizationDeadlineMs(
@@ -291,7 +292,14 @@ async function acquirePersonalizationLock(
 		mutex = new Mutex(`personalization:${accountId.substring(0, 8)}`);
 		personalizationLocks.set(accountId, mutex);
 	}
-	const release = await mutex.acquire(timeoutMs, `personalization:${accountId.substring(0, 8)}`);
+	const release = await mutex.acquire(
+		timeoutMs,
+		`personalization:${accountId.substring(0, 8)}`,
+		// The 2s skip is the designed path (proceed without re-sync), not an
+		// anomaly — keep the timeout out of warn logs so `Mutex[personalization`
+		// never appears in normal operation.
+		{ silentTimeout: true },
+	);
 	return () => {
 		release();
 		if (mutex!.isIdle()) {
@@ -1451,10 +1459,16 @@ async function tryCreateStreamWithRetry(
 			//    cannot acquire it within 2s SKIPS the sync and proceeds — the
 			//    personalization lock must NEVER fail or stall a chat request
 			//    (observed: 60s waits and failover storms on a busy account).
+			//    The acquire-timeout warn is silenced (debug) because the skip
+			//    is the designed path, not an anomaly.
 			//  - The lock is held ONLY for the sync, never through stream
 			//    creation (a stuck header capture used to hold it for 62s+).
-			//  - The sync itself is bounded by a 5s hard deadline; when it fires
-			//    the sync promise is abandoned and the lock is released.
+			//  - The sync itself is bounded by a 2s hard deadline; on timeout
+			//    the sync is SKIPPED (`[Personalization] skipped after 2s`) and
+			//    the request proceeds. An explicit fast sync failure (returned
+			//    false / threw) still fails the attempt with
+			//    PersonalizationSyncError so instructions never silently go
+			//    unapplied on a deterministic rejection.
 			let releasePersonalization: (() => void) | null = null;
 			let personalizationApplied = false;
 			let syncFailure: string | null = null;
@@ -1473,11 +1487,12 @@ async function tryCreateStreamWithRetry(
 					try {
 						const instruction =
 							params.requestPersonalizationInstruction ?? "";
-						// Hard 5s deadline for the sync. A normal sync takes ~2s;
-						// beyond 5s the page/headers are stuck — abandon the sync
+						// Hard 2s deadline for the sync. A normal sync takes ~1s;
+						// beyond 2s the page/headers are stuck — abandon the sync
 						// (browser ops keep their own 60s timeouts) and release the
 						// lock so no other request waits.
 						let syncSettled = false;
+						let syncTimedOut = false;
 						let personalizationDeadlineTimer: NodeJS.Timeout | undefined;
 						const syncPromise = syncQwenRequestPersonalization(
 							instruction,
@@ -1509,6 +1524,7 @@ async function tryCreateStreamWithRetry(
 							new Promise<boolean>((resolve) => {
 								personalizationDeadlineTimer = setTimeout(() => {
 									if (!syncSettled) {
+										syncTimedOut = true;
 										syncFailure = `sync timed out after ${syncDeadlineMs}ms`;
 									}
 									resolve(false);
@@ -1519,16 +1535,25 @@ async function tryCreateStreamWithRetry(
 							clearTimeout(personalizationDeadlineTimer);
 						}
 						// Agent instructions ride ONLY the account-level personalization —
-						// the prompt never carries them. An unconfirmed sync must fail the
-						// attempt (retryable → rotates accounts, each re-syncs on its own
-						// account) instead of degrading to inline. An empty instruction has
-						// nothing to guarantee (plain chat), so it stays best-effort. A lock
-						// contention SKIP (releasePersonalization === null) is NOT a sync
-						// failure — the request proceeds without re-syncing.
+						// the prompt never carries them. A TIMEOUT is skipped (the page
+						// is stuck; blocking would deadlock every waiter): log and
+						// proceed. An explicit fast failure is deterministic — fail
+						// the attempt (retryable → rotates accounts, each re-syncs
+						// on its own account) instead of degrading to inline. An
+						// empty instruction has nothing to guarantee (plain chat),
+						// so it stays best-effort. A lock contention SKIP
+						// (releasePersonalization === null) is NOT a sync failure —
+						// the request proceeds without re-syncing.
 						if (instruction && !personalizationApplied) {
-							throw new PersonalizationSyncError(
-								`personalization sync not confirmed for ${currentAccountEmail}: ${syncFailure ?? "settings response did not confirm the instruction"}`,
-							);
+							if (syncTimedOut) {
+								console.warn(
+									`[Personalization] skipped after 2s | account=${currentAccountEmail} | reason=sync_timeout`,
+								);
+							} else {
+								throw new PersonalizationSyncError(
+									`personalization sync not confirmed for ${currentAccountEmail}: ${syncFailure ?? "settings response did not confirm the instruction"}`,
+								);
+							}
 						}
 					} finally {
 						// Always release the personalization lock — even when the sync
