@@ -710,6 +710,19 @@ async function cleanupServerResources(): Promise<void> {
     // Best-effort.
   }
 
+  if (process.env.QWEN_DURABLE_RUNTIME === "true") {
+    try {
+      // Durable runtime: persist terminal state for in-flight work so a
+      // shutdown cannot strand a generation, then flush debounced writers.
+      const { flushRuntimeTerminalState } = await import(
+        "../runtime/persistence/recovery.ts"
+      );
+      await flushRuntimeTerminalState();
+    } catch {
+      // Best-effort: a shutdown failure must not block the DB close.
+    }
+  }
+
   const { closeDatabase } = await import("../core/database.ts");
   closeDatabase();
 }
@@ -794,6 +807,25 @@ export async function startServer(options?: {
     const { syncCooldownsFromDb } =
       await import("../core/account-manager.ts");
     syncCooldownsFromDb(accounts);
+
+    if (process.env.QWEN_DURABLE_RUNTIME === "true") {
+      // Durable runtime layer: versioned schema + crash recovery. Runs BEFORE
+      // warmup so orphaned ownership from a previous process is fenced before
+      // any account is declared ready. Fail fast on a schema problem.
+      const { bootPersistence } = await import(
+        "../runtime/persistence/bootstrap.ts"
+      );
+      const { recoverCrashedState } = await import(
+        "../runtime/persistence/recovery.ts"
+      );
+      bootPersistence();
+      const recovery = recoverCrashedState();
+      if (recovery.abandonedGenerations > 0) {
+        console.log(
+          `🧹 [Server] Crash recovery: ${recovery.abandonedGenerations} abandoned generation(s), ${recovery.fencedLeases} fenced lease(s), ${recovery.recoveredAccounts} recovered account(s)`,
+        );
+      }
+    }
 
     const { getAccountsByPriority } =
       await import("../core/account-priority.ts");

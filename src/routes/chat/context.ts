@@ -9,6 +9,7 @@ import type { Message } from "../../utils/types.ts";
 import { estimateTokenCount } from "../../utils/context-truncation.ts";
 import { deriveSessionId } from "../../utils/session-id.ts";
 import { getLogicalThreadState, consumeToolCapNotice } from "../../services/qwen.ts";
+import { isSessionVersioningEnabled } from "../../runtime/session/session-service.ts";
 
 export { estimateTokenCount, getModelContextWindow, deriveSessionId };
 
@@ -28,6 +29,9 @@ export interface FinalContext {
   requestPersonalizationInstruction: string | null;
   hasExplicitConversationKey: boolean;
   allowThreadReuse: boolean;
+  // Phase 7-wire: optimistic-concurrency basis captured at generation start.
+  // Failover and retries reuse it instead of rebuilding from live state.
+  sessionVersionAtStart?: number | null;
 }
 
 export interface BuildContextParams {
@@ -41,6 +45,7 @@ export interface BuildContextParams {
   conversationKey: string | null;
   hasExplicitConversationKey: boolean;
   chatMode?: ChatMode;
+  sessionVersionAtStart?: number;
 }
 
 export async function buildFinalContext(
@@ -57,6 +62,7 @@ export async function buildFinalContext(
     conversationKey,
     hasExplicitConversationKey,
     chatMode = "thread",
+    sessionVersionAtStart,
   } = params;
 
   const modelContextWindow = getModelContextWindow(modelId);
@@ -190,6 +196,9 @@ export async function buildFinalContext(
       : null,
     hasExplicitConversationKey,
     allowThreadReuse,
+    sessionVersionAtStart: isSessionVersioningEnabled()
+      ? (sessionVersionAtStart ?? null)
+      : undefined,
   };
 }
 

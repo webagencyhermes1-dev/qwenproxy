@@ -6,6 +6,7 @@ import {
   isTokenExpiringSoon,
 } from "./auth-playwright.ts";
 import { v4 as uuidv4 } from "uuid";
+import { newOperationId } from "../domain/ids.ts";
 import {
   UpstreamRateLimit,
   ClientAbortedError,
@@ -28,6 +29,11 @@ import {
 } from "../core/model-registry.ts";
 import { type Page, type BrowserContext } from "patchright";
 import { withAccountPage, assertAntiBotHeaders, onBrowserContextCreated } from "./playwright.ts";
+import {
+  operationRegistry,
+  browserOwnershipEnabled,
+  type RegisteredOperation,
+} from "../runtime/browser/operation-registry.ts";
 import { recoverBaxiaCaptcha } from "./captcha-coordinator.ts";
 import { startBaxiaCaptchaWatcher } from "./captcha-solver.ts";
 import { isAccountBusy } from "../core/account-concurrency.ts";
@@ -1115,6 +1121,12 @@ async function createQwenBrowserResponse(
   signal: AbortSignal,
   referrer?: string,
   pageOperationTimeoutMs = config.timeouts.page,
+  operationIdentity?: {
+    operationId?: string;
+    generationId?: string;
+    attemptId?: string;
+    operationDeadline?: number;
+  },
 ): Promise<Response> {
   if (isAuthMockEnabled()) {
     return fetch(url, {
@@ -1154,11 +1166,18 @@ async function createQwenBrowserResponse(
   let settled = false;
   let abortListener: (() => void) | undefined;
   let cancelPromise: Promise<void> | undefined;
+  let trackedOp: RegisteredOperation | undefined;
   const cleanup = () => {
     if (settled) return;
     settled = true;
     if (abortListener) signal.removeEventListener("abort", abortListener);
     browserStreamStates.delete(requestId);
+    // Phase 6: the operation's observable lifetime ends here — settle the
+    // completion and drop the registry entry exactly once.
+    if (trackedOp) {
+      trackedOp.resolveCompletion();
+      operationRegistry.remove(trackedOp.operationId);
+    }
   };
   const cancel = () => {
     if (!cancelPromise) {
@@ -1190,6 +1209,41 @@ async function createQwenBrowserResponse(
   let captchaWatcher: ReturnType<typeof startBaxiaCaptchaWatcher> | undefined;
 
   try {
+    // Phase 6 (flag-gated): register the in-page fetch as a tracked operation.
+    // The existing "return immediately to free the mutex" contract is
+    // PRESERVED — only tracking is added. A terminal/cancel of the operation
+    // (generation terminal, deadline) aborts the in-page aborter via the
+    // __qwenProxyAborters mechanism.
+    if (browserOwnershipEnabled() && operationIdentity) {
+      trackedOp = operationRegistry.register({
+        accountId,
+        deadline:
+          operationIdentity.operationDeadline ??
+          Date.now() + pageOperationTimeoutMs,
+        signal,
+        kind: "qwen-browser-fetch",
+        ...(operationIdentity.operationId
+          ? { operationId: operationIdentity.operationId }
+          : {}),
+        ...(operationIdentity.generationId
+          ? { generationId: operationIdentity.generationId }
+          : {}),
+        ...(operationIdentity.attemptId
+          ? { attemptId: operationIdentity.attemptId }
+          : {}),
+      });
+      trackedOp.controller.signal.addEventListener(
+        "abort",
+        () => {
+          void cancel();
+        },
+        { once: true },
+      );
+      if (trackedOp.controller.signal.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
+    }
+
     const startOperationTimeoutMs = Math.max(
       5_000,
       Math.min(config.timeouts.navigation, pageOperationTimeoutMs),
@@ -1222,6 +1276,7 @@ async function createQwenBrowserResponse(
             flushBytes,
             flushMs,
             timeoutMs,
+            bodyDeadlineEpoch,
           }: {
             url: string;
             method: "POST";
@@ -1234,6 +1289,13 @@ async function createQwenBrowserResponse(
             flushBytes: number;
             flushMs: number;
             timeoutMs: number;
+            /**
+             * Phase 6: absolute epoch-ms deadline for the whole operation. The
+             * body read stays bounded by it — headers arriving does NOT clear
+             * the in-page timeout, the timer is re-armed with the remaining
+             * budget instead (J.3).
+             */
+            bodyDeadlineEpoch?: number;
           }) => {
             const globalObject = globalThis as unknown as Record<string, unknown>;
             const notify = globalObject[bindingName] as (
@@ -1252,7 +1314,7 @@ async function createQwenBrowserResponse(
             }
             const abortController = new AbortController();
             aborters.set(requestId, abortController);
-            const timeoutId = setTimeout(
+            let timeoutId = setTimeout(
               () => abortController.abort(),
               timeoutMs,
             );
@@ -1274,6 +1336,19 @@ async function createQwenBrowserResponse(
                   status: response.status,
                   contentType: response.headers.get("content-type") || "",
                 });
+
+                // Phase 6: headers arriving does not end the operation. Re-arm
+                // the in-page timer with the remaining body budget so a stalled
+                // body reader still aborts (the old code cleared it here).
+                if (typeof bodyDeadlineEpoch === "number") {
+                  const bodyRemainingMs = bodyDeadlineEpoch - Date.now();
+                  if (bodyRemainingMs > 0) {
+                    timeoutId = setTimeout(
+                      () => abortController.abort(),
+                      bodyRemainingMs,
+                    );
+                  }
+                }
 
                 if (!response.body) {
                   await notify(requestId, { type: "done" });
@@ -1325,6 +1400,7 @@ async function createQwenBrowserResponse(
                   // Node may have cancelled the stream already.
                 }
               } finally {
+                clearTimeout(timeoutId);
                 aborters?.delete(requestId);
               }
             })();
@@ -1346,6 +1422,7 @@ async function createQwenBrowserResponse(
             flushBytes: BROWSER_STREAM_FLUSH_BYTES,
             flushMs: BROWSER_STREAM_FLUSH_MS,
             timeoutMs: metadataTimeoutMs,
+            bodyDeadlineEpoch: trackedOp?.deadline,
           },
         );
       },
@@ -2437,6 +2514,10 @@ export async function createQwenStream(
     parallelEscape?: boolean;
     /** "thread" (chat_mode:"normal") or "temp" (chat_mode:"local"). */
     chatMode?: ChatMode;
+    /** Phase 6: attribute the stream's browser operation to a generation. */
+    operationId?: string;
+    generationId?: string;
+    attemptId?: string;
   },
   signal?: AbortSignal,
 ): Promise<{
@@ -2447,6 +2528,8 @@ export async function createQwenStream(
   accountId: string;
   createdNewChat: boolean;
   tokenEstimationContext: TokenEstimationContext;
+  /** Phase 6: identity of the tracked browser operation (when the flag is on). */
+  operationId?: string;
 }> {
   if (signal?.aborted) {
     throw new Error("client aborted before stream creation");
@@ -2512,6 +2595,10 @@ async function createQwenStreamInternal(
     parallelEscape?: boolean;
     /** "thread" (chat_mode:"normal") or "temp" (chat_mode:"local"). */
     chatMode?: ChatMode;
+    /** Phase 6: attribute the stream's browser operation to a generation. */
+    operationId?: string;
+    generationId?: string;
+    attemptId?: string;
   } | undefined,
   signal: AbortSignal | undefined,
   releaseStreamLock: () => void,
@@ -2525,6 +2612,8 @@ async function createQwenStreamInternal(
   accountId: string;
   createdNewChat: boolean;
   tokenEstimationContext: TokenEstimationContext;
+  /** Phase 6: identity of the tracked browser operation (when the flag is on). */
+  operationId?: string;
 }> {
   const ensureNotAborted = () => {
     if (signal?.aborted) {
@@ -2821,6 +2910,13 @@ async function createQwenStreamInternal(
     ),
   );
 
+  // Phase 6: attribute the browser fetch to a stable operation identity with an
+  // absolute deadline (the generation budget), so the in-page fetch is tracked
+  // by the operation registry instead of outliving every Node timer.
+  const operationId =
+    options?.operationId ?? (browserOwnershipEnabled() ? newOperationId() : undefined);
+  const operationDeadlineMs = operationId ? Date.now() + dynamicTimeoutMs : undefined;
+
   const url = chatSessionId
     ? qwenUrl(`/api/v2/chat/completions?chat_id=${encodeURIComponent(chatSessionId)}`)
     : qwenUrl("/api/v2/chat/completions");
@@ -2852,6 +2948,16 @@ async function createQwenStreamInternal(
             : "/",
         ),
         browserStreamBudgetMs,
+        operationId
+          ? {
+              operationId,
+              ...(options?.generationId ? { generationId: options.generationId } : {}),
+              ...(options?.attemptId ? { attemptId: options.attemptId } : {}),
+              ...(operationDeadlineMs !== undefined
+                ? { operationDeadline: operationDeadlineMs }
+                : {}),
+            }
+          : undefined,
       );
     };
 
@@ -3122,6 +3228,7 @@ async function createQwenStreamInternal(
             accountId: accountId ?? "global",
             createdNewChat,
             tokenEstimationContext,
+            operationId,
           };
         }
       }
@@ -3182,6 +3289,7 @@ async function createQwenStreamInternal(
       accountId: accountId ?? "global",
       createdNewChat,
       tokenEstimationContext,
+      operationId,
     };
   } catch (error) {
     releaseStreamResources();

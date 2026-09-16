@@ -22,6 +22,11 @@ import {
 import { isAccountDisabledRecord, loadAccounts, type QwenAccount } from "./accounts.ts";
 import { getAccountsByPriority } from "./account-priority.ts";
 import { hasActiveAccountLease } from "./account-concurrency.ts";
+import type { AccountStatus } from "../domain/types.ts";
+import type { IAccountOwnership } from "../runtime/contracts.ts";
+import type { ReadinessController, TickReport } from "../runtime/readiness/readiness-controller.ts";
+import type { MaintenanceScheduler } from "../runtime/maintenance/maintenance-scheduler.ts";
+import type { EventRecorder } from "../runtime/observability/event-recorder.ts";
 
 const MIN_READY = 2;
 const MIN_WARMING = 1;
@@ -36,6 +41,78 @@ const MAX_CONCURRENT_WARMING = 1;
  * matching the sweep counter, so a batch is re-warmed over `buckets` sweeps.
  */
 const VALIDATION_BUCKETS = 3;
+
+/**
+ * Feature flag (spec §14): when "true" the guard stops acting as a competing
+ * account authority and becomes a maintenance CLIENT of the bounded
+ * ReadinessController / MaintenanceScheduler built in runtime/bootstrap.ts.
+ * Default "false" preserves the legacy behavior exactly.
+ */
+export const READINESS_CONTROLLER_FLAG = "QWEN_READINESS_CONTROLLER";
+
+export function isReadinessControllerEnabled(): boolean {
+  return process.env[READINESS_CONTROLLER_FLAG] === "true";
+}
+
+/** Dedupe key under which exactly one warmup job per account may be outstanding. */
+export const WARMUP_DEDUPE_PREFIX = "warmup:";
+
+export function warmupDedupeKey(accountId: string): string {
+  return `${WARMUP_DEDUPE_PREFIX}${accountId}`;
+}
+
+/** Ownership statuses that mean user traffic currently owns the browser context. */
+const GENERATING_STATUSES: ReadonlySet<AccountStatus> = new Set([
+  "GENERATING",
+  "RESERVED",
+]);
+
+/** Ownership statuses that mean an initializer is already running. */
+const INITIALIZING_STATUSES: ReadonlySet<AccountStatus> = new Set([
+  "WARMING",
+  "RECOVERING",
+]);
+
+/**
+ * The bounded controller + scheduler the guard delegates to when the flag is
+ * on. Registered by startRuntimeServices (runtime/bootstrap.ts); while null,
+ * the guard keeps its legacy standalone behavior.
+ */
+export interface ReadinessControllerClients {
+  readonly ownership: IAccountOwnership;
+  readonly scheduler: MaintenanceScheduler;
+  readonly controller: ReadinessController;
+  readonly events?: EventRecorder;
+}
+
+let controllerClients: ReadinessControllerClients | null = null;
+
+export function registerReadinessControllerClients(
+  clients: ReadinessControllerClients,
+): void {
+  controllerClients = clients;
+}
+
+/** Test hook: detach the controller so the guard falls back to legacy behavior. */
+export function resetReadinessControllerClientsForTests(): void {
+  controllerClients = null;
+}
+
+function ownershipAccountStatus(accountId: string): AccountStatus | undefined {
+  return controllerClients?.ownership.getAccountStatus(accountId);
+}
+
+/** True when the ownership authority says an initializer already owns the account. */
+function isInitializingElsewhere(accountId: string): boolean {
+  const status = ownershipAccountStatus(accountId);
+  return status !== undefined && INITIALIZING_STATUSES.has(status);
+}
+
+/** True when the ownership authority says user traffic owns the account. */
+function isGeneratingOrReserved(accountId: string): boolean {
+  const status = ownershipAccountStatus(accountId);
+  return status !== undefined && GENERATING_STATUSES.has(status);
+}
 
 /** Accounts currently being warmed by the guard (prevents double-init). */
 const warmingInProgress = new Set<string>();
@@ -75,6 +152,31 @@ let lastValidationSweepAt: number | null = null;
 
 /** Snapshot of the guard's counters for /health/recovery and tests. */
 export function getReadinessDiagnostics(): ReadinessDiagnostics {
+  if (isReadinessControllerEnabled() && controllerClients) {
+    // The controller is the authority; report its outstanding work rather than
+    // the guard's legacy local sets (which stay empty in client mode).
+    const warming = controllerClients.scheduler
+      .getInflight()
+      .filter((job) => job.kind === "WARM_ACCOUNT" && job.status !== "dead")
+      .length;
+    const snapshot = controllerClients.ownership.getPoolSnapshot();
+    return {
+      poolChecksRun,
+      coalescedTriggers,
+      accountsWarmed,
+      warmSkippedAlreadyWarming,
+      warmSkippedActiveLease,
+      warmupFailures,
+      validationSweepsRun,
+      accountsRevalidated,
+      accountsWarming: warming,
+      readyAccounts: snapshot.ready,
+      standbyAccounts: controllerClients.ownership.listAccountsByStatus("STANDBY")
+        .length,
+      lastPoolCheckAt,
+      lastValidationSweepAt,
+    };
+  }
   return {
     poolChecksRun,
     coalescedTriggers,
@@ -187,6 +289,102 @@ function getStandbyAccounts(): QwenAccount[] {
   );
 }
 
+/**
+ * The shared init sequence (browser + tools + chat pool + headers). Bounded by
+ * the caller: the legacy guard calls it inline, the controller-flagged path
+ * only ever reaches it as a MaintenanceScheduler WARM_ACCOUNT job.
+ */
+async function runWarmupSteps(account: QwenAccount): Promise<boolean> {
+  const deps = guardDeps;
+  if (!deps) return false;
+  warmingInProgress.add(account.id);
+  const startedAt = Date.now();
+  controllerClients?.events?.record("WARMUP_STARTED", { accountId: account.id });
+  try {
+    const creds = deps.getAccountCredentials(account.id);
+    if (!creds) return false;
+
+    const { isPlaywrightInitialized } = await import("../services/playwright.ts");
+    if (!isPlaywrightInitialized(account.id)) {
+      await deps.initPlaywrightForAccount(
+        creds,
+        config.playwright.headless,
+        config.playwright.browser,
+      );
+    }
+
+    await deps.disableNativeTools(account.id);
+
+    for (const modelId of config.qwen.chatPoolModels) {
+      await deps.warmQwenChatPool(account.id, modelId);
+    }
+
+    markAccountHeadersReady(account.id);
+    accountsWarmed++;
+    controllerClients?.events?.record(
+      "WARMUP_COMPLETED",
+      { accountId: account.id },
+      { durationMs: Date.now() - startedAt },
+    );
+    console.log(
+      `🪶 [ReadinessGuard] Account ready: ${maskEmail(account.email)} (${account.id})`,
+    );
+    return true;
+  } catch (error) {
+    warmupFailures++;
+    controllerClients?.events?.record(
+      "WARMUP_FAILED",
+      { accountId: account.id },
+      {
+        durationMs: Date.now() - startedAt,
+        errorName: error instanceof Error ? error.name : "Error",
+      },
+    );
+    console.warn(
+      `⚠️  [ReadinessGuard] Warmup failed for ${maskEmail(account.email)}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return false;
+  } finally {
+    warmingInProgress.delete(account.id);
+  }
+}
+
+/**
+ * Execute one WARM_ACCOUNT maintenance job (spec §14). The guard is a CLIENT
+ * here: it re-checks the ownership authority immediately before mutating, so an
+ * account that became GENERATING between submit and execute is skipped, and a
+ * second initializer never starts while the account is WARMING/RECOVERING.
+ */
+export async function performAccountWarmup(
+  accountId: string,
+): Promise<boolean> {
+  if (!guardDeps) return false;
+  if (isGeneratingOrReserved(accountId)) {
+    console.log(
+      `🪶 [ReadinessGuard] Skipping warmup job for ${accountId} — account is generating/reserved`,
+    );
+    warmSkippedActiveLease++;
+    return false;
+  }
+  if (isInitializingElsewhere(accountId)) {
+    console.log(
+      `🪶 [ReadinessGuard] Skipping warmup job for ${accountId} — already warming/recovering`,
+    );
+    warmSkippedAlreadyWarming++;
+    return false;
+  }
+  if (hasActiveAccountLease(accountId)) {
+    console.log(
+      `🪶 [ReadinessGuard] Skipping warmup job for ${accountId} — active lease`,
+    );
+    warmSkippedActiveLease++;
+    return false;
+  }
+  const account = loadAccounts().find((a) => a.id === accountId);
+  if (!account || !isEligible(account)) return false;
+  return runWarmupSteps(account);
+}
+
 async function warmAccount(account: QwenAccount): Promise<boolean> {
   if (!guardDeps) return false;
   // Already being warmed by another caller (pool check OR recovered-account
@@ -209,41 +407,7 @@ async function warmAccount(account: QwenAccount): Promise<boolean> {
     warmSkippedActiveLease++;
     return false;
   }
-  warmingInProgress.add(account.id);
-  try {
-    const creds = guardDeps.getAccountCredentials(account.id);
-    if (!creds) return false;
-
-    const { isPlaywrightInitialized } = await import("../services/playwright.ts");
-    if (!isPlaywrightInitialized(account.id)) {
-      await guardDeps.initPlaywrightForAccount(
-        creds,
-        config.playwright.headless,
-        config.playwright.browser,
-      );
-    }
-
-    await guardDeps.disableNativeTools(account.id);
-
-    for (const modelId of config.qwen.chatPoolModels) {
-      await guardDeps.warmQwenChatPool(account.id, modelId);
-    }
-
-    markAccountHeadersReady(account.id);
-    accountsWarmed++;
-    console.log(
-      `🪶 [ReadinessGuard] Account ready: ${maskEmail(account.email)} (${account.id})`,
-    );
-    return true;
-  } catch (error) {
-    warmupFailures++;
-    console.warn(
-      `⚠️  [ReadinessGuard] Warmup failed for ${maskEmail(account.email)}: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    return false;
-  } finally {
-    warmingInProgress.delete(account.id);
-  }
+  return runWarmupSteps(account);
 }
 
 /**
@@ -287,7 +451,15 @@ async function runPoolCheck(): Promise<void> {
  * and fork N Chromium processes at once. The first caller runs the check;
  * every concurrent trigger coalesces into a single trailing re-check.
  */
-export async function ensurePoolReadiness(): Promise<void> {
+export async function ensurePoolReadiness(): Promise<TickReport | void> {
+  if (isReadinessControllerEnabled() && controllerClients) {
+    // Client mode (spec §14): the bounded controller owns the deficit math and
+    // launches warmups through the scheduler's dedupe table. The guard no
+    // longer selects standby accounts itself, and needs no deps of its own.
+    poolChecksRun++;
+    lastPoolCheckAt = Date.now();
+    return controllerClients.controller.tick();
+  }
   if (!guardDeps) return;
   if (poolCheckInFlight) {
     coalescedTriggers++;
@@ -307,6 +479,10 @@ export async function ensurePoolReadiness(): Promise<void> {
 
 /** Fire-and-forget trigger, safe to call from hot paths. */
 export function triggerReadinessCheck(): void {
+  if (isReadinessControllerEnabled() && controllerClients) {
+    void controllerClients.controller.tick().catch(() => {});
+    return;
+  }
   void ensurePoolReadiness().catch(() => {});
 }
 
@@ -316,7 +492,8 @@ export function triggerReadinessCheck(): void {
  * before it receives traffic. Called by the periodic sweep.
  */
 async function validateRecoveredAccounts(): Promise<void> {
-  if (!guardDeps) return;
+  const clientMode = isReadinessControllerEnabled() && controllerClients !== null;
+  if (!clientMode && !guardDeps) return;
   validationSweepsRun++;
   lastValidationSweepAt = Date.now();
   // Spread validation across sweeps so a whole batch that cleared cooldown at
@@ -336,6 +513,26 @@ async function validateRecoveredAccounts(): Promise<void> {
     // Not this sweep's bucket — the account's re-validation is deferred so
     // batches thin out instead of stampeding.
     if (recoveredValidationBucket(account.id) !== sweepBucket) continue;
+    if (clientMode) {
+      // Client mode: submit a bounded job instead of warming inline. The
+      // scheduler dedupe (warmup:<id>) and the controller's in-flight tracking
+      // allow exactly one initializer per account; the executor re-checks the
+      // ownership authority before mutating.
+      if (isGeneratingOrReserved(account.id)) continue;
+      if (isInitializingElsewhere(account.id)) continue;
+      const submitted = controllerClients!.scheduler.submit({
+        kind: "WARM_ACCOUNT",
+        accountId: account.id,
+        dedupeKey: warmupDedupeKey(account.id),
+      });
+      if (submitted.accepted) {
+        console.log(
+          `🪶 [ReadinessGuard] Queued recovered account: ${maskEmail(account.email)} (${account.id})`,
+        );
+        accountsRevalidated++;
+      }
+      continue;
+    }
     // This account is eligible but not ready — it may have just returned from
     // cooldown. Warm it so it can receive traffic.
     console.log(
@@ -353,6 +550,17 @@ const SWEEP_INTERVAL_MS = 60_000;
 /** Start the periodic sweep. Called once at server startup. */
 export function startReadinessGuardSweep(): void {
   if (sweepTimer) return;
+  if (isReadinessControllerEnabled() && controllerClients) {
+    // Client mode: the bounded controller owns the pool-check interval; this
+    // sweep keeps only its recovered-account pass, which now queues bounded
+    // WARM_ACCOUNT jobs instead of warming inline.
+    controllerClients.controller.start();
+    sweepTimer = setInterval(() => {
+      void validateRecoveredAccounts().catch(() => {});
+    }, SWEEP_INTERVAL_MS);
+    sweepTimer.unref?.();
+    return;
+  }
   sweepTimer = setInterval(() => {
     void ensurePoolReadiness().catch(() => {});
     // Also validate accounts returning from cooldown.
@@ -364,6 +572,9 @@ export function startReadinessGuardSweep(): void {
 }
 
 export function stopReadinessGuardSweep(): void {
+  if (isReadinessControllerEnabled() && controllerClients) {
+    controllerClients.controller.stop();
+  }
   if (sweepTimer) {
     clearInterval(sweepTimer);
     sweepTimer = null;

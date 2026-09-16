@@ -119,14 +119,31 @@ import type { Message } from "../../utils/types.ts";
 import type { FunctionToolDefinition } from "../../tools/types.ts";
 import { buildRepeatedToolCallReminder } from "../../utils/tool-call-guard.ts";
 import {
-	classifyRetryAction,
-	isAntiBotError as isAntiBotPolicyError,
-	isAccountInitializationError,
-	isChatInProgressError,
-	isQuotaLikeError,
-	isTerminalLocalError,
-	shouldRetryInvalidInputOnSameAccount,
-} from "./retry-policy.ts";
+ 	classifyRetryAction,
+ 	isAntiBotError as isAntiBotPolicyError,
+ 	isAccountInitializationError,
+ 	isChatInProgressError,
+ 	isQuotaLikeError,
+ 	isTerminalLocalError,
+ 	shouldRetryInvalidInputOnSameAccount,
+ } from "./retry-policy.ts";
+import {
+	getAccountOwnership,
+	isLeaseAuthorityEnabled,
+	toLegacyAccountLease,
+} from "../../runtime/account/instance.ts";
+import { acquireGenerationAccount } from "../../runtime/gateway.ts";
+import {
+	getModelCapabilities,
+	getModelContextWindow,
+} from "../../core/model-registry.ts";
+import {
+	prepareContext,
+	type ModelCapabilitySource,
+} from "../../runtime/context/context-service.ts";
+import { TypedRuntimeError } from "../../domain/errors.ts";
+import type { AccountLease as DomainAccountLease } from "../../domain/types.ts";
+import type { Message as DomainMessage } from "../../domain/session.ts";
 
 /** How many alternate accounts a single request may try after a WAF challenge.
  * Scales with pool size (capped by maxAccountSwitches) so large pools can
@@ -616,6 +633,139 @@ export function buildCompressedFailoverPrompt(args: {
 	return prompt;
 }
 
+/**
+ * Model limits for the bounded compaction pipeline, resolved from the model
+ * registry (upstream-synced, with a conservative default for unknown models).
+ */
+function registryCapabilitySource(): ModelCapabilitySource {
+	return {
+		getContextWindowTokens(modelId: string): number {
+			return getModelContextWindow(modelId);
+		},
+		getMaxOutputTokens(modelId: string): number {
+			return getModelCapabilities(modelId).maxOutputTokens;
+		},
+	};
+}
+
+/** Map the request-layer message history onto the domain message shape. */
+function toDomainFailoverMessages(
+	messages: readonly Message[],
+): readonly DomainMessage[] {
+	return messages.map((message, index) => {
+		const role: DomainMessage["role"] =
+			message.role === "system" ||
+			message.role === "user" ||
+			message.role === "assistant" ||
+			message.role === "tool"
+				? message.role
+				: "user";
+		return {
+			messageId: `failover_msg_${index}`,
+			sessionId: "failover",
+			role,
+			content: message.content ?? "",
+			sequenceNumber: index,
+			parentMessageId: index > 0 ? `failover_msg_${index - 1}` : null,
+			branchId: "failover",
+			createdAt: 0,
+			toolCalls: message.tool_calls?.map((call) => ({
+				callId: call.id,
+				name: call.function.name,
+				arguments: call.function.arguments,
+				status: "completed",
+			})),
+			toolCallId: message.tool_call_id,
+		};
+	});
+}
+
+/**
+ * THE bounded failover prompt under the lease authority: the monotonic,
+ * group-atomic ContextService pipeline replaces the char-tiered assembler
+ * whose budget loop could recompute the same candidate forever. A budget
+ * failure fails CLOSED with a typed context code instead of looping or
+ * sending the oversized original — the known non-convergence bug.
+ */
+export function prepareCompressedFailoverPrompt(args: {
+	messages?: Message[];
+	systemPrompt?: string;
+	toolInstructions?: string;
+	tools?: FunctionToolDefinition[];
+	fallbackQuery?: string;
+	stickyKey?: string | null;
+	contextModelId?: string;
+	capabilities?: ModelCapabilitySource;
+}): string {
+	const source =
+		args.messages && args.messages.length > 0
+			? args.messages
+			: [{ role: "user", content: args.fallbackQuery ?? "" } as Message];
+	const systemPrompt = [args.systemPrompt ?? "", args.toolInstructions ?? ""]
+		.filter(Boolean)
+		.join("\n\n");
+
+	const result = prepareContext({
+		messages: toDomainFailoverMessages(source),
+		systemPrompt,
+		toolDefinitions: (args.tools ?? []).map((tool) => ({
+			name: tool.function.name,
+			description: tool.function.description,
+			parameters: tool.function.parameters ?? { type: "object" },
+			strict: tool.function.strict,
+		})),
+		modelId: args.contextModelId ?? "default",
+		capabilities: args.capabilities ?? registryCapabilitySource(),
+		legacyCharBudget: TIERED_DEFAULT_BUDGET,
+		rollingSummary: getRollingSummary().get(args.stickyKey ?? ""),
+	});
+
+	if (!result.ok) {
+		throw TypedRuntimeError.fromCode(result.errorCode, result.reason, {
+			compactionPasses: result.attempts.length,
+		});
+	}
+	return result.prepared.renderedPrompt;
+}
+
+/**
+ * Failover prompt for the active authority: bounded monotonic compaction when
+ * the lease authority is enabled, the legacy tiered assembler otherwise.
+ */
+function failoverPromptForAuthority(args: {
+	systemPrompt?: string;
+	toolInstructions?: string;
+	tools?: FunctionToolDefinition[];
+	messages?: Message[];
+	fallbackQuery?: string;
+	stickyKey?: string | null;
+	usePersonalization?: boolean;
+	reason: string;
+	contextModelId?: string;
+}): string {
+	if (!isLeaseAuthorityEnabled()) {
+		return buildCompressedFailoverPrompt({
+			systemPrompt: args.systemPrompt,
+			toolInstructions: args.toolInstructions,
+			tools: args.tools,
+			messages: args.messages,
+			fallbackQuery: args.fallbackQuery,
+			stickyKey: args.stickyKey,
+			usePersonalization: args.usePersonalization,
+			reason: args.reason,
+		});
+	}
+	return prepareCompressedFailoverPrompt({
+		messages: args.messages,
+		systemPrompt: args.systemPrompt,
+		toolInstructions: args.toolInstructions,
+		tools: args.tools,
+		fallbackQuery: args.fallbackQuery,
+		stickyKey: args.stickyKey,
+		contextModelId: args.contextModelId,
+	});
+}
+
 export async function acquireUpstreamStream(
 	params: AcquireParams,
 ): Promise<StreamCreationResult | StreamCreationFailure> {
@@ -683,32 +833,78 @@ export async function acquireUpstreamStream(
 		excludeSet.add(stickyThreadAccountId);
 	}
 
-	const resolved = resolveInitialAccount(resolvedPreferred, excludeSet);
+	// QWEN_RUNTIME_LEASE_AUTHORITY: the ownership authority performs the atomic
+	// select+claim for the initial account (runtime/gateway.ts). Legacy path
+	// keeps resolveInitialAccount; behavior is unchanged while the flag is off.
+	const useGateway = isLeaseAuthorityEnabled() && !isAuthMockEnabled();
+	let configuredAccounts: SelectedAccount[];
+	let account: SelectedAccount | null;
+	let ownershipLease: DomainAccountLease | null = null;
+	if (useGateway) {
+		configuredAccounts = loadAccounts();
+		const claimed = acquireGenerationAccount({
+			generationId: completionId,
+			preferredAccountId:
+				typeof resolvedPreferred === "string" ? resolvedPreferred : undefined,
+			triedAccountIds: excludeSet,
+			deadline: Date.now() + config.timeouts.totalRequestTimeout,
+			modelId: params.model,
+		});
+		if (!claimed.ok) {
+			return {
+				error: TypedRuntimeError.fromCode(
+					claimed.errorCode,
+					`Lease authority rejected the generation: ${claimed.failureCode}`,
+				),
+				completionId,
+				allOnCooldown: claimed.errorCode === "ACCOUNT_COOLDOWN",
+			};
+		}
+		const selected = configuredAccounts.find((a) => a.id === claimed.accountId);
+		if (!selected) {
+			getAccountOwnership().release({
+				leaseId: claimed.lease.leaseId,
+				ownerToken: claimed.lease.ownerToken,
+				outcome: "abandoned",
+				reason: "claimed-account-not-configured",
+			});
+			return {
+				error: new Error(
+					`Lease authority claimed an unconfigured account: ${claimed.accountId}`,
+				),
+				completionId,
+				allOnCooldown: false,
+			};
+		}
+		account = selected;
+		ownershipLease = claimed.lease;
+	} else {
+		const resolved = resolveInitialAccount(resolvedPreferred, excludeSet);
+		account = resolved.account;
+		configuredAccounts = resolved.configuredAccounts;
+	}
 
 	if (logger.isLevelEnabled("info")) {
 		// Why THIS account? The operator needs the decision, not just the
 		// result — the previous rounds' "stale label" / "switching" confusion
 		// came from logs that showed only the outcome.
-		const poolSize = resolved.configuredAccounts.length;
-		const cooldownCount = resolved.configuredAccounts.filter((a) =>
+		const poolSize = configuredAccounts.length;
+		const cooldownCount = configuredAccounts.filter((a) =>
 			getAccountCooldownInfo(a.id),
 		).length;
 		const why =
-			resolved.account.id === stickyThreadAccountId
+			account.id === stickyThreadAccountId
 				? "sticky"
 				: typeof resolvedPreferred === "string" &&
-					resolved.account.id === resolvedPreferred
+					account.id === resolvedPreferred
 					? "preferred"
 					: resolvedPreferred === null
 						? "failover-rotate"
 						: "round-robin";
 		console.log(
-			`🎯 [Chat] Account selected | ${maskEmail(resolved.account.email)} (${resolved.account.id}) | reason=${why} | pool=${poolSize}${cooldownCount ? ` | cooldown=${cooldownCount}` : ""}${stickyThreadAccountId ? ` | sticky=${stickyThreadAccountId === resolved.account.id}` : ""}`,
+			`🎯 [Chat] Account selected | ${maskEmail(account.email)} (${account.id}) | reason=${why} | pool=${poolSize}${cooldownCount ? ` | cooldown=${cooldownCount}` : ""}${stickyThreadAccountId ? ` | sticky=${stickyThreadAccountId === account.id}` : ""}${useGateway ? " | authority=lease" : ""}`,
 		);
 	}
-
-	let account: SelectedAccount | null = resolved.account;
-	const configuredAccounts = resolved.configuredAccounts;
 	const triedAccountIds = new Set<string>();
 	let lastError: any = null;
 	let antiBotRotations = 0;
@@ -730,6 +926,7 @@ export async function acquireUpstreamStream(
 		// covered by the same-chat settle retries). Mirrors the saturated-account
 		// exception below.
 		if (
+			ownershipLease === null &&
 			isAccountTemporarilyBusy(accountId) &&
 			params.allowTemporarilyBusyAccountId !== accountId &&
 			accountId !== stickyThreadAccountId &&
@@ -752,6 +949,7 @@ export async function acquireUpstreamStream(
 		// tool/think pause splinters the conversation across upstream chats, so
 		// it must queue on its own slot instead of being skipped.
 		if (
+			ownershipLease === null &&
 			isAccountBusy(accountId) &&
 			accountId !== stickyThreadAccountId &&
 			hasFreeAlternateAccount(configuredAccounts, accountId, triedAccountIds)
@@ -769,7 +967,7 @@ export async function acquireUpstreamStream(
 		}
 
 		const cooldownInfo = getAccountCooldownInfo(accountId);
-		if (cooldownInfo) {
+		if (cooldownInfo && ownershipLease === null) {
 			console.log(
 				`⏭️  [Chat] Skipping account ${accountEmail} (${accountId}) on cooldown for ${Math.round(cooldownInfo.remainingMs / 1000)}s (${cooldownInfo.reason})`,
 			);
@@ -820,7 +1018,7 @@ export async function acquireUpstreamStream(
 			// Failover onto a new upstream chat: tiered compressed context
 			// (T1+T2+T3, 200k budget) — never the raw 2M-char full replay.
 		const attemptFinalPrompt = mustReplayFullContext
-			? buildCompressedFailoverPrompt({
+			? failoverPromptForAuthority({
 					systemPrompt: params.systemPrompt,
 					toolInstructions: params.toolInstructions,
 					tools: params.tools,
@@ -829,6 +1027,7 @@ export async function acquireUpstreamStream(
 					stickyKey: params.stickyKey,
 					usePersonalization: params.requestPersonalizationInstruction != null,
 					reason: recreatingOnNewAccount ? "sticky-failover" : "missing-parent",
+					contextModelId: params.contextModelId,
 				})
 			: finalPrompt;
 			// The thread owner (or a deployment where no alternate account is
@@ -842,6 +1041,26 @@ export async function acquireUpstreamStream(
 					accountId,
 					triedAccountIds,
 				);
+			// Claim the rotated account through the ownership authority. The
+			// initial claim happened above; this covers accounts reached by the
+			// rotation logic below. A failure is typed and terminal, so the loop
+			// stops instead of re-burning accounts.
+			if (useGateway && !ownershipLease) {
+				const claimed = acquireGenerationAccount({
+					generationId: completionId,
+					candidates: [accountId],
+					deadline: Date.now() + config.timeouts.totalRequestTimeout,
+					modelId: params.model,
+				});
+				if (!claimed.ok) {
+					lastError = TypedRuntimeError.fromCode(
+						claimed.errorCode,
+						`Lease authority rejected account ${accountId}: ${claimed.failureCode}`,
+					);
+					break;
+				}
+				ownershipLease = claimed.lease;
+			}
 			const result = await tryCreateStreamWithRetry(
 				{
 					finalPrompt: attemptFinalPrompt,
@@ -882,10 +1101,14 @@ export async function acquireUpstreamStream(
 				completionId,
 					parallelEscape: params.parallelEscape,
 					chatMode,
+					ownershipLease: ownershipLease ?? undefined,
 				},
 				accountId,
 				accountEmail,
 			);
+			// The inner attempt now owns the lease lifecycle (it releases on
+			// failure, or hands release() to the caller on success).
+			ownershipLease = null;
 
 			if (result.success) {
 				registerStream(completionId, {
@@ -928,6 +1151,9 @@ export async function acquireUpstreamStream(
 			}
 		} catch (err: any) {
 			lastError = err;
+			// The inner attempt released the lease in its own catch before
+			// rejecting; drop the reference so a later break cannot touch it.
+			ownershipLease = null;
 			for (const tried of getTriedAccountIds(lastError)) {
 				triedAccountIds.add(tried);
 			}
@@ -1235,6 +1461,11 @@ async function tryCreateStreamWithRetry(
 		chatMode: ChatMode;
 		/** Authoritative per-request retry state shared across all retry layers. */
 		retryContext?: RequestRetryContext;
+		/**
+		 * Lease pre-claimed by the ownership authority (runtime/gateway.ts).
+		 * When set, the loop reuses it instead of claiming a slot.
+		 */
+		ownershipLease?: DomainAccountLease;
 	},
 	accountId: string,
 	accountEmail: string,
@@ -1405,7 +1636,11 @@ async function tryCreateStreamWithRetry(
 					])
 				: AbortSignal.any([leaseAbort.signal, acquireAbort.signal]);
 
-			if (params.parallelEscape) {
+			if (params.ownershipLease) {
+				// The ownership authority already claimed this account
+				// atomically; reuse that lease instead of claiming a slot.
+				accountLease = toLegacyAccountLease(params.ownershipLease);
+			} else if (params.parallelEscape) {
 				// Parallel request racing an unemitted stream: do NOT queue on this
 				// account's slot (the main may hold it for minutes while thinking).
 				// Fail fast with account_busy so the attempt loop hops to a free
@@ -2061,7 +2296,7 @@ async function tryCreateStreamWithRetry(
 				);
 				if (params.useThreadNative) {
 					params.existingThread = null;
-					params.finalPrompt = buildCompressedFailoverPrompt({
+					params.finalPrompt = failoverPromptForAuthority({
 						systemPrompt: params.systemPrompt,
 						toolInstructions: params.toolInstructions,
 						tools: params.tools,
@@ -2070,6 +2305,7 @@ async function tryCreateStreamWithRetry(
 						stickyKey: params.stickyKey,
 						usePersonalization: params.requestPersonalizationInstruction != null,
 						reason: "in-progress-escalation",
+						contextModelId: params.contextModelId,
 					});
 					params.messageCount =
 						params.fullMessageCount ?? params.messageCount;
@@ -2179,7 +2415,7 @@ async function tryCreateStreamWithRetry(
 			// chatSessionId writes make subsequent turns rotate/lose context.
 			if (params.useThreadNative) {
 				params.existingThread = null;
-				params.finalPrompt = buildCompressedFailoverPrompt({
+				params.finalPrompt = failoverPromptForAuthority({
 					systemPrompt: params.systemPrompt,
 					toolInstructions: params.toolInstructions,
 					tools: params.tools,
@@ -2188,6 +2424,7 @@ async function tryCreateStreamWithRetry(
 					stickyKey: params.stickyKey,
 					usePersonalization: params.requestPersonalizationInstruction != null,
 					reason: "inner-account-switch",
+					contextModelId: params.contextModelId,
 				});
 				params.messageCount = params.fullMessageCount ?? params.messageCount;
 				params.forceNewChat = true;
@@ -2217,7 +2454,7 @@ async function tryCreateStreamWithRetry(
 			`🔄 [Chat] Forcing new chat/compressed context | reason=${policy.reason}`,
 		);
 		params.existingThread = null;
-		params.finalPrompt = buildCompressedFailoverPrompt({
+		params.finalPrompt = failoverPromptForAuthority({
 			systemPrompt: params.systemPrompt,
 			toolInstructions: params.toolInstructions,
 			tools: params.tools,
@@ -2226,6 +2463,7 @@ async function tryCreateStreamWithRetry(
 			stickyKey: params.stickyKey,
 			usePersonalization: params.requestPersonalizationInstruction != null,
 			reason: `force-new-chat:${policy.reason}`,
+			contextModelId: params.contextModelId,
 		});
 		params.messageCount = params.fullMessageCount ?? params.messageCount;
 		params.forceNewChat = true;

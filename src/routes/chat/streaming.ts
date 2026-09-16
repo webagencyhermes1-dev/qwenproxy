@@ -75,6 +75,56 @@ import {
   applyUpstreamUsage,
   buildUsage,
 } from "./helpers.ts";
+import {
+  getSharedSessionService,
+  isSessionVersioningEnabled,
+  type SessionStreamCommit,
+} from "../../runtime/session/session-service.ts";
+import type { ToolCall } from "../../domain/tools.ts";
+
+function readSessionCommit(
+  params: StreamProcessingParams,
+): SessionStreamCommit | null {
+  return params.sessionCommit && isSessionVersioningEnabled()
+    ? params.sessionCommit
+    : null;
+}
+
+async function failVersionedGeneration(
+  commit: SessionStreamCommit,
+): Promise<void> {
+  try {
+    await getSharedSessionService().failGeneration({
+      sessionId: commit.sessionId,
+      generationId: commit.generationId,
+    });
+  } catch {
+    // Best-effort: teardown and error paths must not throw.
+  }
+}
+
+function toCommittedToolCalls(calls: readonly unknown[]): ToolCall[] {
+  const committed: ToolCall[] = [];
+  for (const call of calls) {
+    if (typeof call !== "object" || call === null) continue;
+    const record = call as Record<string, unknown>;
+    const fn = record["function"];
+    if (typeof fn !== "object" || fn === null) continue;
+    const fnRecord = fn as Record<string, unknown>;
+    const id = record["id"];
+    const name = fnRecord["name"];
+    const args = fnRecord["arguments"];
+    if (typeof id !== "string" || typeof name !== "string") continue;
+    if (typeof args !== "string") continue;
+    committed.push({
+      callId: id,
+      name,
+      arguments: args,
+      status: "completed",
+    });
+  }
+  return committed;
+}
 
 function firstString(...values: unknown[]): string | null {
   for (const value of values) {
@@ -186,6 +236,7 @@ export interface StreamProcessingParams {
   activeAccountId: string;
   activeAccountLabel?: string;
   logicalSessionId: string | null;
+  sessionCommit?: SessionStreamCommit | null;
   body: OpenAIRequest & { stream_options?: { include_usage?: boolean } };
   finalPrompt: string;
   userPrompt: string;
@@ -686,6 +737,10 @@ export async function processNonStreamingResponse(
               completionId,
             },
           );
+          const abortedCommit = readSessionCommit(params);
+          if (abortedCommit) {
+            await failVersionedGeneration(abortedCommit);
+          }
           return sendOpenAIError(c, newStreamResult.error);
         }
         // Retry failed, return original error
@@ -693,6 +748,10 @@ export async function processNonStreamingResponse(
           error: newStreamResult.error?.message,
           completionId,
         });
+        const failedCommit = readSessionCommit(params);
+        if (failedCommit) {
+          await failVersionedGeneration(failedCommit);
+        }
         return sendOpenAIError(c, newStreamResult.error);
       }
 
@@ -702,6 +761,10 @@ export async function processNonStreamingResponse(
       // lease is not orphaned.
       if (c.req.raw.signal.aborted) {
         newStreamResult.releaseAccountLease();
+        const retryAbortCommit = readSessionCommit(params);
+        if (retryAbortCommit) {
+          await failVersionedGeneration(retryAbortCommit);
+        }
         return sendOpenAIError(
           c,
           new Error("client aborted during malformed-tool retry"),
@@ -814,6 +877,33 @@ export async function processNonStreamingResponse(
       finishReason,
     });
 
+    const nonStreamCommit = readSessionCommit(params);
+    if (nonStreamCommit) {
+      const commit = await getSharedSessionService().commitGeneration({
+        sessionId: nonStreamCommit.sessionId,
+        generationId: nonStreamCommit.generationId,
+        fromVersion: nonStreamCommit.versionAtStart,
+        userMessage: { content: userPrompt },
+        assistantMessage: {
+          content: finalContent,
+          ...(toolCallsOut.length > 0
+            ? { toolCalls: toCommittedToolCalls(toolCallsOut) }
+            : {}),
+        },
+      });
+      if (!commit.committed) {
+        return c.json(
+          {
+            error: {
+              code: "SESSION_CONFLICT",
+              message: `Session version advanced during generation: expected ${nonStreamCommit.versionAtStart}, now ${commit.currentVersion}`,
+            },
+          },
+          409,
+        );
+      }
+    }
+
     return c.json({
       id: completionId,
       object: "chat.completion",
@@ -829,6 +919,12 @@ export async function processNonStreamingResponse(
       ],
       usage,
     });
+  } catch (nonStreamError) {
+    const nonStreamFail = readSessionCommit(params);
+    if (nonStreamFail) {
+      await failVersionedGeneration(nonStreamFail);
+    }
+    throw nonStreamError;
   } finally {
     if (isToolcallDebugEnabled()) {
       logger.debug("[chat] non-stream: cleanup", { completionId });
@@ -935,6 +1031,11 @@ export async function processStreamingResponse(
     const runDisconnectTeardown = () => {
       if (teardownDone) return;
       teardownDone = true;
+
+      const disconnectCommit = readSessionCommit(params);
+      if (disconnectCommit) {
+        void failVersionedGeneration(disconnectCommit);
+      }
 
       if (logger.isLevelEnabled("info")) {
         console.log(
@@ -1983,6 +2084,10 @@ export async function processStreamingResponse(
         });
         flushWrites();
         await streamWriter.write("data: [DONE]\n\n");
+        const errorPayloadCommit = readSessionCommit(params);
+        if (errorPayloadCommit) {
+          await failVersionedGeneration(errorPayloadCommit);
+        }
         return;
       }
 
@@ -2582,6 +2687,40 @@ export async function processStreamingResponse(
         flushBuffer = null;
         streamCompletedOk = true;
 
+        // Single terminal section: the one [DONE] above is the exactly-once
+        // guard, so this commit runs once per generation (the service-level
+        // committed set makes a repeated call a no-op success).
+        const streamCommit = readSessionCommit(params);
+        if (streamCommit) {
+          try {
+            const commit = await getSharedSessionService().commitGeneration({
+              sessionId: streamCommit.sessionId,
+              generationId: streamCommit.generationId,
+              fromVersion: streamCommit.versionAtStart,
+              userMessage: { content: userPrompt },
+              assistantMessage: { content: finalContent },
+            });
+            if (!commit.committed) {
+              logger.warn(
+                "[chat] stream: session version conflict on commit; response already sent",
+                {
+                  completionId,
+                  expectedVersion: streamCommit.versionAtStart,
+                  currentVersion: commit.currentVersion,
+                },
+              );
+            }
+          } catch (commitError) {
+            logger.warn("[chat] stream: session commit failed", {
+              completionId,
+              error:
+                commitError instanceof Error
+                  ? commitError.message
+                  : String(commitError),
+            });
+          }
+        }
+
         scheduleAssistantComplete(onAssistantComplete, {
           sessionId: logicalSessionId,
           accountId: activeAccountId,
@@ -2633,6 +2772,12 @@ export async function processStreamingResponse(
         }
       }
     } catch (err: any) {
+      if (!streamCompletedOk) {
+        const streamFail = readSessionCommit(params);
+        if (streamFail) {
+          await failVersionedGeneration(streamFail);
+        }
+      }
       const streamStillRegistered = Boolean(getStream(completionId));
             if (
               shouldSuppressStreamAbort(
@@ -2732,6 +2877,10 @@ export async function processStreamingResponse(
       }
     }
   }, async (err: Error, errorStream: any) => {
+    const streamErrorCommit = readSessionCommit(params);
+    if (streamErrorCommit) {
+      await failVersionedGeneration(streamErrorCommit);
+    }
     const retryable = err instanceof RetryableQwenStreamError;
     const errorCode =
       getQwenErrorCode(err) ||

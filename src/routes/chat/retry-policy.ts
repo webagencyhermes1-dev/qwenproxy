@@ -22,6 +22,7 @@ import {
   ValidationError,
 } from "../../core/errors.ts";
 import { isAbortError } from "./helpers.ts";
+import { isLeaseAuthorityEnabled } from "../../runtime/account/instance.ts";
 
 export type RetryAction = {
   /** Outer/create-stream layer should retry this failure */
@@ -75,9 +76,29 @@ function statusOf(err: unknown): number | undefined {
   return undefined;
 }
 
+/**
+ * Typed runtime codes that must never ride the network retry loop while the
+ * lease authority is enabled. A budget/conflict/cancellation outcome cannot be
+ * changed by a replay, so looping only burns attempts. Flag-gated: the legacy
+ * classifications below are unchanged while the flag is off.
+ */
+const LEASE_AUTHORITY_TERMINAL_CODES: ReadonlySet<string> = new Set<string>([
+  "context_too_large",
+  "context_reconstruction_failed",
+  "context_compaction_non_convergent",
+  "session_busy",
+  "session_conflict",
+  "generation_cancelled",
+]);
+
 /** Errors that belong to the proxy/client request itself — retrying is useless. */
 export function isTerminalLocalError(err: unknown): boolean {
   if (!err) return false;
+
+  if (isLeaseAuthorityEnabled()) {
+    const code = errCode(err).toLowerCase();
+    if (LEASE_AUTHORITY_TERMINAL_CODES.has(code)) return true;
+  }
 
   if (
     err instanceof ValidationError ||

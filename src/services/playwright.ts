@@ -83,6 +83,10 @@ import { recordAccountFailure } from "../core/account-health.ts";
 import { markAccountAuthError } from "../core/account-state.ts";
 import { updateQwenWebVersion, getQwenWebVersion } from "./qwen-headers.ts";
 import { getAccountProfilePath, getProfilesDir } from "../core/paths.ts";
+import {
+  operationRegistry,
+  browserOwnershipEnabled,
+} from "../runtime/browser/operation-registry.ts";
 
 type ContextInitHook = (context: BrowserContext) => Promise<void> | void;
 const contextInitHooks: ContextInitHook[] = [];
@@ -210,17 +214,61 @@ let pwOpActive = 0;
 const pwOpWaiters: Array<() => void> = [];
 let pwOpHighWater = 0;
 
-export async function withPlaywrightOpSlot<T>(fn: () => Promise<T>): Promise<T> {
-  while (pwOpActive >= PW_OP_SEMAPHORE_MAX) {
-    await new Promise<void>((resolve) => pwOpWaiters.push(resolve));
-  }
-  pwOpActive++;
-  pwOpHighWater = Math.max(pwOpHighWater, pwOpActive);
+/**
+ * Optional operation identity for the browser-ownership model (Phase 6). When
+ * passed AND the QWEN_BROWSER_OWNERSHIP flag is on, the slot registers a live
+ * operation (deadline + AbortController) so header captures and page ops are
+ * attributable and terminal-cancellable. Omitted => unchanged behavior.
+ */
+export interface PlaywrightOpIdentity {
+  accountId?: string;
+  generationId?: string;
+  attemptId?: string;
+  /** Absolute epoch-ms deadline; defaults to now + config.timeouts.page. */
+  deadline?: number;
+  kind: string;
+  operationId?: string;
+}
+
+export async function withPlaywrightOpSlot<T>(
+  fn: () => Promise<T>,
+  identity?: PlaywrightOpIdentity,
+): Promise<T> {
+  const op =
+    browserOwnershipEnabled() && identity
+      ? operationRegistry.register({
+          accountId: identity.accountId ?? "global",
+          deadline: identity.deadline ?? Date.now() + config.timeouts.page,
+          kind: identity.kind,
+          ...(identity.generationId ? { generationId: identity.generationId } : {}),
+          ...(identity.attemptId ? { attemptId: identity.attemptId } : {}),
+          ...(identity.operationId ? { operationId: identity.operationId } : {}),
+        })
+      : undefined;
+
   try {
-    return await fn();
+    while (pwOpActive >= PW_OP_SEMAPHORE_MAX) {
+      if (op?.controller.signal.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
+      await new Promise<void>((resolve) => pwOpWaiters.push(resolve));
+    }
+    pwOpActive++;
+    pwOpHighWater = Math.max(pwOpHighWater, pwOpActive);
+    try {
+      if (op?.controller.signal.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
+      return await fn();
+    } finally {
+      pwOpActive--;
+      pwOpWaiters.shift()?.();
+    }
   } finally {
-    pwOpActive--;
-    pwOpWaiters.shift()?.();
+    if (op) {
+      op.resolveCompletion();
+      operationRegistry.remove(op.operationId);
+    }
   }
 }
 
@@ -2360,8 +2408,9 @@ export async function captureQwenHeaders(
   timeoutMs = config.timeouts.headers,
   triggerGraceMs = HEADER_CAPTURE_TRIGGER_GRACE_MS,
 ): Promise<void> {
-  return withPlaywrightOpSlot(() =>
-    captureQwenHeadersInner(accountId, pageOverride, timeoutMs, triggerGraceMs),
+  return withPlaywrightOpSlot(
+    () => captureQwenHeadersInner(accountId, pageOverride, timeoutMs, triggerGraceMs),
+    { accountId, deadline: Date.now() + timeoutMs, kind: "header-capture" },
   );
 }
 

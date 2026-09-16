@@ -10,6 +10,11 @@
 import { config } from "./config.ts";
 import { logger } from "./logger.ts";
 import { getStream } from "./stream-registry.ts";
+import {
+  getAccountOwnership,
+  isLeaseAuthorityEnabled,
+  toLegacyAccountLease,
+} from "../runtime/account/instance.ts";
 
 export interface AccountLease {
   accountId: string;
@@ -248,6 +253,9 @@ export function tryAcquireAccountLease(
   leaseAbortController?: AbortController,
   parallelEscape?: boolean,
 ): AccountLease | null {
+  if (isLeaseAuthorityEnabled()) {
+    return tryAcquireFromOwnershipAuthority(accountId, label);
+  }
   const slot = getSlot(accountId);
   sweepStaleLeases(accountId);
   if (slot.activeLeases.length < config.concurrency.maxStreamsPerAccount) {
@@ -269,6 +277,9 @@ export function acquireAccountLease(
   accountId: string,
   options?: AcquireAccountLeaseOptions,
 ): Promise<AccountLease> {
+  if (isLeaseAuthorityEnabled()) {
+    return acquireFromOwnershipAuthority(accountId, options);
+  }
   const signal = options?.signal ?? null;
   const label = options?.label ?? "unlabeled";
 
@@ -385,6 +396,56 @@ export function acquireAccountLease(
       timeoutMs,
     });
   });
+}
+
+/**
+ * Thin pass-through to the ownership authority used while
+ * QWEN_RUNTIME_LEASE_AUTHORITY is enabled. Returns the legacy AccountLease
+ * shape with release() bound to the fenced manager release, so no caller
+ * changes. The old slot machinery stays in place for the flag-off path.
+ */
+function tryAcquireFromOwnershipAuthority(
+  accountId: string,
+  label?: string,
+): AccountLease | null {
+  const generationId = label ?? accountId;
+  const result = getAccountOwnership().acquire({
+    generationId,
+    candidates: [accountId],
+    deadline: Date.now() + config.concurrency.leaseMaxDurationMs,
+    requirements: { purpose: "generation", generationId },
+  });
+  return result.ok ? toLegacyAccountLease(result.lease) : null;
+}
+
+function acquireFromOwnershipAuthority(
+  accountId: string,
+  options?: AcquireAccountLeaseOptions,
+): Promise<AccountLease> {
+  if (options?.signal?.aborted) {
+    return Promise.reject(
+      new Error("Aborted before acquiring account lease"),
+    );
+  }
+  try {
+    const generationId = options?.label ?? accountId;
+    const result = getAccountOwnership().acquire({
+      generationId,
+      candidates: [accountId],
+      deadline: Date.now() + config.concurrency.leaseMaxDurationMs,
+      requirements: { purpose: "generation", generationId },
+    });
+    if (!result.ok) {
+      const err = new Error(
+        `Account ${accountId} unavailable under lease authority: ${result.failureCode}`,
+      ) as Error & { code?: string };
+      err.code = "account_busy";
+      return Promise.reject(err);
+    }
+    return Promise.resolve(toLegacyAccountLease(result.lease));
+  } catch (err) {
+    return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+  }
 }
 
 /**

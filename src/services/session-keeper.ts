@@ -1,5 +1,8 @@
 import { config } from "../core/config.ts";
 import { hasActiveAccountLease } from "../core/account-concurrency.ts";
+import { isReadinessControllerEnabled } from "../core/readiness-guard.ts";
+import type { IAccountOwnership } from "../runtime/contracts.ts";
+import type { MaintenanceScheduler } from "../runtime/maintenance/maintenance-scheduler.ts";
 
 import {
   closeIdlePlaywrightAccounts,
@@ -10,6 +13,42 @@ import {
 } from "./playwright.ts";
 import { humanDelay, sleep } from "./human-behavior.ts";
 
+/** Dedupe key under which exactly one keep-alive job per account is outstanding. */
+export const KEEP_ALIVE_DEDUPE_PREFIX = "keepalive:";
+
+export function keepAliveDedupeKey(accountId: string): string {
+  return `${KEEP_ALIVE_DEDUPE_PREFIX}${accountId}`;
+}
+
+/** Ownership statuses that mean user traffic currently owns the browser context. */
+const GENERATING_STATUSES: ReadonlySet<string> = new Set([
+  "GENERATING",
+  "RESERVED",
+]);
+
+/**
+ * The bounded scheduler the keeper submits to when the readiness controller
+ * flag is on (spec §14). Registered by startRuntimeServices; while null the
+ * keeper keeps its legacy per-account interval loop.
+ */
+export interface SessionKeeperClients {
+  readonly ownership: IAccountOwnership;
+  readonly scheduler: MaintenanceScheduler;
+}
+
+let keeperClients: SessionKeeperClients | null = null;
+
+export function registerSessionKeeperClients(
+  clients: SessionKeeperClients,
+): void {
+  keeperClients = clients;
+}
+
+/** Test hook: detach the scheduler so the keeper falls back to legacy behavior. */
+export function resetSessionKeeperClientsForTests(): void {
+  keeperClients = null;
+}
+
 let running = false;
 let intervalId: ReturnType<typeof setInterval> | null = null;
 let cycleInProgress = false;
@@ -18,41 +57,83 @@ export function isSessionKeeperRunning(): boolean {
   return running;
 }
 
+/**
+ * Execute one keep-alive maintenance job. Bounded by the MaintenanceScheduler
+ * worker pool and dedupe table; never called directly when the controller flag
+ * is on.
+ */
+export async function performKeepAlive(accountId: string): Promise<void> {
+  await keepAlivePlaywrightAccount(accountId).catch((error) => {
+    // Shutdown/eviction closes contexts while a cycle is in flight; the
+    // resulting "already closed" rejection is benign. The old substring
+    // filter ("Target closed"/"Page is closed") missed Playwright's real
+    // message ("Target page, context or browser has been closed") and
+    // leaked a warning on every Ctrl+C.
+    if (isPlaywrightAlreadyClosedError(error)) return;
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(
+      `[SessionKeeper] Keep-alive failed for ${accountId}: ${message}`,
+    );
+  });
+  // TOCTOU check: a lease may have been acquired during the keep-alive.
+  // Log a warning so operators can detect races (the keep-alive itself is
+  // lightweight and unlikely to interfere, but the signal is useful).
+  if (hasActiveAccountLease(accountId)) {
+    console.warn(
+      `[SessionKeeper] Lease acquired during keep-alive | account=${accountId} | possible race`,
+    );
+  }
+}
+
+/**
+ * Client mode: submit one bounded keep-alive job per active account instead of
+ * running the keep-alive inline. Accounts carrying user traffic are skipped
+ * (the scheduler also defers low-priority work while a generation is active).
+ */
+function submitKeepAliveJobs(): void {
+  const clients = keeperClients;
+  if (!clients) return;
+  for (const accountId of getActivePlaywrightAccountIds()) {
+    const status = clients.ownership.getAccountStatus(accountId);
+    if (GENERATING_STATUSES.has(status)) {
+      console.log(
+        `[SessionKeeper] skipped active account | account=${accountId} | reason=generating`,
+      );
+      continue;
+    }
+    if (hasActiveAccountLease(accountId)) {
+      console.log(
+        `[SessionKeeper] skipped active account | account=${accountId} | reason=active_lease`,
+      );
+      continue;
+    }
+    clients.scheduler.submit({
+      kind: "CLEAN_SESSION",
+      accountId,
+      dedupeKey: keepAliveDedupeKey(accountId),
+    });
+  }
+}
+
 async function runKeepAliveCycle(): Promise<void> {
   if (cycleInProgress) return;
   cycleInProgress = true;
   try {
     if (config.sessionKeeper.enabled) {
-      const accountIds = getActivePlaywrightAccountIds();
-      for (const accountId of accountIds) {
-        if (hasActiveAccountLease(accountId)) {
-          console.log(
-            `[SessionKeeper] skipped active account | account=${accountId} | reason=active_lease`,
-          );
-          continue;
+      if (isReadinessControllerEnabled() && keeperClients) {
+        submitKeepAliveJobs();
+      } else {
+        const accountIds = getActivePlaywrightAccountIds();
+        for (const accountId of accountIds) {
+          if (hasActiveAccountLease(accountId)) {
+            console.log(
+              `[SessionKeeper] skipped active account | account=${accountId} | reason=active_lease`,
+            );
+            continue;
+          }
+          await performKeepAlive(accountId);
+          await sleep(humanDelay(250, 900));
         }
-        await keepAlivePlaywrightAccount(accountId).catch((error) => {
-          // Shutdown/eviction closes contexts while a cycle is in flight; the
-          // resulting "already closed" rejection is benign. The old substring
-          // filter ("Target closed"/"Page is closed") missed Playwright's real
-          // message ("Target page, context or browser has been closed") and
-          // leaked a warning on every Ctrl+C.
-          if (isPlaywrightAlreadyClosedError(error)) return;
-          const message =
-            error instanceof Error ? error.message : String(error);
-          console.warn(
-            `[SessionKeeper] Keep-alive failed for ${accountId}: ${message}`,
-          );
-        });
-        // TOCTOU check: a lease may have been acquired during the keep-alive.
-        // Log a warning so operators can detect races (the keep-alive itself is
-        // lightweight and unlikely to interfere, but the signal is useful).
-        if (hasActiveAccountLease(accountId)) {
-          console.warn(
-            `[SessionKeeper] Lease acquired during keep-alive | account=${accountId} | possible race`,
-          );
-        }
-        await sleep(humanDelay(250, 900));
       }
     }
 

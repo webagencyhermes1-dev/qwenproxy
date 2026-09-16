@@ -10,6 +10,16 @@ import type { Context } from "hono";
 import { parseRequestBody } from "./validation.ts";
 import { buildFinalContext } from "./context.ts";
 import {
+  DEFAULT_TENANT_ID,
+  IDEMPOTENCY_KEY_HEADER,
+  SESSION_GENERATION_DEADLINE_MS,
+  SESSION_VERSIONING_ENDPOINT_CHAT,
+  getSharedSessionService,
+  isSessionVersioningEnabled,
+  scopedIdempotencyKey,
+  type SessionStreamCommit,
+} from "../../runtime/session/session-service.ts";
+import {
   acquireUpstreamStream,
   acquireChatLock,
   buildCompressedFailoverPrompt,
@@ -79,6 +89,7 @@ export async function chatCompletions(c: Context) {
   // in the outer catch when the stream result is out of scope.
   let lastActiveAccountId: string | null = null;
   const currentStreamAccountIdForHealth = (): string | null => lastActiveAccountId;
+  let versionedCommit: SessionStreamCommit | null = null;
 
   try {
     let stepStartedAt = Date.now();
@@ -143,6 +154,63 @@ export async function chatCompletions(c: Context) {
       chatMode,
     });
     mark("context", stepStartedAt);
+
+    // Phase 7-wire: when QWEN_SESSION_VERSIONING=true, persist the derived
+    // session and open a single-active generation holding the version the
+    // commit must later CAS against. Flag off: skipped, legacy path below.
+    versionedCommit = null;
+    if (isSessionVersioningEnabled() && ctx.sessionId) {
+      const sessionService = getSharedSessionService();
+      const tenantId = DEFAULT_TENANT_ID;
+      const resolved = await sessionService.resolveSession({
+        tenantId,
+        sessionId: ctx.sessionId,
+        modelId,
+      });
+      const rawIdempotencyKey = c.req.header(IDEMPOTENCY_KEY_HEADER);
+      const begun = await sessionService.beginGeneration({
+        sessionId: resolved.session.sessionId,
+        tenantId,
+        turnId: `turn_${reqId}`,
+        modelId,
+        deadline: Date.now() + SESSION_GENERATION_DEADLINE_MS,
+        ...(rawIdempotencyKey
+          ? {
+              idempotencyKey: scopedIdempotencyKey(
+                SESSION_VERSIONING_ENDPOINT_CHAT,
+                rawIdempotencyKey,
+              ),
+            }
+          : {}),
+      });
+      if (!begun.ok) {
+        if (begun.error.code === "SESSION_BUSY") {
+          return c.json(
+            { error: { code: "SESSION_BUSY", message: begun.error.message } },
+            409,
+          );
+        }
+        const existingGenerationId = begun.error.details?.["generationId"];
+        return c.json(
+          {
+            error: {
+              code: "SESSION_CONFLICT",
+              message: begun.error.message,
+              ...(typeof existingGenerationId === "string"
+                ? { generationId: existingGenerationId }
+                : {}),
+            },
+          },
+          409,
+        );
+      }
+      ctx.sessionVersionAtStart = begun.versionAtStart;
+      versionedCommit = {
+        sessionId: resolved.session.sessionId,
+        generationId: begun.generationId,
+        versionAtStart: begun.versionAtStart,
+      };
+    }
 
     // Loop 2: deterministic sticky key (header > first_message > combined > random).
     // Lookup-only: touch on hit for sliding TTL, no routing change yet.
@@ -446,6 +514,7 @@ export async function chatCompletions(c: Context) {
       activeAccountId: streamResult.activeAccountId,
       activeAccountLabel: streamResult.activeAccountLabel,
       logicalSessionId: streamResult.logicalSessionId,
+      sessionCommit: versionedCommit,
       body,
       finalPrompt,
       userPrompt: currentPrompt || prompt,
@@ -845,6 +914,7 @@ export async function chatCompletions(c: Context) {
               activeAccountId: newStreamResult.activeAccountId,
               activeAccountLabel: newStreamResult.activeAccountLabel,
               logicalSessionId: newStreamResult.logicalSessionId,
+              sessionCommit: currentParams.sessionCommit,
               body,
               finalPrompt: retryFinalPrompt,
               userPrompt: currentPrompt || prompt,
@@ -896,6 +966,16 @@ export async function chatCompletions(c: Context) {
           }
         }
   } catch (err) {
+    if (versionedCommit && isSessionVersioningEnabled()) {
+      try {
+        await getSharedSessionService().failGeneration({
+          sessionId: versionedCommit.sessionId,
+          generationId: versionedCommit.generationId,
+        });
+      } catch {
+        // Best-effort: the error response below is authoritative.
+      }
+    }
     timings.preResponse = Date.now() - startedAt;
     c.header("X-QwenProxy-Timing", formatTimingHeader(timings));
     if (releaseChatLock) {
