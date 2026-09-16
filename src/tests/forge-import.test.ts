@@ -35,6 +35,51 @@ import { isEncrypted } from "../core/crypto-utils.ts";
 
 const TEST_DIR = path.join(os.tmpdir(), "qwenproxy-forge-tests");
 
+/**
+ * Every account email this file ever creates (direct INSERTs + fixture
+ * imports, including the 55 bulk accounts). Cleanup deletes ONLY these
+ * addresses — never a blanket wipe — so concurrently-running test files keep
+ * their own rows under `--test-concurrency`.
+ */
+const FORGE_TEST_EMAILS: readonly string[] = [
+  "user1@test.com",
+  "a@b.com",
+  "dup@test.com",
+  "DUP@TEST.COM",
+  "existing@test.com",
+  "colon@test.com",
+  "user@t�st.com",
+  "rb1@test.com",
+  "rb2@test.com",
+  "cache@test.com",
+  "first@test.com",
+  "second@test.com",
+  "third@test.com",
+  "healthy@test.com",
+  "cool@test.com",
+  "health@test.com",
+  "leak@test.com",
+  "live1@test.com",
+  "live2@test.com",
+  "enc@test.com",
+];
+
+function forgeTestBulkEmails(): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < 55; i++) out.push(`bulk${i}@test.com`);
+  return out;
+}
+
+function deleteForgeTestRows(): void {
+  const db = getDatabase();
+  const del = db.prepare("DELETE FROM accounts WHERE email = ?");
+  const tx = db.transaction((emails: string[]) => {
+    for (const email of emails) del.run(email);
+  });
+  tx([...FORGE_TEST_EMAILS, ...forgeTestBulkEmails()]);
+  invalidateAccountsCache();
+}
+
 function setup(): void {
   fs.mkdirSync(TEST_DIR, { recursive: true });
 }
@@ -58,10 +103,13 @@ function forgeJson(
 }
 
 function freshDb(): void {
+  // Scoped cleanup: delete only rows this file creates. A blanket
+  // `DELETE FROM accounts` would destroy rows owned by concurrently-running
+  // test files under `--test-concurrency`.
+  deleteForgeTestRows();
   const db = getDatabase();
-  db.prepare("DELETE FROM accounts").run();
   try {
-    db.prepare("DELETE FROM account_health").run();
+    db.prepare("DELETE FROM account_health WHERE account_id NOT IN (SELECT id FROM accounts)").run();
   } catch {}
   invalidateAccountsCache();
   resetAccountHealthForTests();
@@ -74,6 +122,8 @@ function freshDb(): void {
 }
 
 function cleanup(): void {
+  // Remove this file's rows so later/concurrent files see a clean pool.
+  deleteForgeTestRows();
   try {
     fs.rmSync(TEST_DIR, { recursive: true, force: true });
   } catch {}
@@ -139,7 +189,16 @@ test("forge-import: 50+ account bulk import", () => {
     assert.equal(summary.error, undefined);
     assert.equal(summary.found, 55);
     assert.equal(summary.imported, 55);
-    assert.equal(summary.poolTotal, 55);
+    // poolTotal is global pool size: under `--test-concurrency` other files
+    // may own rows concurrently, so assert containment, not exact total.
+    assert.ok(
+      summary.poolTotal >= 55,
+      `pool must contain the 55 bulk accounts (saw ${summary.poolTotal})`,
+    );
+    const emails = new Set(loadAccounts().map((a) => a.email));
+    for (const a of accounts) {
+      assert.ok(emails.has(a.email), `bulk account ${a.email} must be present`);
+    }
   } finally {
     cleanup();
   }
