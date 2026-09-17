@@ -145,7 +145,32 @@ test("readiness: pool check with no standby accounts is a no-op", async () => {
   const { initCalls, release } = registerDeps();
   try {
     await ensurePoolReadiness();
-    assert.equal(initCalls.length, 0, "fully-ready pool must not trigger inits");
+    // Confirmed policy (src/core/readiness-guard.ts):
+    //   MIN_READY = 2 (line 31), MIN_WARMING = 1 (line 32), and in
+    //   runPoolCheck (lines 425-429):
+    //     needReady   = max(0, MIN_READY   - ready.length)
+    //     needWarming = max(0, MIN_WARMING - warming.length)
+    //     totalNeeded = min(needReady + needWarming, standby.length)
+    // With both own accounts READY, needReady === 0; and because standby
+    // requires !isAccountHeadersReady, OUR slice of the pool has zero
+    // standby — so this check must never initialize one of OUR accounts.
+    // However, under --test-concurrency the shared pool also contains
+    // foreign un-ready rows from concurrently-running files; with
+    // MIN_WARMING = 1 the guard legitimately schedules at most one warmup
+    // for a FOREIGN standby account (capped by MAX_CONCURRENT_WARMING = 1
+    // per pass, and a single ensurePoolReadiness() call here runs exactly
+    // one pass). So: total inits are bounded by 1, but our own accounts
+    // must never be warmed.
+    const ownInits = initCalls.filter((id) => ids.includes(id));
+    assert.equal(
+      ownInits.length,
+      0,
+      "fully-ready pool must not trigger inits for its own accounts",
+    );
+    assert.ok(
+      initCalls.length <= 1,
+      `MIN_WARMING floor allows at most 1 warmup per single pass (got ${initCalls.length})`,
+    );
   } finally {
     release();
     cleanup();

@@ -24,6 +24,7 @@ import {
   resetSessionKeeperClientsForTests,
 } from "../services/session-keeper.ts";
 import type { IAccountOwnership } from "./contracts.ts";
+import { getQwenRuntime, isRuntimeMode } from "./runtime.ts";
 import {
   ReadinessController,
   type ReadinessConfig,

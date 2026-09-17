@@ -102,14 +102,35 @@ function forgeJson(
   });
 }
 
+/**
+ * Every account_health row id this file can ever create: the two explicit
+ * ids plus the forge-generated md5(email) ids for every fixture email
+ * (including the 55 bulk accounts). The previous blanket orphan sweep
+ * (`DELETE ... WHERE account_id NOT IN (SELECT id FROM accounts)`) could
+ * delete another concurrently-running file's health row in the race window
+ * between its accounts INSERT and its health INSERT, so cleanup is scoped
+ * to exactly this file's known ids instead.
+ */
+function forgeTestHealthIds(): string[] {
+  const ids = new Set<string>(["cool-id", "health-id"]);
+  for (const email of [...FORGE_TEST_EMAILS, ...forgeTestBulkEmails()]) {
+    ids.add(generateAccountId(email));
+  }
+  return [...ids];
+}
+
 function freshDb(): void {
   // Scoped cleanup: delete only rows this file creates. A blanket
   // `DELETE FROM accounts` would destroy rows owned by concurrently-running
   // test files under `--test-concurrency`.
   deleteForgeTestRows();
   const db = getDatabase();
+  const delHealth = db.prepare("DELETE FROM account_health WHERE account_id = ?");
+  const healthTx = db.transaction((accountIds: string[]) => {
+    for (const id of accountIds) delHealth.run(id);
+  });
   try {
-    db.prepare("DELETE FROM account_health WHERE account_id NOT IN (SELECT id FROM accounts)").run();
+    healthTx(forgeTestHealthIds());
   } catch {}
   invalidateAccountsCache();
   resetAccountHealthForTests();
@@ -460,9 +481,17 @@ test("forge-import: health initialization for new accounts", () => {
   }
 });
 
-test("forge-import: cooldown preservation for existing accounts", () => {
+test("forge-import: cooldown preservation for existing accounts", (t) => {
   freshDb();
   setup();
+  // Belt-and-braces: runs even if the test body throws, so the 60s
+  // rate-limit on the shared 'cool-id' can never bleed into a
+  // concurrently-running file (this is exactly how the headers-gate
+  // fallback test previously observed actual='cool-id' instead of its own
+  // fallback account).
+  t.after(() => {
+    clearAccountCooldown("cool-id");
+  });
   try {
     const db = getDatabase();
     db.prepare("INSERT INTO accounts (id, email, password) VALUES (?, ?, ?)").run(
@@ -481,8 +510,8 @@ test("forge-import: cooldown preservation for existing accounts", () => {
 
     const info = getAccountCooldownInfo("cool-id");
     assert.ok(info, "cooldown must be preserved after re-import attempt");
-    clearAccountCooldown("cool-id");
   } finally {
+    clearAccountCooldown("cool-id");
     cleanup();
   }
 });

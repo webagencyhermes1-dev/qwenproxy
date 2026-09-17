@@ -31,6 +31,11 @@ import {
   markAccountBroken,
   noteAccountRecovered,
 } from "../core/account-state.js";
+import { getRuntimeMode, isRuntimeMode } from "../runtime/runtime-mode.ts";
+import { constructRuntime } from "../runtime/construct.ts";
+import { getAccountsByPriority } from "../core/account-priority.ts";
+import type { QwenRuntime } from "../runtime/runtime.ts";
+import type { RuntimeServices } from "../runtime/bootstrap.ts";
 
 // Module-level state (initialized in startServer)
 let cache: MemoryCache | undefined;
@@ -39,6 +44,7 @@ let server: any;
 let startPromise: Promise<StartedServerInfo> | null = null;
 let stopPromise: Promise<void> | null = null;
 let signalHandlersInstalled = false;
+let runtimeServices: RuntimeServices | undefined;
 
 const app = new Hono();
 
@@ -671,9 +677,6 @@ async function cleanupServerResources(): Promise<void> {
     }
   }
 
-  const { closeAllPlaywright } = await import("../services/playwright.ts");
-  await closeAllPlaywright();
-
   const activeServer = server;
   server = undefined;
   if (activeServer?.close) {
@@ -693,6 +696,30 @@ async function cleanupServerResources(): Promise<void> {
       }
     });
   }
+
+  // Stop runtime services (readiness controller + maintenance scheduler)
+  // before closing browsers and DB
+  try {
+    const { stopRuntimeServices } = await import("../runtime/bootstrap.ts");
+    if (runtimeServices) {
+      await stopRuntimeServices(runtimeServices);
+    }
+  } catch {
+    // Runtime services may not be initialized.
+  }
+
+  // Matching stop for the lease sweep timer started by the runtime branch
+  // (idempotent: safe when the timer was never started).
+  try {
+    const { stopLeaseSweepTimer } = await import("../core/account-concurrency.ts");
+    stopLeaseSweepTimer();
+  } catch {
+    // Lease sweep timer may not have been started.
+  }
+
+  // Close browser contexts AFTER HTTP drain and runtime services stop
+  const { closeAllPlaywright } = await import("../services/playwright.ts");
+  await closeAllPlaywright();
 
   const { flushLogicalThreadState } = await import("../services/qwen.ts");
   try {
@@ -808,28 +835,6 @@ export async function startServer(options?: {
       await import("../core/account-manager.ts");
     syncCooldownsFromDb(accounts);
 
-    if (process.env.QWEN_DURABLE_RUNTIME === "true") {
-      // Durable runtime layer: versioned schema + crash recovery. Runs BEFORE
-      // warmup so orphaned ownership from a previous process is fenced before
-      // any account is declared ready. Fail fast on a schema problem.
-      const { bootPersistence } = await import(
-        "../runtime/persistence/bootstrap.ts"
-      );
-      const { recoverCrashedState } = await import(
-        "../runtime/persistence/recovery.ts"
-      );
-      bootPersistence();
-      const recovery = recoverCrashedState();
-      if (recovery.abandonedGenerations > 0) {
-        console.log(
-          `🧹 [Server] Crash recovery: ${recovery.abandonedGenerations} abandoned generation(s), ${recovery.fencedLeases} fenced lease(s), ${recovery.recoveredAccounts} recovered account(s)`,
-        );
-      }
-    }
-
-    const { getAccountsByPriority } =
-      await import("../core/account-priority.ts");
-
     const { disableNativeTools, warmQwenChatPool } =
       await import("../services/qwen.ts");
     const { initPlaywrightForAccount, isPlaywrightInitialized } =
@@ -840,29 +845,66 @@ export async function startServer(options?: {
     if (accounts.length > 0) {
       const totalAccounts = accounts.length;
 
-      // Warm accounts in priority order (recently successful accounts first),
-      // skipping accounts still on cooldown. Warm the primary account first so
-      // the server binds the port and goes online immediately (~15-20s).
-      // Reserve account(s) and standby validations run seamlessly in background.
-      const warmOrder = getAccountsByPriority(accounts).filter(
-        (account) => !getAccountCooldownInfo(account.id),
-      );
+      // In runtime mode, construct the single runtime container with all 9 components.
+      // This handles crash recovery, account registration, readiness controller,
+      // maintenance scheduler, and warmup via the bounded controller.
+      let runtime: QwenRuntime | null = null;
       const readyAccountIds = new Set<string>();
 
-      for (let i = 0; i < warmOrder.length; i++) {
-        const ok = await prepareAccountRuntime(
-          warmOrder[i],
-          getAccountCredentials,
-          initPlaywrightForAccount,
-          disableNativeTools,
-          warmQwenChatPool,
+      if (isRuntimeMode()) {
+        // New contract: constructRuntime(accounts, deps?) — server.ts supplies
+        // the warmup executor via its existing prepareAccountRuntime path and
+        // defers keep-alive to bootstrap's default executor (undefined).
+        // construct.ts is mid-migration to the deps-carrying contract. Cast to
+        // the new signature so this call site compiles against both the old and
+        // new construct.ts; at runtime constructRuntime already returns
+        // bootstrap's RuntimeServices (readiness included).
+        type ConstructRuntimeDeps = {
+          warmupExecutor?: (accountId: string) => Promise<boolean>;
+          keepAliveExecutor?: (accountId: string) => Promise<void>;
+        };
+        const constructRuntimeWithDeps = constructRuntime as unknown as (
+          accounts: QwenAccount[],
+          deps?: ConstructRuntimeDeps,
+        ) => Promise<{ runtime: QwenRuntime; runtimeServices: RuntimeServices }>;
+        const { runtime: rt, runtimeServices: rs } = await constructRuntimeWithDeps(accounts, {
+          warmupExecutor: async (accountId: string) => {
+            const account = accounts.find((a) => a.id === accountId);
+            if (!account) return false;
+            return prepareAccountRuntime(
+              account,
+              getAccountCredentials,
+              initPlaywrightForAccount,
+              disableNativeTools,
+              warmQwenChatPool,
+            );
+          },
+          keepAliveExecutor: undefined,
+        });
+        runtime = rt;
+        runtimeServices = rs;
+        console.log(`🚀 [Server] Runtime mode active — ${getRuntimeMode().toUpperCase()}`);
+      } else {
+        // Legacy warmup path for non-runtime mode
+        const warmOrder = getAccountsByPriority(accounts).filter(
+          (account) => !getAccountCooldownInfo(account.id),
         );
-        if (ok) {
-          readyAccountIds.add(warmOrder[i].id);
-          console.log(
-            `✅ [Server] Account ready (1/${totalAccounts}): ${maskEmail(warmOrder[i].email)}`,
+
+        for (let i = 0; i < warmOrder.length; i++) {
+          const ok = await prepareAccountRuntime(
+            warmOrder[i],
+            getAccountCredentials,
+            initPlaywrightForAccount,
+            disableNativeTools,
+            warmQwenChatPool,
           );
-          break;
+          if (ok) {
+            readyAccountIds.add(warmOrder[i].id);
+            console.log(
+              `✅ [Server] Account ready (1/${totalAccounts}): ${maskEmail(warmOrder[i].email)}`,
+            );
+            break;
+          }
         }
       }
 
@@ -1003,32 +1045,6 @@ export async function startServer(options?: {
         });
       }
     }
-
-    watchdog = new Watchdog();
-    watchdog.start();
-
-    metrics.startCollection();
-
-    const { startSessionKeeper } =
-      await import("../services/session-keeper.ts");
-    startSessionKeeper();
-
-    const { startLeaseSweepTimer } =
-      await import("../core/account-concurrency.ts");
-    startLeaseSweepTimer();
-
-    // Readiness guard: maintains the ready-account floor (2 ready + 1 warming).
-    const {
-      registerReadinessGuardDeps,
-      startReadinessGuardSweep,
-    } = await import("../core/readiness-guard.ts");
-    registerReadinessGuardDeps({
-      getAccountCredentials,
-      initPlaywrightForAccount,
-      disableNativeTools,
-      warmQwenChatPool,
-    });
-    startReadinessGuardSweep();
 
     const serverInstance = serve({
       fetch: app.fetch,
