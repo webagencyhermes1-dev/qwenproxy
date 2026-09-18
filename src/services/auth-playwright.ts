@@ -56,6 +56,10 @@ async function ensurePlaywrightInitialized(accountId: string): Promise<void> {
   } catch {
     // Non-fatal: chat creation will still work with default account settings.
   }
+
+  void import("../core/readiness-guard.ts")
+    .then((m) => m.triggerReadinessCheck("lazy-init-complete"))
+    .catch(() => {});
 }
 
 export async function getBasicHeaders(accountId?: string): Promise<{

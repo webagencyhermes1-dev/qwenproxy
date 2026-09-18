@@ -433,6 +433,8 @@ export function getP50Ttfb(accountId: string): number {
     : sorted[mid];
 }
 
+const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
+
 /**
  * Recent 429 rate: fraction of the last N requests that were rate-limited.
  * Uses rateLimitEvents + quotaEvents vs total requests (bounded window).
@@ -441,7 +443,11 @@ export function getRecent429Rate(accountId: string): number {
   const rec = getAccountHealth(accountId);
   const total = rec.successCount + rec.failureCount;
   if (total === 0) return 0;
+  const now = Date.now();
   const window = Math.min(total, 20);
+  if (rec.lastRequestAt != null && now - rec.lastRequestAt > RATE_LIMIT_WINDOW_MS) {
+    return 0;
+  }
   const rateLimited = Math.min(rec.rateLimitEvents + rec.quotaEvents, window);
   return rateLimited / window;
 }

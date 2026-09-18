@@ -7,8 +7,8 @@
  * parallel state store to drift out of sync.
  *
  * Display priority (first match wins):
- *   DISABLED > BROKEN > AUTH_ERROR > SESSION_EXPIRED > COOLDOWN > BUSY >
- *   WARMING > READY
+ *   DISABLED > BROKEN > AUTH_ERROR > SESSION_EXPIRED > COOLDOWN >
+ *   RECOVERING > BUSY > WARMING > READY
  */
 
 import { isAccountBrokenByHealth } from "./account-health.ts";
@@ -18,6 +18,7 @@ export type AccountState =
   | "WARMING"
   | "BUSY"
   | "COOLDOWN"
+  | "RECOVERING"
   | "AUTH_ERROR"
   | "SESSION_EXPIRED"
   | "BROKEN"
@@ -29,6 +30,7 @@ export interface AccountStateFlags {
   headersReady: boolean;
   initialized: boolean;
   busy: boolean;
+  recovering?: boolean;
   authError: boolean;
   sessionExpired: boolean;
   broken: boolean;
@@ -38,6 +40,7 @@ export interface AccountStateFlags {
 const authErrorAccounts = new Set<string>();
 const sessionExpiredAccounts = new Set<string>();
 const brokenAccounts = new Set<string>();
+const recoveringAccounts = new Set<string>();
 
 /** Pure derivation — no I/O, safe to call per request for 200 accounts. */
 export function deriveAccountState(flags: AccountStateFlags): AccountState {
@@ -46,6 +49,7 @@ export function deriveAccountState(flags: AccountStateFlags): AccountState {
   if (flags.authError) return "AUTH_ERROR";
   if (flags.sessionExpired) return "SESSION_EXPIRED";
   if (flags.onCooldown) return "COOLDOWN";
+  if (flags.recovering) return "RECOVERING";
   if (flags.busy) return "BUSY";
   if (!flags.headersReady || !flags.initialized) return "WARMING";
   return "READY";
@@ -97,6 +101,20 @@ export function clearAccountBroken(accountId: string): void {
   brokenAccounts.delete(accountId);
 }
 
+export function markAccountRecovering(accountId: string): void {
+  if (!accountId || accountId === "global") return;
+  recoveringAccounts.add(accountId);
+}
+
+export function clearAccountRecovering(accountId: string): void {
+  if (!accountId) return;
+  recoveringAccounts.delete(accountId);
+}
+
+export function isAccountRecovering(accountId: string): boolean {
+  return recoveringAccounts.has(accountId);
+}
+
 /** Effective broken = explicit flag OR health init-fail threshold. */
 export function isAccountEffectivelyBroken(accountId: string): boolean {
   if (brokenAccounts.has(accountId)) return true;
@@ -117,6 +135,7 @@ export function noteAccountRecovered(accountId: string): void {
   sessionExpiredAccounts.delete(accountId);
   authErrorAccounts.delete(accountId);
   brokenAccounts.delete(accountId);
+  recoveringAccounts.delete(accountId);
 }
 
 /** Test isolation. */
@@ -124,4 +143,5 @@ export function resetAccountStateForTests(): void {
   authErrorAccounts.clear();
   sessionExpiredAccounts.clear();
   brokenAccounts.clear();
+  recoveringAccounts.clear();
 }

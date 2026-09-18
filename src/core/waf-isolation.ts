@@ -78,6 +78,9 @@ export function recordWafHardBlock(accountId: string): WafBlockResult {
 
   if (cooldownMs > 0) {
     markAccountRateLimited(accountId, cooldownMs, "WafChallenge");
+    void import("./readiness-guard.ts")
+      .then((m) => m.triggerReadinessCheck("waf-quarantine"))
+      .catch(() => {});
   }
   try {
     recordAccountFailure(accountId, "waf");

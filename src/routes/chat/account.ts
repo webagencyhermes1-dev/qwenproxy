@@ -2030,6 +2030,9 @@ async function tryCreateStreamWithRetry(
 		} catch {
 			// Health bookkeeping is best-effort; the stream already succeeded.
 		}
+		void import("../../core/readiness-guard.ts")
+			.then((m) => m.triggerReadinessCheck("request-success"))
+			.catch(() => {});
 			if (accountLease) {
 				markLeaseCompletion(
 					currentAccountId,

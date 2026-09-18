@@ -169,6 +169,12 @@ const envSchema = z
     CHAT_IN_PROGRESS_MAX_RETRIES: z.string().default("6"),
     MID_STREAM_FAILOVER_THRESHOLD: z.string().default("2"),
     MID_STREAM_FAILOVER_BUSY_MS: z.string().default("60000"),
+    POOL_TARGET_READY: z.string().default("2"),
+    POOL_RECONCILIATION_INTERVAL_MS: z.string().default("30000"),
+    POOL_WARMUP_TIMEOUT_MS: z.string().default("90000"),
+    POOL_MAX_WARMUP_FAILURES: z.string().default("3"),
+    POOL_WARMUP_BACKOFF_BASE_MS: z.string().default("500"),
+    POOL_WARMUP_BACKOFF_MAX_MS: z.string().default("300000"),
 
 
     QWEN_BASE_URL: z.string().default("https://chat.qwen.ai"),
@@ -374,6 +380,17 @@ export const config = {
     disconnectGraceMs: Math.max(
       0,
       parseInt(env.STREAM_DISCONNECT_GRACE_MS),
+    ),
+  },
+  pool: {
+    targetReady: Math.max(1, parseInt(env.POOL_TARGET_READY)),
+    warmupTimeoutMs: Math.max(1, parseInt(env.POOL_WARMUP_TIMEOUT_MS)),
+    backoffBaseMs: Math.max(1, parseInt(env.POOL_WARMUP_BACKOFF_BASE_MS)),
+    backoffMaxMs: Math.max(1, parseInt(env.POOL_WARMUP_BACKOFF_MAX_MS)),
+    maxWarmupFailures: Math.max(1, parseInt(env.POOL_MAX_WARMUP_FAILURES)),
+    reconciliationIntervalMs: Math.max(
+      1,
+      parseInt(env.POOL_RECONCILIATION_INTERVAL_MS),
     ),
   },
 

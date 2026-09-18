@@ -31,5 +31,5 @@
     "src/login.ts",
     "src/tui/index.ts"
   ],
-  "exclude": ["node_modules", "dist", "src/runtime/**/*", "src/tests/stress/**/*", "src/tests/readiness-guard.test.ts", "src/tests/recovery-metrics.test.ts"]
+  "exclude": ["node_modules", "dist", "src/tests/stress/**/*", "src/tests/readiness-guard.test.ts", "src/tests/recovery-metrics.test.ts"]
 }

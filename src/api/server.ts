@@ -288,6 +288,8 @@ app.get("/health", async (c) => {
     const manager = await import("../core/account-manager.js");
     const { loadAccounts } = await import("../core/accounts.js");
     const stats = manager.getPoolStats();
+    const readinessTarget = config.pool?.targetReady ?? 2;
+    const readinessDeficit = Math.max(0, readinessTarget - stats.ready);
     pool = {
       total: stats.total,
       ready: stats.ready,
@@ -304,6 +306,8 @@ app.get("/health", async (c) => {
       failureRate: Number(stats.failureRate.toFixed(4)),
       averageLatencyMs: stats.averageLatencyMs,
       averageHealth: stats.averageHealth,
+      readinessTarget,
+      readinessDeficit,
     };
     const accounts = loadAccounts();
     const candidates = manager.buildSchedulerCandidates(accounts);
@@ -386,12 +390,22 @@ app.get("/health/sessions", async (c) => {
 // guards are engaging (vs. a silent thundering herd) and surfaces lease churn.
 app.get("/health/recovery", async (c) => {
   try {
-    const { getReadinessDiagnostics } = await import("../core/readiness-guard.js");
+    const {
+      getReadinessDiagnostics,
+      getWarmupFailureInfo,
+      getWarmingAccountIds,
+    } = await import("../core/readiness-guard.js");
     const { getAccountConcurrencySnapshot } = await import(
       "../core/account-concurrency.js"
     );
-    const { getPoolStats } = await import("../core/account-manager.js");
+    const { getPoolStats, getHeadersReadyAccountIds } = await import(
+      "../core/account-manager.js"
+    );
     const leases = getAccountConcurrencySnapshot();
+    const warmupFailures = getWarmupFailureInfo();
+    const warmingAccounts = getWarmingAccountIds();
+    const targetReady = config.pool?.targetReady ?? 2;
+    const readyCount = getHeadersReadyAccountIds().length;
     return c.json({
       readiness: getReadinessDiagnostics(),
       leases,
@@ -403,6 +417,11 @@ app.get("/health/recovery", async (c) => {
         cooldown: getPoolStats().cooldown,
         broken: getPoolStats().broken,
       },
+      warmupFailures,
+      warmingAccounts,
+      targetReady,
+      readyCount,
+      deficit: Math.max(0, targetReady - readyCount),
       timestamp: Date.now(),
     });
   } catch (err) {
@@ -697,6 +716,13 @@ async function cleanupServerResources(): Promise<void> {
     });
   }
 
+  try {
+    const { stopReconciliationTimer } = await import("../core/readiness-guard.ts");
+    stopReconciliationTimer();
+  } catch {
+    // Readiness guard may not have been initialized.
+  }
+
   // Stop runtime services (readiness controller + maintenance scheduler)
   // before closing browsers and DB
   try {
@@ -840,6 +866,17 @@ export async function startServer(options?: {
     const { initPlaywrightForAccount, isPlaywrightInitialized } =
       await import("../services/playwright.ts");
 
+    const { registerReadinessGuardDeps, startReadinessGuardSweep, startReconciliationTimer } = await import("../core/readiness-guard.ts");
+    registerReadinessGuardDeps({
+      getAccountCredentials,
+      initPlaywrightForAccount: (account) => initPlaywrightForAccount(account, config.playwright.headless, config.playwright.browser),
+      disableNativeTools,
+      warmQwenChatPool,
+    });
+    startReadinessGuardSweep();
+    startReconciliationTimer();
+    console.log("[Pool Readiness] controller registered | deps=ready");
+
     const BATCH_SIZE = config.playwright.initBatchSize;
 
     if (accounts.length > 0) {
@@ -901,9 +938,9 @@ export async function startServer(options?: {
           if (ok) {
             readyAccountIds.add(warmOrder[i].id);
             console.log(
-              `✅ [Server] Account ready (1/${totalAccounts}): ${maskEmail(warmOrder[i].email)}`,
+              `✅ [Server] Account ready (${readyAccountIds.size}/${totalAccounts}): ${maskEmail(warmOrder[i].email)}`,
             );
-            break;
+            if (readyAccountIds.size >= (config.pool?.targetReady ?? 2)) break;
           }
         }
       }

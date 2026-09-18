@@ -844,16 +844,16 @@ test("TUI AccountsView: precision mouse hover and click on accounts list rows", 
   let render = view.render(80, 24, mockSnapshot as any).join("\n");
   assert.ok(!render.includes("two@test.com") || render.includes("one@test.com"));
 
-  // Hovering row 9 (account 2) should highlight row 2
+  // Hovering row 10 (account 2) should highlight row 2
   await view.handleKey({
     name: "hover",
     ctrl: false,
     shift: false,
     meta: false,
-    mouse: { type: "hover", col: 10, row: 9 },
+    mouse: { type: "hover", col: 10, row: 10 },
   });
   render = view.render(80, 24, mockSnapshot as any).join("\n");
-  // Check that row 9 got hovered
+  // Check that row 10 got hovered
   assert.ok(render.includes("two@test.com"));
 
   // Moving mouse away to row 15 should clear hover
@@ -865,13 +865,13 @@ test("TUI AccountsView: precision mouse hover and click on accounts list rows", 
     mouse: { type: "hover", col: 10, row: 15 },
   });
 
-  // Clicking row 9 should select account 2
+  // Clicking row 10 should select account 2
   await view.handleKey({
     name: "click",
     ctrl: false,
     shift: false,
     meta: false,
-    mouse: { type: "click", button: "left", col: 10, row: 9 },
+    mouse: { type: "click", button: "left", col: 10, row: 10 },
   });
   render = view.render(80, 24, mockSnapshot as any).join("\n");
   // Right panel should now show account 2 details

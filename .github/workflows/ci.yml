@@ -37,6 +37,12 @@ jobs:
           CI: true
           TEST_MOCK_QWEN_AUTH: true
 
+      - name: Run runtime tests
+        run: npm run test:runtime
+        env:
+          CI: true
+          TEST_MOCK_QWEN_AUTH: true
+
   docker:
     name: Docker Build
     runs-on: ubuntu-latest

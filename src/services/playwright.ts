@@ -1669,7 +1669,9 @@ async function resolveAccountCredentials(account: QwenAccount): Promise<QwenAcco
       return creds;
     }
   } catch {}
-  return account;
+  throw new Error(
+    `Account ${account.id} credentials unresolved: password is masked and store lookup failed`,
+  );
 }
 
 export async function initPlaywrightForAccount(
@@ -3618,6 +3620,9 @@ function cleanupPlaywrightAccountState(accountId: string): void {
   // page is gone, so it must not be selected by the rotation gate until a
   // fresh capture succeeds again.
   unmarkAccountHeadersReady(accountId);
+  void import("../core/readiness-guard.ts")
+    .then((m) => m.triggerReadinessCheck("context-death"))
+    .catch(() => {});
 }
 
 async function closePlaywrightContextBestEffort(

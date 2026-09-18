@@ -66,7 +66,10 @@ export function decrypt(ciphertext: string): string {
     const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
     decipher.setAuthTag(authTag);
     return decipher.update(encrypted).toString("utf-8") + decipher.final("utf-8");
-  } catch {
+  } catch (err) {
+    console.error(
+      `❌ [CryptoUtils] Decryption failed (possible key mismatch): ${(err as Error).message}`,
+    );
     return ciphertext;
   }
 }

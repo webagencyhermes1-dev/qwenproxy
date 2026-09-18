@@ -53,7 +53,7 @@ export class AccountsView implements TuiView {
   private ensureSelectedVisible(contentH: number): void {
     const accounts = this.statusData?.accounts || [];
     if (accounts.length === 0) return;
-    const visibleRows = Math.max(1, contentH - 4); // account for header/footer
+    const visibleRows = Math.max(1, contentH - 5); // account for header/footer/summary
     if (this.selectedIndex < this.scrollOffset) {
       this.scrollOffset = this.selectedIndex;
     } else if (this.selectedIndex >= this.scrollOffset + visibleRows) {
@@ -538,11 +538,11 @@ if (key.name === "hover" && key.mouse) {
       const { row, col } = key.mouse;
       const leftW = this.lastLeftW || 46;
 
-      // Account list rows start at row 8 (row 4=box border, 5=blank, 6=header, 7=divider)
-      const visibleRows = Math.max(1, this.lastContentH - 4);
+      // Account list rows start at row 9 (row 4=box border, 5=blank, 6=summary, 7=header, 8=divider)
+      const visibleRows = Math.max(1, this.lastContentH - 5);
       const maxVisible = Math.min(accounts.length - this.scrollOffset, visibleRows);
-      if (col >= 2 && col <= leftW - 1 && row >= 8 && row < 8 + maxVisible) {
-        const hoverIdx = this.scrollOffset + (row - 8);
+      if (col >= 2 && col <= leftW - 1 && row >= 9 && row < 9 + maxVisible) {
+        const hoverIdx = this.scrollOffset + (row - 9);
         if (this.hoveredAccountIndex !== hoverIdx) {
           this.hoveredAccountIndex = hoverIdx;
           return true;
@@ -572,12 +572,12 @@ if (key.name === "hover" && key.mouse) {
     if (key.name === "click" && key.mouse) {
       const { row, col } = key.mouse;
       const leftW = this.lastLeftW || 46;
-      const visibleRows = Math.max(1, this.lastContentH - 4);
+      const visibleRows = Math.max(1, this.lastContentH - 5);
       const startIdx = Math.max(0, Math.min(this.scrollOffset, Math.max(0, accounts.length - visibleRows)));
 
       // Click on account row
-      if (col >= 2 && col <= leftW - 1 && row >= 8 && row < 8 + Math.min(accounts.length - this.scrollOffset, visibleRows)) {
-        this.selectedIndex = this.scrollOffset + (row - 8);
+      if (col >= 2 && col <= leftW - 1 && row >= 9 && row < 9 + Math.min(accounts.length - this.scrollOffset, visibleRows)) {
+        this.selectedIndex = this.scrollOffset + (row - 9);
         return true;
       }
       // Right panel action buttons click (rows 15, 16, 17, 18)
@@ -624,7 +624,7 @@ if (key.name === "hover" && key.mouse) {
     // Page up/down for scrolling through accounts
     if (key.name === "pageup" || (key.name === "up" && key.ctrl)) {
       if (accounts.length > 0) {
-        const visibleRows = Math.max(1, this.lastContentH - 4); // account for header/footer
+        const visibleRows = Math.max(1, this.lastContentH - 5); // account for header/footer/summary
         this.scrollOffset = Math.max(0, this.scrollOffset - visibleRows);
         this.ensureSelectedVisible(this.lastContentH);
       }
@@ -632,7 +632,7 @@ if (key.name === "hover" && key.mouse) {
     }
     if (key.name === "pagedown" || (key.name === "down" && key.ctrl)) {
       if (accounts.length > 0) {
-        const visibleRows = Math.max(1, this.lastContentH - 4);
+        const visibleRows = Math.max(1, this.lastContentH - 5);
         const maxScroll = Math.max(0, accounts.length - visibleRows);
         this.scrollOffset = Math.min(maxScroll, this.scrollOffset + visibleRows);
         this.ensureSelectedVisible(this.lastContentH);
@@ -687,18 +687,39 @@ if (key.name === "hover" && key.mouse) {
     const selected = accounts[this.selectedIndex];
 
     // Left Panel: Accounts List Table (Pool 2.0 compact: state/health/load).
-    const leftContent: string[] = [
-      "",
-      `  ${theme.dim("#  Account      State     H  Strm S/F  Cd")}`,
-      `  ${theme.dim("───────────────────────────────────────")}`,
-    ];
+    const leftContent: string[] = [""];
+
+    if (accounts.length > 0) {
+      let readyCount = 0;
+      let busyCount = 0;
+      let cooldownCount = 0;
+      let standbyCount = 0;
+      for (const acc of accounts) {
+        const state = acc.state ?? (acc.onCooldown ? "COOLDOWN" : acc.headersReady ? "READY" : "WARMING");
+        if (state === "COOLDOWN" || acc.onCooldown) {
+          cooldownCount++;
+        } else if (state === "BUSY") {
+          busyCount++;
+        } else if (!acc.headersReady) {
+          standbyCount++;
+        } else {
+          readyCount++;
+        }
+      }
+      leftContent.push(
+        `  ${theme.green(`r:${readyCount}`)} ${theme.cyan(`b:${busyCount}`)} ${theme.yellow(`c:${cooldownCount}`)} ${theme.muted(`s:${standbyCount}`)}`,
+      );
+    }
+
+    leftContent.push(`  ${theme.dim("#  Account      State     H  Strm S/F  Cd")}`);
+    leftContent.push(`  ${theme.dim("───────────────────────────────────────")}`);
 
     if (accounts.length === 0) {
       leftContent.push("");
       leftContent.push(`  ${theme.yellow("No accounts configured yet.")}`);
       leftContent.push(`  ${theme.muted("Press ")}${theme.cyan("'A'")}${theme.muted(" or use the side option to add.")}`);
     } else {
-      const visibleRows = Math.max(1, contentH - 4);
+      const visibleRows = Math.max(1, contentH - 5);
       const maxScroll = Math.max(0, accounts.length - visibleRows);
       const startIdx = Math.max(0, Math.min(this.scrollOffset, Math.max(0, accounts.length - visibleRows)));
       const endIdx = Math.min(accounts.length, startIdx + visibleRows);

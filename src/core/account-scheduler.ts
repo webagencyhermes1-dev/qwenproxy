@@ -140,14 +140,23 @@ export function pickSchedulerCandidate(
   }
   if (ranked.length === 1) return ranked[0];
   const top = ranked[0];
-  const topBand = Math.floor(top.health.healthScore / 10);
+  const topScore =
+    top.health.healthScore *
+    getTtfbFactor(top.account.id) *
+    (1 - getRecent429Rate(top.account.id));
+  const topBand = Math.floor(topScore / 10);
   // Similarly-healthy leaders under identical load share the pick.
-  const group = ranked.filter(
-    (c) =>
-      Math.floor(c.health.healthScore / 10) === topBand &&
+  const group = ranked.filter((c) => {
+    const scoreC =
+      c.health.healthScore *
+      getTtfbFactor(c.account.id) *
+      (1 - getRecent429Rate(c.account.id));
+    return (
+      Math.floor(scoreC / 10) === topBand &&
       c.activeStreams === top.activeStreams &&
-      c.queuedRequests === top.queuedRequests,
-  );
+      c.queuedRequests === top.queuedRequests
+    );
+  });
   if (group.length === 1) return group[0];
   const span = Math.max(1, prioritySpan ?? ranked.length);
   let best = group[0];

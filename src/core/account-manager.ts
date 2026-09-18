@@ -31,6 +31,7 @@ import {
   rankSchedulerCandidates,
   type SchedulerCandidate,
 } from "./account-scheduler.ts";
+import { getWarmingAccountIds } from "./readiness-guard.ts";
 
 let currentIndex = 0;
 
@@ -157,6 +158,9 @@ export function getAccountCooldownInfo(
         );
       }
     }
+    void import("./readiness-guard.ts")
+      .then((m) => m.triggerReadinessCheck("cooldown-expired"))
+      .catch(() => {});
     return null;
   }
   return { onCooldown: true, remainingMs: remaining, reason: entry.reason };
@@ -391,6 +395,9 @@ export interface PoolStats {
   averageLatencyMs: number;
   averageHealth: number;
   states: Record<string, AccountState>;
+  readinessTarget: number;
+  readinessDeficit: number;
+  warmingAccounts: string[];
 }
 
 /** Pool-wide aggregates for /health, /metrics and the TUI. */
@@ -439,6 +446,8 @@ export function getPoolStats(): PoolStats {
   }
 
   const agg = getPoolHealthAggregates(accounts.map((a) => a.id));
+  const readinessTarget = config.pool?.targetReady ?? 2;
+  const readinessDeficit = Math.max(0, readinessTarget - ready);
   const stats: PoolStats = {
     total: accounts.length,
     ready,
@@ -457,6 +466,9 @@ export function getPoolStats(): PoolStats {
     averageHealth:
       accounts.length > 0 ? Math.round(healthSum / accounts.length) : 100,
     states,
+    readinessTarget,
+    readinessDeficit,
+    warmingAccounts: getWarmingAccountIds(),
   };
 
   // Pool gauges for Prometheus (best-effort; /metrics renders them).

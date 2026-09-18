@@ -14,13 +14,19 @@ import type {
 
 export const READINESS_CONTROLLER_FLAG = "QWEN_READINESS_CONTROLLER";
 
-const MIN_READY = 2;
 const MIN_WARMING = 1;
 const MAX_CONCURRENT_WARMING = 1;
 const VALIDATION_BUCKETS = 3;
 const VALIDATION_BUCKET_WINDOW_MS = 60_000;
 const SWEEP_INTERVAL_MS = 60_000;
 const WARMUP_DEDUPE_PREFIX = "WARM_ACCOUNT:";
+const EXHAUSTION_RESET_MS = 600_000;
+
+function getMinReady(): number {
+  return config.pool?.targetReady ?? 2;
+}
+
+const mask = (id: string) => id.slice(0, 8) + "...";
 
 export interface ReadinessGuardDeps {
   getAccountCredentials: (accountId: string) => QwenAccount | undefined;
@@ -46,6 +52,7 @@ export interface ReadinessDiagnostics {
   readyAccounts: number;
   validationSweepsRun: number;
   accountsRevalidated: number;
+  warmupFailures: number;
 }
 
 export interface ValidationPassResult {
@@ -60,6 +67,7 @@ const counters = {
   lastPoolCheckAt: null as number | null,
   validationSweepsRun: 0,
   accountsRevalidated: 0,
+  warmupFailures: 0,
 };
 
 let guardDeps: ReadinessGuardDeps | null = null;
@@ -67,7 +75,10 @@ let controllerClients: ReadinessControllerClients | null = null;
 let checkInFlight: Promise<void> | null = null;
 let trailingRecheckRequested = false;
 let sweepTimer: ReturnType<typeof setInterval> | null = null;
+let reconciliationTimer: ReturnType<typeof setInterval> | null = null;
 const warmingAccounts = new Set<string>();
+const warmupFailures = new Map<string, { count: number; backoffUntil: number }>();
+const exhaustedAccounts = new Map<string, number>();
 
 export function isReadinessControllerEnabled(): boolean {
   return process.env[READINESS_CONTROLLER_FLAG] === "true";
@@ -87,10 +98,24 @@ export function warmupDedupeKey(accountId: string): string {
   return `${WARMUP_DEDUPE_PREFIX}${accountId}`;
 }
 
+export function getWarmingAccountIds(): string[] {
+  return Array.from(warmingAccounts);
+}
+
+export function getWarmupFailureInfo(): Map<
+  string,
+  { count: number; backoffUntil: number }
+> {
+  return new Map(warmupFailures);
+}
+
 export function registerReadinessGuardDeps(
   deps: ReadinessGuardDeps | null,
 ): void {
   guardDeps = deps;
+  if (deps) {
+    console.log("[Pool Readiness] controller registered | deps=ready");
+  }
 }
 
 export function getReadinessDiagnostics(): ReadinessDiagnostics {
@@ -106,6 +131,7 @@ export function getReadinessDiagnostics(): ReadinessDiagnostics {
     readyAccounts,
     validationSweepsRun: counters.validationSweepsRun,
     accountsRevalidated: counters.accountsRevalidated,
+    warmupFailures: counters.warmupFailures,
   };
 }
 
@@ -116,6 +142,9 @@ export function resetReadinessCountersForTests(): void {
   counters.lastPoolCheckAt = null;
   counters.validationSweepsRun = 0;
   counters.accountsRevalidated = 0;
+  counters.warmupFailures = 0;
+  warmupFailures.clear();
+  exhaustedAccounts.clear();
 }
 
 export function recoveredValidationBucket(
@@ -180,6 +209,8 @@ async function runPoolCheck(): Promise<void> {
   const deps = guardDeps;
   if (!deps) return;
 
+  resetExpiredExhaustions();
+
   const accounts = loadAccounts();
   const ready = accounts.filter((account) =>
     isAccountHeadersReady(account.id),
@@ -188,15 +219,23 @@ async function runPoolCheck(): Promise<void> {
     (account) =>
       !isAccountHeadersReady(account.id) &&
       !getAccountCooldownInfo(account.id) &&
-      !warmingAccounts.has(account.id),
+      !warmingAccounts.has(account.id) &&
+      !exhaustedAccounts.has(account.id) &&
+      !isInWarmupBackoff(account.id),
   );
-  const needReady = Math.max(0, MIN_READY - ready.length);
+  const target = getMinReady();
+  const deficit = Math.max(0, target - ready.length);
   const needWarming = Math.max(0, MIN_WARMING - warmingAccounts.size);
-  const totalNeeded = Math.min(needReady + needWarming, standby.length);
+  const totalNeeded = Math.min(deficit + needWarming, standby.length);
   const slots = Math.min(
     totalNeeded,
     Math.max(0, MAX_CONCURRENT_WARMING - warmingAccounts.size),
   );
+  if (deficit > 0) {
+    console.log(
+      `[Pool Readiness] reconcile | ready=${ready.length} target=${target} deficit=${deficit}`,
+    );
+  }
 
   for (let i = 0; i < slots; i++) {
     const account = standby[i];
@@ -204,6 +243,11 @@ async function runPoolCheck(): Promise<void> {
     if (isAccountHeadersReady(account.id)) continue;
     if (getAccountCooldownInfo(account.id)) continue;
     if (warmingAccounts.has(account.id)) continue;
+    if (exhaustedAccounts.has(account.id)) continue;
+    if (isInWarmupBackoff(account.id)) continue;
+    console.log(
+      `[Pool Readiness] warmup scheduled | account=${mask(account.id)} reason=ready_deficit`,
+    );
     await warmStandbyAccount(deps, account.id);
   }
 }
@@ -215,25 +259,75 @@ async function warmStandbyAccount(
   const credentials = deps.getAccountCredentials(accountId);
   if (!credentials) return false;
   warmingAccounts.add(accountId);
-  try {
-    await deps.initPlaywrightForAccount(credentials);
-    await deps.disableNativeTools(accountId).catch(noop);
-    await Promise.all(
-      config.qwen.chatPoolModels.map((modelId) =>
-        deps.warmQwenChatPool(accountId, modelId).catch(noop),
-      ),
+  const startedAt = Date.now();
+  const timeoutMs = config.pool?.warmupTimeoutMs ?? 90_000;
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(
+      () => reject(new Error(`Warmup timeout after ${timeoutMs}ms`)),
+      timeoutMs,
     );
+    timeoutHandle.unref?.();
+  });
+  try {
+    await Promise.race([
+      (async () => {
+        await deps.initPlaywrightForAccount(credentials);
+        await deps.disableNativeTools(accountId).catch(noop);
+        await Promise.all(
+          config.qwen.chatPoolModels.map((modelId) =>
+            deps.warmQwenChatPool(accountId, modelId).catch(noop),
+          ),
+        );
+      })(),
+      timeoutPromise,
+    ]);
     if (getAccountCooldownInfo(accountId)) return false;
     markAccountHeadersReady(accountId);
     counters.accountsWarmed += 1;
+    warmupFailures.delete(accountId);
+    console.log(
+      `[Pool Readiness] warmup success | account=${mask(accountId)} duration=${Date.now() - startedAt}ms`,
+    );
     return true;
   } catch (error) {
-    console.warn(
-      `⚠️ [ReadinessGuard] Warmup failed | account=${accountId} | error=${getErrorMessage(error)}`,
-    );
+    recordWarmupFailure(accountId, getErrorMessage(error));
     return false;
   } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
     warmingAccounts.delete(accountId);
+  }
+}
+
+function recordWarmupFailure(accountId: string, message: string): void {
+  counters.warmupFailures += 1;
+  const info = warmupFailures.get(accountId) ?? { count: 0, backoffUntil: 0 };
+  info.count += 1;
+  const baseMs = config.pool?.backoffBaseMs ?? 500;
+  const maxMs = config.pool?.backoffMaxMs ?? 300_000;
+  info.backoffUntil =
+    Date.now() + Math.min(baseMs * 2 ** (info.count - 1), maxMs);
+  warmupFailures.set(accountId, info);
+  if (info.count >= (config.pool?.maxWarmupFailures ?? 3)) {
+    exhaustedAccounts.set(accountId, Date.now());
+  }
+  console.warn(
+    `[Pool Readiness] warmup failed | account=${mask(accountId)} error=${message}`,
+  );
+}
+
+function isInWarmupBackoff(accountId: string): boolean {
+  const info = warmupFailures.get(accountId);
+  return info !== undefined && info.backoffUntil > Date.now();
+}
+
+function resetExpiredExhaustions(): void {
+  const now = Date.now();
+  for (const [accountId, exhaustedAt] of exhaustedAccounts) {
+    if (now - exhaustedAt >= EXHAUSTION_RESET_MS) {
+      exhaustedAccounts.delete(accountId);
+      warmupFailures.delete(accountId);
+    }
   }
 }
 
@@ -286,6 +380,20 @@ export function stopReadinessGuardSweep(): void {
   if (!sweepTimer) return;
   clearInterval(sweepTimer);
   sweepTimer = null;
+}
+
+export function startReconciliationTimer(): void {
+  if (reconciliationTimer) return;
+  reconciliationTimer = setInterval(() => {
+    void coalescedPoolCheck().then(noop, noop);
+  }, config.pool?.reconciliationIntervalMs ?? 30_000);
+  reconciliationTimer.unref?.();
+}
+
+export function stopReconciliationTimer(): void {
+  if (!reconciliationTimer) return;
+  clearInterval(reconciliationTimer);
+  reconciliationTimer = null;
 }
 
 function noop(): void {}
