@@ -28,7 +28,8 @@ export type ErrorCode =
   | "TOOL_CALL_INVALID"
   | "TOOL_RESULT_MISSING"
   | "PERSISTENCE_FAILURE"
-  | "INTERNAL_ERROR";
+  | "INTERNAL_ERROR"
+  | "LEGACY_PATH";
 
 export const HTTP_STATUS_BY_ERROR_CODE: Record<ErrorCode, number> = {
   INVALID_REQUEST: 400,
@@ -54,6 +55,7 @@ export const HTTP_STATUS_BY_ERROR_CODE: Record<ErrorCode, number> = {
   TOOL_RESULT_MISSING: 400,
   PERSISTENCE_FAILURE: 500,
   INTERNAL_ERROR: 500,
+  LEGACY_PATH: 500,
 };
 
 const TERMINAL_GENERATION_ERRORS: ReadonlySet<ErrorCode> = new Set<ErrorCode>([

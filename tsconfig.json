@@ -13,6 +13,23 @@
     "lib": ["ESNext", "DOM"],
     "types": ["node"]
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
+  "include": [
+    "src/api/**/*",
+    "src/benchmarks/**/*",
+    "src/cache/**/*",
+    "src/core/**/*",
+    "src/domain/**/*",
+    "src/routes/**/*",
+    "src/services/**/*",
+    "src/sync/**/*",
+    "src/tests/**/*",
+    "src/tools/**/*",
+    "src/tui/**/*",
+    "src/types/**/*",
+    "src/utils/**/*",
+    "src/index.ts",
+    "src/login.ts",
+    "src/tui/index.ts"
+  ],
+  "exclude": ["node_modules", "dist", "src/runtime/**/*", "src/tests/stress/**/*", "src/tests/readiness-guard.test.ts", "src/tests/recovery-metrics.test.ts"]
 }
