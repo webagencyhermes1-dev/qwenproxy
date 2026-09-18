@@ -9,7 +9,6 @@ import {
   CONTEXT_COMPACTION_MAX_PASSES,
 } from "../../domain/context.ts";
 import type { ContextMeasurement, PreparedContext } from "../../domain/context.ts";
-import { computeInputContextBudget } from "../../utils/context-budget.ts";
 import { estimateTokenCount } from "../../utils/context-truncation.ts";
 import { TOOL_CALL_OPEN, TOOL_CALL_CLOSE } from "../../tools/toolcall-tags.ts";
 
@@ -282,13 +281,17 @@ export function prepareContext(input: PrepareContextInput): PrepareContextResult
     : 0;
 
   const contextWindowTokens = capabilities.getContextWindowTokens(modelId);
-  const maxInputTokens = capabilities.getMaxOutputTokens(modelId);
+  const maxOutputTokens = capabilities.getMaxOutputTokens(modelId);
 
-  const inputBudget = computeInputContextBudget({
+  const budget = buildContextBudget({
     contextWindowTokens,
-    maxInputTokens,
-    safetyMarginTokens: 2048,
+    maxOutputTokens,
+    maxThinkingTokens: 0,
+    toolSchemaTokens,
+    thinkingEnabled: false,
+    toolsPresent: toolDefinitions !== undefined && toolDefinitions.length > 0,
   });
+  const inputBudget = budget.usableInputTokens;
 
   const callIdToName = buildCallIdToToolName(messages);
   const summaryText = rollingSummary ?? "";

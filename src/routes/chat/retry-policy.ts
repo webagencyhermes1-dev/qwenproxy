@@ -91,9 +91,28 @@ const LEASE_AUTHORITY_TERMINAL_CODES: ReadonlySet<string> = new Set<string>([
   "generation_cancelled",
 ]);
 
+/**
+ * Deterministic context-budget failures (typed ContextLengthExceededError or
+ * plain errors carrying the same messages). Retrying, rotating accounts, or
+ * rebuilding the failover prompt can never shrink the context, so these must
+ * terminate immediately instead of looping on the default-retry path.
+ */
+export function isContextLengthExceededError(err: unknown): boolean {
+  const code = errCode(err).toLowerCase();
+  if (code === "context_length_exceeded") return true;
+  const message = errMessage(err).toLowerCase();
+  return (
+    message.includes("compressed context still exceeds budget") ||
+    message.includes("serialized payload exceeds budget") ||
+    message.includes("failover prompt exceeds budget")
+  );
+}
+
 /** Errors that belong to the proxy/client request itself — retrying is useless. */
 export function isTerminalLocalError(err: unknown): boolean {
   if (!err) return false;
+
+  if (isContextLengthExceededError(err)) return true;
 
   if (isLeaseAuthorityEnabled()) {
     const code = errCode(err).toLowerCase();

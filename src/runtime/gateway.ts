@@ -1,1 +1,120 @@
-﻿export const acquireGenerationAccount = (_: any) => ({ ok: false, errorCode: 'ACCOUNT_COOLDOWN' as const, failureCode: 'not_authorized', accountId: '', lease: { leaseId: '', ownerToken: '', accountId: '', generationId: '', acquiredAt: 0, deadline: 0 } });
+﻿import type { ErrorCode } from "../domain/errors.ts";
+import type { AccountLease } from "../domain/types.ts";
+import type { AcquireFailureCode, IAccountOwnership } from "./contracts.ts";
+
+export interface AcquireGenerationAccountRequest {
+  generationId: string;
+  candidates?: readonly string[];
+  preferredAccountId?: string;
+  triedAccountIds?: ReadonlySet<string>;
+  deadline: number;
+  modelId?: string;
+}
+
+export type GatewayFailureCode = AcquireFailureCode | "not_authorized";
+
+export type AcquireGenerationAccountResult =
+  | {
+      ok: true;
+      accountId: string;
+      lease: AccountLease;
+      errorCode: null;
+      failureCode: null;
+    }
+  | {
+      ok: false;
+      accountId: string;
+      lease: AccountLease;
+      errorCode: ErrorCode;
+      failureCode: GatewayFailureCode;
+    };
+
+const EMPTY_LEASE: AccountLease = {
+  leaseId: "",
+  ownerToken: "",
+  accountId: "",
+  generationId: "",
+  acquiredAt: 0,
+  deadline: 0,
+};
+
+let ownership: IAccountOwnership | null = null;
+
+export function bindGateway(next: IAccountOwnership | null): void {
+  ownership = next;
+}
+
+export function resetGatewayForTests(): void {
+  ownership = null;
+}
+
+function failure(
+  errorCode: ErrorCode,
+  failureCode: GatewayFailureCode,
+): AcquireGenerationAccountResult {
+  return {
+    ok: false,
+    accountId: "",
+    lease: EMPTY_LEASE,
+    errorCode,
+    failureCode,
+  };
+}
+
+function buildCandidates(
+  authority: IAccountOwnership,
+  preferredAccountId: string | undefined,
+  triedAccountIds: ReadonlySet<string> | undefined,
+): string[] {
+  const excluded = triedAccountIds ?? new Set<string>();
+  const candidates = authority
+    .listAccountsByStatus("READY")
+    .filter((accountId) => !excluded.has(accountId));
+  if (preferredAccountId === undefined || excluded.has(preferredAccountId)) {
+    return candidates;
+  }
+  const preferredIndex = candidates.indexOf(preferredAccountId);
+  if (preferredIndex === 0) return candidates;
+  if (preferredIndex > 0) candidates.splice(preferredIndex, 1);
+  candidates.unshift(preferredAccountId);
+  return candidates;
+}
+
+export function acquireGenerationAccount(
+  request: AcquireGenerationAccountRequest,
+): AcquireGenerationAccountResult {
+  const authority = ownership;
+  if (authority === null) {
+    return failure("ACCOUNT_UNAVAILABLE", "not_authorized");
+  }
+  const candidates =
+    request.candidates ??
+    buildCandidates(
+      authority,
+      request.preferredAccountId,
+      request.triedAccountIds,
+    );
+  if (candidates.length === 0) {
+    return failure("ACCOUNT_UNAVAILABLE", "NO_CANDIDATES");
+  }
+  const result = authority.acquire({
+    generationId: request.generationId,
+    candidates,
+    deadline: request.deadline,
+    requirements: {
+      purpose: "generation",
+      modelId: request.modelId,
+      generationId: request.generationId,
+    },
+  });
+  if (result.ok) {
+    return {
+      ok: true,
+      accountId: result.accountId,
+      lease: result.lease,
+      errorCode: null,
+      failureCode: null,
+    };
+  }
+  return failure(result.errorCode, result.failureCode);
+}
