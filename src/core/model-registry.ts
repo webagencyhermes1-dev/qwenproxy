@@ -14,6 +14,7 @@ export const MAX_PAYLOAD_SIZE = 50 * 1024 * 1024;
 export interface ModelCapabilities {
   maxOutputTokens: number;
   maxThinkingTokens: number;
+  maxCotTokens: number;
   supportsThinking: boolean;
   supportsVision: boolean;
   canSkipThinking: boolean;
@@ -41,6 +42,7 @@ type JsonRecord = Record<string, unknown>;
 const defaultCapabilities: ModelCapabilities = {
   maxOutputTokens: defaultMaxOutputTokens,
   maxThinkingTokens: defaultMaxThinkingTokens,
+  maxCotTokens: 262_144,
   supportsThinking: false,
   supportsVision: false,
   canSkipThinking: false,
@@ -338,6 +340,22 @@ function deriveCapabilities(
       upstreamCapabilities.maxGenerationLength,
     ) ?? fallback.maxOutputTokens;
 
+  const maxCotTokens =
+    firstPositiveNumber(
+      model.max_cot_tokens,
+      model.maxCotTokens,
+      model.max_chain_of_thought,
+      model.maxCoT,
+      metadata.max_cot_tokens,
+      metadata.maxCotTokens,
+      metadata.max_chain_of_thought,
+      metadata.maxCoT,
+      upstreamCapabilities.max_cot_tokens,
+      upstreamCapabilities.maxCotTokens,
+      upstreamCapabilities.max_chain_of_thought,
+      upstreamCapabilities.maxCoT,
+    ) ?? fallback.maxCotTokens;
+
   const explicitThinkingTokens = firstPositiveNumber(
     model.max_thinking_tokens,
     model.maxThinkingTokens,
@@ -387,6 +405,7 @@ function deriveCapabilities(
     capabilities: {
       maxOutputTokens,
       maxThinkingTokens,
+      maxCotTokens,
       supportsThinking,
       supportsVision,
       canSkipThinking,
@@ -523,6 +542,28 @@ export function replaceModelMetadata(
 ): void {
   modelRegistryByAccount.delete(accountKey(accountId));
   syncModelMetadata(models, accountId);
+}
+
+/** Get the max input tokens for a model (standard mode). */
+export function getModelMaxInput(modelId: string, accountId?: string): number {
+  const entry = getEntry(modelId, accountId);
+  const raw = entry?.raw as Record<string, unknown>;
+  const val = raw?.max_input ?? raw?.maxInput;
+  return (typeof val === "number" && val > 0) ? val : defaultContextWindow;
+}
+
+/** Get the max input tokens for a model in thinking mode. */
+export function getModelMaxInputThinking(modelId: string, accountId?: string): number {
+  const entry = getEntry(modelId, accountId);
+  const raw = entry?.raw as Record<string, unknown>;
+  const val = raw?.max_input_thinking ?? raw?.maxInputThinking;
+  return (typeof val === "number" && val > 0) ? val : defaultContextWindow;
+}
+
+/** Get the max chain-of-thought tokens for a model. */
+export function getModelMaxCot(modelId: string, accountId?: string): number {
+  const capabilities = getModelCapabilities(modelId, accountId);
+  return capabilities.maxCotTokens;
 }
 
 /** Strip the public Fast suffix from a model ID. */

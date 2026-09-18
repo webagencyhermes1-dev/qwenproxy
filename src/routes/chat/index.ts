@@ -429,26 +429,46 @@ export async function chatCompletions(c: Context) {
             // (string replay already compressed in account.ts; this is the
             // Message-level check + refs for reversibility).
             try {
-              const { assembleCompressedContext, TIERED_DEFAULT_BUDGET } = await import(
-                "../../services/context/tiered.ts"
-              );
-            const { getRollingSummary } = await import(
-              "../../services/context/summary.ts"
-            );
-            const lastMsg = messages[messages.length - 1] ?? {
-              role: "user",
-              content: currentPrompt || prompt,
-            };
-            const compressed = assembleCompressedContext({
-              systemPrompt,
-              tools: Array.isArray((body as unknown as { tools?: [] }).tools)
-                ? ((body as unknown as { tools: [] }).tools as never)
-                : [],
-              messages,
-              currentTurn: lastMsg,
-              rollingSummary: getRollingSummary().get(stickyKey),
-              tokenBudget: TIERED_DEFAULT_BUDGET,
-            });
+               const { assembleCompressedContext, TIERED_DEFAULT_BUDGET } = await import(
+                 "../../services/context/tiered.ts"
+               );
+               const { computeInputContextBudget, CONTEXT_TOKEN_SAFETY_MARGIN } = await import(
+                 "../../utils/context-budget.ts"
+               );
+               const {
+                 getModelContextWindow,
+                 getModelCapabilities,
+                 getModelMaxInput,
+                 getModelMaxInputThinking,
+               } = await import(
+                 "../../core/model-registry.ts"
+               );
+             const { getRollingSummary } = await import(
+               "../../services/context/summary.ts"
+             );
+             const lastMsg = messages[messages.length - 1] ?? {
+               role: "user",
+               content: currentPrompt || prompt,
+             };
+              const contextWindowTokens = getModelContextWindow(modelId);
+              const maxInputTokens = getModelMaxInput(modelId);
+              const maxInputThinkingTokens = getModelMaxInputThinking(modelId);
+              const effectiveBudget = computeInputContextBudget({
+                contextWindowTokens,
+                maxInputTokens,
+                maxInputThinkingTokens,
+                safetyMarginTokens: CONTEXT_TOKEN_SAFETY_MARGIN,
+              });
+             const compressed = assembleCompressedContext({
+               systemPrompt,
+               tools: Array.isArray((body as unknown as { tools?: [] }).tools)
+                 ? ((body as unknown as { tools: [] }).tools as never)
+                 : [],
+               messages,
+               currentTurn: lastMsg,
+               rollingSummary: getRollingSummary().get(stickyKey),
+               tokenBudget: effectiveBudget,
+             });
             console.warn(
               `[Session] Failover compressed | key=${stickyKey} | from=${existing.accountId} | to=${streamResult.activeAccountId} | total=${compressed.totalChars} | t2=${compressed.t2.length} | refs=${Object.keys(compressed.refs).length}`,
             );

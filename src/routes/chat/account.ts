@@ -91,6 +91,14 @@ import {
   renderFailoverPrompt,
   TIERED_DEFAULT_BUDGET,
 } from "../../services/context/tiered.ts";
+import { computeInputContextBudget, CONTEXT_TOKEN_SAFETY_MARGIN } from "../../utils/context-budget.ts";
+import {
+  getModelContextWindow,
+  getModelCapabilities,
+  getModelMaxInput,
+  getModelMaxInputThinking,
+  getModelMaxCot,
+} from "../../core/model-registry.ts";
 import { getRollingSummary } from "../../services/context/summary.ts";
 import { getVectorStore } from "../../services/context/vectorStore.ts";
 import { isPlaywrightInitialized, refreshHeaders } from "../../services/playwright.ts";
@@ -133,10 +141,6 @@ import {
 	toLegacyAccountLease,
 } from "../../runtime/account/instance.ts";
 import { acquireGenerationAccount } from "../../runtime/gateway.ts";
-import {
-	getModelCapabilities,
-	getModelContextWindow,
-} from "../../core/model-registry.ts";
 import {
 	prepareContext,
 	type ModelCapabilitySource,
@@ -591,8 +595,8 @@ async function attemptRelogin(
  * 2M chars): tiered selection (T1 last-3 + T2 BM25 + T3 summary) rendered in
  * the validation segment format, same envelope as the original request
  * (system prefix verbatim when personalization is off; personalization
- * channel otherwise). Budget (TIERED_DEFAULT_BUDGET, 200k chars) enforced —
- * throws instead of full-sending.
+ * channel otherwise). Budget computed from model metadata when available,
+ * falls back to legacy 200k char ceiling for unknown models.
  */
 export function buildCompressedFailoverPrompt(args: {
 	systemPrompt?: string;
@@ -603,6 +607,7 @@ export function buildCompressedFailoverPrompt(args: {
 	stickyKey?: string | null;
 	usePersonalization?: boolean;
 	reason: string;
+	modelId?: string;
 }): string {
 	const messages = args.messages ?? [];
 	const currentTurn =
@@ -611,24 +616,44 @@ export function buildCompressedFailoverPrompt(args: {
 	// System messages are covered by the envelope/personalization — keep them
 	// out of the selection so compression cannot duplicate or drop them.
 	const nonSystem = messages.filter((m) => m.role !== "system");
+	// With personalization, system instructions/tools ride the Qwen account
+	// personalization channel and are NOT rendered into the failover prompt —
+	// they must not consume the conversation compression budget (T0). Without
+	// personalization they prefix the prompt verbatim and keep counting.
+	const usePersonalization = args.usePersonalization ?? false;
+	const modelId = args.modelId ?? "qwen3.8-max";
+	
+	// Compute model-aware budget when metadata is available
+	const contextWindowTokens = getModelContextWindow(modelId);
+	const maxInputTokens = getModelMaxInput(modelId);
+	const maxInputThinkingTokens = getModelMaxInputThinking(modelId);
+	const maxCotTokens = getModelMaxCot(modelId);
+	const effectiveInputBudget = computeInputContextBudget({
+		contextWindowTokens,
+		maxInputTokens,
+		maxInputThinkingTokens,
+		thinkingMode: false,
+		safetyMarginTokens: CONTEXT_TOKEN_SAFETY_MARGIN,
+	});
+
 	const compressed = assembleCompressedContext({
-		systemPrompt: args.systemPrompt ?? "",
-		tools: args.tools ?? [],
+		systemPrompt: usePersonalization ? "" : args.systemPrompt ?? "",
+		tools: usePersonalization ? [] : args.tools ?? [],
 		messages: nonSystem,
 		currentTurn,
 		vectorStore: getVectorStore(),
 		sessionKey: args.stickyKey ?? undefined,
 		rollingSummary: getRollingSummary().get(args.stickyKey ?? ""),
-		tokenBudget: TIERED_DEFAULT_BUDGET,
+		tokenBudget: effectiveInputBudget,
 	});
 	const prompt = renderFailoverPrompt(compressed, {
 		systemPrompt: args.systemPrompt ?? "",
 		toolInstructions: args.toolInstructions ?? "",
 		usePersonalization: args.usePersonalization ?? false,
-		budget: TIERED_DEFAULT_BUDGET,
+		budget: effectiveInputBudget,
 	});
 	console.warn(
-		`[Session] Failover context=compressed | reason=${args.reason} | prompt=${prompt.length}/${TIERED_DEFAULT_BUDGET} | t1=${compressed.t1.length}msgs | t2=${compressed.t2.length}msgs | refs=${Object.keys(compressed.refs).length}`,
+		`[Session] Failover context=compressed | reason=${args.reason} | prompt=${prompt.length}/${effectiveInputBudget} | t1=${compressed.t1.length}msgs | t2=${compressed.t2.length}msgs | refs=${Object.keys(compressed.refs).length}`,
 	);
 	return prompt;
 }
@@ -644,6 +669,9 @@ function registryCapabilitySource(): ModelCapabilitySource {
 		},
 		getMaxOutputTokens(modelId: string): number {
 			return getModelCapabilities(modelId).maxOutputTokens;
+		},
+		getMaxInputTokens(modelId: string): number {
+			return getModelMaxInput(modelId);
 		},
 	};
 }
@@ -865,7 +893,7 @@ export async function acquireUpstreamStream(
 			getAccountOwnership().release({
 				leaseId: claimed.lease.leaseId,
 				ownerToken: claimed.lease.ownerToken,
-				outcome: "abandoned",
+				outcome: "failed",
 				reason: "claimed-account-not-configured",
 			});
 			return {

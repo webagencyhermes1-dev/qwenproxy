@@ -21,12 +21,19 @@
  *   (T0/T2/T3 alone overflow), where the caller must error, never full-send.
  */
 
+import { ContextLengthExceededError } from "../../core/errors.ts";
 import type { Message } from "../../utils/types.ts";
 import type { FunctionToolDefinition } from "../../tools/types.ts";
 import { TOOL_CALL_OPEN, TOOL_CALL_CLOSE } from "../../tools/toolcall-tags.ts";
+import { estimateTokenCount } from "../../utils/context-truncation.ts";
 import { tokenize } from "../context-compressor.ts";
-import type { VectorStore } from "./vectorStore.ts";
+import { type VectorStore } from "./vectorStore.ts";
 
+/**
+ * Legacy fallback for callers without model metadata.
+ * This represents ~200K chars as a conservative char-based budget
+ * for pre-token-aware paths. Model-aware callers MUST compute their own budget.
+ */
 export const TIERED_DEFAULT_BUDGET = 200_000;
 const T1_EXCHANGES = 3;
 
@@ -40,7 +47,8 @@ export interface ContextInput {
   vectorStore?: VectorStore;
   sessionKey?: string;
   rollingSummary: string;
-  tokenBudget?: number;
+  tokenBudget: number;
+  usePersonalization?: boolean;
 }
 
 export interface CompressedContext {
@@ -52,6 +60,7 @@ export interface CompressedContext {
   /** Serialized failover payload (t0+t3+t2+t1 joined). Never exceeds budget. */
   payload: string;
   totalChars: number;
+  estimatedTokens: number;
 }
 
 function textOf(m: Message): string {
@@ -151,9 +160,6 @@ function groupExchanges(messages: Message[]): Message[][] {
   };
   for (const m of messages) {
     if (m.role === "user" && current.length > 0) {
-      // Start a new exchange, but don't split a pending tool pair:
-      // tool responses belong to the assistant call that precedes them,
-      // which is already inside `current`.
       flush();
     }
     current.push(m);
@@ -199,15 +205,6 @@ function bm25RankIndices(query: string, docs: string[], max: number): number[] {
 const TRIM_NOTICE =
   "\n\n[Context truncated: this message was too large to fit the context budget and was cut to its most recent content.]\n\n";
 
-/**
- * Last-resort guard for a single message so large that selection alone cannot
- * shrink it below budget (a 2M-char paste IS the current turn — it can't be
- * dropped or paired away). Binary-searches the content length so the
- * serialized selection fits, keeping a truncated-notice tail so the turn is
- * still served. Returns null when even an empty message cannot fit (T0/T2/T3
- * alone overflow) — the caller must then error rather than full-send.
- * A small join reserve absorbs the "\n\n" separators in the assembled payload.
- */
 const JOIN_RESERVE = 128;
 
 function trimLastMessageToFit(
@@ -220,8 +217,9 @@ function trimLastMessageToFit(
   if (t1.length === 0) return null;
   const lastIdx = t1.length - 1;
   const last = t1[lastIdx];
-  if (typeof last.content !== "string") return null;
   if (last.role !== "user" && last.role !== "assistant") return null;
+  const originalText =
+    typeof last.content === "string" ? last.content : textOf(last);
   const budgetLimit = Math.max(1, budget - JOIN_RESERVE);
   const baseChars = t0Len + charsOf(t2) + t3.length;
   const fits = (content: string): boolean => {
@@ -230,10 +228,10 @@ function trimLastMessageToFit(
   };
   if (!fits(TRIM_NOTICE)) return null;
   let lo = 0;
-  let hi = last.content.length;
+  let hi = originalText.length;
   while (lo < hi) {
     const mid = Math.ceil((lo + hi) / 2);
-    if (fits((last.content as string).slice(0, mid) + TRIM_NOTICE)) {
+    if (fits(originalText.slice(0, mid) + TRIM_NOTICE)) {
       lo = mid;
     } else {
       hi = mid - 1;
@@ -241,14 +239,13 @@ function trimLastMessageToFit(
   }
   t1[lastIdx] = {
     ...last,
-    content: (last.content as string).slice(0, lo) + TRIM_NOTICE,
+    content: originalText.slice(0, lo) + TRIM_NOTICE,
   } as Message;
   return t1;
 }
 
 export function assembleCompressedContext(input: ContextInput): CompressedContext {
   const budget = input.tokenBudget ?? TIERED_DEFAULT_BUDGET;
-  // T0 byte-identical: verbatim systemPrompt + verbatim tools JSON (no trim).
   const t0 =
     input.tools.length > 0
       ? `${input.systemPrompt}\n\n${JSON.stringify(input.tools)}`
@@ -261,12 +258,9 @@ export function assembleCompressedContext(input: ContextInput): CompressedContex
   const olderGroups = groups.slice(0, Math.max(0, groups.length - T1_EXCHANGES));
   const olderFlat = olderGroups.flat();
 
-  // T2: BM25 over older messages scored against currentTurn text.
   const queryText = textOf(input.currentTurn);
   const olderTexts = olderFlat.map((m) => `${m.role}: ${textOf(m)}`);
-  // K grows until budget filled: start with up to 8, budget enforcement trims.
   const topIdx = bm25RankIndices(queryText, olderTexts, 8);
-  // Score-descending for trimming, then chronological for coherence.
   const topByScore = [...topIdx];
   let t2: Message[] = topByScore
     .sort((a, b) => a - b)
@@ -276,30 +270,24 @@ export function assembleCompressedContext(input: ContextInput): CompressedContex
   const totalOf = (t1list: Message[], t2list: Message[], t3str: string): number =>
     t0.length + charsOf(t1list) + charsOf(t2list) + t3str.length;
 
-  // Budget: drop lowest-scoring T2 first.
   let curT3 = t3;
-  // Keep score order for trimming (lowest = end of topByScore desc? bm25Rank
-  // returns desc, so lowest is last).
   const t2ByScoreDesc: Message[] = topByScore.map((i) => olderFlat[i]).filter(Boolean);
   let t2ByScore = [...t2ByScoreDesc];
   while (t2ByScore.length > 0 && totalOf(t1, t2ByScore, curT3) > budget) {
-    t2ByScore.pop(); // drop lowest-scoring
+    t2ByScore.pop();
   }
-  // Chronological for payload.
   const order = new Map<Message, number>();
   olderFlat.forEach((m, i) => {
     if (!order.has(m)) order.set(m, i);
   });
   t2 = [...t2ByScore].sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));
 
-  // Still over: drop oldest T1 groups (whole groups keep tool pairs intact).
   let t1work = [...t1Groups];
   while (t1work.length > 1 && totalOf(t1work.flat(), t2, curT3) > budget) {
     t1work.shift();
   }
   t1 = t1work.flat();
 
-  // Still over: truncate T3.
   if (totalOf(t1, t2, curT3) > budget && curT3.length > 0) {
     const over = totalOf(t1, t2, curT3) - budget;
     curT3 = curT3.slice(0, Math.max(0, curT3.length - over));
@@ -307,9 +295,6 @@ export function assembleCompressedContext(input: ContextInput): CompressedContex
 
   let total = totalOf(t1, t2, curT3);
   if (total > budget) {
-    // Last resort: a single message so large it survives selection and alone
-    // still exceeds the budget (a 2M-char paste that is the current turn).
-    // Never refuse to serve it — trim the tail with a truncation notice.
     const trimmed = trimLastMessageToFit(t1, t2, curT3, budget, t0.length);
     if (trimmed !== null) {
       t1 = trimmed;
@@ -318,13 +303,12 @@ export function assembleCompressedContext(input: ContextInput): CompressedContex
         `[Session] Context last-resort trimmed | t1=${t1.length}msgs | t2=${t2.length}msgs | t3=${curT3.length} | total=${total}/${budget}`,
       );
     } else {
-      throw new Error(
+      throw new ContextLengthExceededError(
         `Compressed context still exceeds budget (${total} > ${budget}); refusing to send full context`,
       );
     }
   }
 
-  // Refs for every retained non-T0 message.
   const refs: RefMap = {};
   let n = 0;
   for (const m of [...t2, ...t1]) {
@@ -337,57 +321,35 @@ export function assembleCompressedContext(input: ContextInput): CompressedContex
     .join("\n\n");
 
   if (payload.length > budget) {
-    throw new Error(
+    throw new ContextLengthExceededError(
       `Serialized payload exceeds budget (${payload.length} > ${budget}); refusing full context`,
     );
   }
 
+  const usePersonalization = input.usePersonalization ?? false;
+  const systemTokens = usePersonalization ? 0 : estimateTokenCount(input.systemPrompt);
+  const estimatedTokens = systemTokens + estimateTokenCount(t3, payload);
+
   console.log(
-    `[Session] Context compressed | t0=${t0.length} | t1=${t1.length}msgs | t2=${t2.length}msgs | t3=${curT3.length} | total=${total}/${budget}`,
+    `[Session] Context compressed | t0=${t0.length} | t1=${t1.length}msgs | t2=${t2.length}msgs | t3=${curT3.length} | total=${total}/${budget} | estTokens=${estimatedTokens}`,
   );
 
-  return { t0, t1, t2, t3: curT3, refs, payload, totalChars: total };
+  return { t0, t1, t2, t3: curT3, refs, payload, totalChars: total, estimatedTokens };
 }
 
 export interface FailoverPromptInput extends ContextInput {
-  /** Verbatim tool-instruction text (prompt envelope, no-personalization mode). */
   toolInstructions: string;
-  /**
-   * True when agent instructions ride the account-level personalization channel
-   * (re-synced on the new account before the completion). Then system/tools
-   * stay out of the prompt; otherwise they prefix it verbatim.
-   */
   usePersonalization: boolean;
 }
 
 export interface FailoverPromptResult {
-  /** Upstream-ready prompt string in validation segment format. Never > budget. */
   prompt: string;
   compressed: CompressedContext;
 }
 
-/**
- * THE real failover path: tiered Message-level selection rendered into the
- * same envelope the original full prompt used, so the upstream renderer sees
- * a familiar shape at a fraction of the chars.
- *
- * - Personalization mode: `[T3 section, T2+T1 rendered]` (system rides the
- *   re-synced personalization channel, byte-identical instruction string).
- * - No-personalization mode: `[systemPrompt, toolInstructions, T3, rendered]`
- *   with the system prefix verbatim (T0 byte-identical).
- * - Tool call/result pairs survive via whole-group selection + faithful tags.
- * - Over budget after selection → throw (caller must error, never full-send).
- */
 export function buildFailoverPrompt(input: FailoverPromptInput): FailoverPromptResult {
   const budget = input.tokenBudget ?? TIERED_DEFAULT_BUDGET;
-  // System messages are covered by the envelope/personalization — keep them
-  // out of the selection so compression cannot duplicate or drop them.
   const nonSystem = input.messages.filter((m) => m.role !== "system");
-  // Rendering re-emits segment prefixes ("User: ", "Assistant: ", re-serialized
-  // tool-call tags) that the JSON serialization inside assemble does not count,
-  // and in no-personalization mode toolInstructions rides only the envelope.
-  // Shrink the assembly budget by that overhead so the downstream render check
-  // passes with the same 200k ceiling instead of throwing on the envelope.
   const RENDER_OVERHEAD_RESERVE = 4_096;
   const assemblyBudget = Math.max(
     1,
@@ -407,11 +369,6 @@ export function buildFailoverPrompt(input: FailoverPromptInput): FailoverPromptR
   return { prompt, compressed };
 }
 
-/**
- * Render a tiered selection into the upstream-ready prompt string.
- * Split out so live failover paths can select (assembleCompressedContext)
- * and render as explicit steps with refs retained for re-injection.
- */
 export function renderFailoverPrompt(
   compressed: CompressedContext,
   opts: {
@@ -429,9 +386,10 @@ export function renderFailoverPrompt(
     : [opts.systemPrompt, opts.toolInstructions, t3section, rendered];
   const prompt = parts.filter((p) => p.trim().length > 0).join("\n\n");
   if (prompt.length > budget) {
-    throw new Error(
+    throw new ContextLengthExceededError(
       `Failover prompt exceeds budget (${prompt.length} > ${budget}); refusing to send full context`,
     );
   }
   return prompt;
 }
+
