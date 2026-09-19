@@ -1,9 +1,8 @@
 import { AuthError } from "../core/errors.ts";
-import { getAccountCredentials, loadAccounts } from "../core/accounts.ts";
-import { config } from "../core/config.ts";
+import { loadAccounts } from "../core/accounts.ts";
+import { getHeadersReadyAccountIds } from "../core/account-manager.ts";
 import {
   getBasicHeaders as getPlaywrightBasicHeaders,
-  initPlaywrightForAccount,
   isPlaywrightInitialized,
   refreshHeaders,
 } from "./playwright.ts";
@@ -37,29 +36,9 @@ async function ensurePlaywrightInitialized(accountId: string): Promise<void> {
     throw new Error(`Playwright not initialized for account: ${accountId}`);
   }
 
-  const credentials = getAccountCredentials(accountId);
-  if (!credentials) {
-    throw new AuthError(`Qwen account ${accountId} is not configured.`);
-  }
-
-  await initPlaywrightForAccount(
-    credentials,
-    config.playwright.headless,
-    config.playwright.browser,
+  throw new AuthError(
+    `Account ${accountId} is not warmed. The pool controller will prepare it in the background.`,
   );
-
-  // Standby accounts are initialized lazily. Apply the same account-level
-  // settings that startup preparation would apply.
-  try {
-    const { disableNativeTools } = await import("./qwen.ts");
-    await disableNativeTools(accountId).catch(() => {});
-  } catch {
-    // Non-fatal: chat creation will still work with default account settings.
-  }
-
-  void import("../core/readiness-guard.ts")
-    .then((m) => m.triggerReadinessCheck("lazy-init-complete"))
-    .catch(() => {});
 }
 
 export async function getBasicHeaders(accountId?: string): Promise<{
@@ -87,7 +66,8 @@ export async function getBasicHeaders(accountId?: string): Promise<{
     };
   }
 
-  const resolvedAccountId = accountId ?? loadAccounts()[0]?.id;
+  const resolvedAccountId =
+    accountId ?? getHeadersReadyAccountIds()[0] ?? loadAccounts()[0]?.id;
   if (!resolvedAccountId) {
     throw new AuthError(
       "No Qwen accounts configured. Add accounts with npm run login.",
@@ -145,7 +125,8 @@ export async function getQwenHeaders(
     };
   }
 
-  const resolvedAccountId = accountId ?? loadAccounts()[0]?.id;
+  const resolvedAccountId =
+    accountId ?? getHeadersReadyAccountIds()[0] ?? loadAccounts()[0]?.id;
   if (!resolvedAccountId) {
     throw new AuthError(
       "No Qwen accounts configured. Add accounts with npm run login.",

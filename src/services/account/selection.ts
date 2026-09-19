@@ -5,7 +5,10 @@
  * sorts by (score * headroom) desc, tie-broken by least-recently-used.
  */
 
-import { getAccountCooldownInfo } from "../../core/account-manager.ts";
+import {
+  getAccountCooldownInfo,
+  isAccountHeadersReady,
+} from "../../core/account-manager.ts";
 import { isAccountBusy, isAccountTemporarilyBusy } from "../../core/account-concurrency.ts";
 import { logger } from "../../core/logger.ts";
 import type { HealthTracker } from "./health.ts";
@@ -95,6 +98,10 @@ export function selectAccountForNewSession(ctx: SelectionContext): string | null
 
   for (const id of ctx.availableAccounts) {
     if (excluded.has(id)) continue;
+    // NORMAL REQUESTS MAY ONLY EXECUTE ON HOT ACCOUNTS. The advisory new-session
+    // selection must never propose a WARM/COLD account; the caller would pin to
+    // it and then discover readiness failure after lease acquisition.
+    if (!isAccountHeadersReady(id)) continue;
     if (getAccountCooldownInfo(id)) continue;
     if (ctx.healthTracker.isQuotaExhausted(id)) continue;
     const score = ctx.healthTracker.score(id);

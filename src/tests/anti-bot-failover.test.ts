@@ -16,6 +16,8 @@ import {
   clearAccountCooldown,
   getAccountCooldownInfo,
   getNextAvailableAccount,
+  markAccountHeadersReady,
+  unmarkAccountHeadersReady,
 } from "../core/account-manager.ts";
 import { getDatabase } from "../core/database.ts";
 import { invalidateAccountsCache } from "../core/accounts.ts";
@@ -76,6 +78,7 @@ function withFreshAccounts(
         clearAccountCooldown(row.id);
         clearWafIsolation(row.id);
         noteWafRecovery(row.id);
+        markAccountHeadersReady(row.id);
       }
       await fn();
     } finally {

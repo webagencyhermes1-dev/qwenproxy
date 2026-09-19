@@ -8,6 +8,10 @@ import { generateStickyKey } from "../services/session/key.ts";
 import { HealthTracker } from "../services/account/health.ts";
 import { selectAccountForNewSession } from "../services/account/selection.ts";
 import { assembleCompressedContext } from "../services/context/tiered.ts";
+import {
+  markAccountHeadersReady,
+  unmarkAccountHeadersReady,
+} from "../core/account-manager.ts";
 import type { Message } from "../utils/types.ts";
 
 function buildBigConversation(exchanges: number): Message[] {
@@ -24,6 +28,8 @@ test("rebind: quota exhaust triggers rebind with compressed context, stays", () 
   sticky.clearForTests();
   const health = new HealthTracker();
   try {
+    markAccountHeadersReady("acc-a");
+    markAccountHeadersReady("acc-b");
     // Turn 1: new session binds.
     const key = generateStickyKey({
       messages: [{ role: "user", content: "session A task: refactor auth" } as Message],
@@ -92,6 +98,8 @@ test("rebind: quota exhaust triggers rebind with compressed context, stays", () 
       sticky.touch(key);
     }
   } finally {
+    unmarkAccountHeadersReady("acc-a");
+    unmarkAccountHeadersReady("acc-b");
     sticky.clearForTests();
   }
 });

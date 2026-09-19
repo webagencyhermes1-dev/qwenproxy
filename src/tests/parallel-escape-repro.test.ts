@@ -13,7 +13,7 @@ import {
 import { resolveInitialAccount } from "../routes/chat/account.ts";
 import { invalidateAccountsCache } from "../core/accounts.ts";
 import { getDatabase } from "../core/database.ts";
-import { clearAccountCooldown } from "../core/account-manager.ts";
+import { clearAccountCooldown, markAccountHeadersReady } from "../core/account-manager.ts";
 
 // Repro of the 2026-08-20 02:43:41 incident (req=0869d768): a parallel-escape
 // request tried the STICKY account first (ldyjl) which was busy with the main
@@ -74,6 +74,8 @@ test("ParallelEscape fix: failover selection excludes the STICKY busy account", 
   ],
   () => {
     resetAccountConcurrencyForTests();
+    markAccountHeadersReady("ldyjl");
+    markAccountHeadersReady("free-alt");
 
     // Main non-stream holds the sticky account slot (maxStreamsPerAccount=1).
     const main = acquireAccountLease("ldyjl", { label: "sess-main" });
@@ -83,12 +85,12 @@ test("ParallelEscape fix: failover selection excludes the STICKY busy account", 
     // must return the FREE account — never the sticky that the main uses.
     const resolved = resolveInitialAccount(null, ["ldyjl"]);
     assert.notStrictEqual(
-      resolved.account.id,
+      resolved.account!.id,
       "ldyjl",
       "parallel escape must not select the sticky owner it is racing",
     );
     assert.strictEqual(
-      resolved.account.id,
+      resolved.account!.id,
       "free-alt",
       "must select the free alternate account",
     );

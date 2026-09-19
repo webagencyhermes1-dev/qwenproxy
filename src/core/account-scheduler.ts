@@ -40,6 +40,15 @@ export interface SchedulerOptions {
   preferredAccountId?: string | null;
   /** True when no other eligible account exists (last-usable stays lossless). */
   allowSaturatedFallback?: boolean;
+  /**
+   * Normal-request invariant: ONLY headers-ready (HOT) accounts are eligible.
+   * No degradation to the full eligible pool when no ready account is
+   * unsaturated, and a pinned/sticky account is returned only when it is
+   * itself ready. Returns an empty ranking when zero HOT accounts exist so
+   * the caller surfaces a bounded capacity error instead of executing on a
+   * WARM/COLD account.
+   */
+  strictHeadersReady?: boolean;
 }
 
 /**
@@ -65,6 +74,27 @@ export function rankSchedulerCandidates(
   });
 
   if (eligible.length === 0) return [];
+
+  // NORMAL REQUESTS MAY ONLY EXECUTE ON HOT ACCOUNTS. Enforce the
+  // headers-ready gate BEFORE any pin/sticky handling so a non-HOT
+  // preferred or sticky account is never returned — the caller must
+  // immediately rotate to a HOT account instead of discovering readiness
+  // failure after lease acquisition.
+  if (options.strictHeadersReady) {
+    const hotPool = eligible.filter((c) => c.headersReady);
+    if (hotPool.length === 0) return [];
+    const pin =
+      options.preferredAccountId ?? options.stickyAccountId ?? undefined;
+    if (pin) {
+      const pinned = hotPool.find((c) => c.account.id === pin);
+      if (pinned) {
+        return [pinned, ...hotPool.filter((c) => c.account.id !== pin)];
+      }
+    }
+    const unsaturatedHot = hotPool.filter((c) => !c.saturated);
+    const selectable = unsaturatedHot.length > 0 ? unsaturatedHot : hotPool;
+    return rankByScore(selectable);
+  }
 
   // Sticky / explicit pin wins whenever eligible (conversation correctness).
   const pin =
@@ -96,6 +126,10 @@ export function rankSchedulerCandidates(
   // Health band (±10) + load-aware spread + TTFB/429 penalty:
   // score = healthScore * ttfbFactor * (1 - recent429Rate)
   // Sort by composite score desc, then utilization asc, then priority order.
+  return rankByScore(selectable);
+}
+
+function rankByScore(selectable: SchedulerCandidate[]): SchedulerCandidate[] {
   return [...selectable].sort((a, b) => {
     const scoreA = a.health.healthScore * getTtfbFactor(a.account.id) * (1 - getRecent429Rate(a.account.id));
     const scoreB = b.health.healthScore * getTtfbFactor(b.account.id) * (1 - getRecent429Rate(b.account.id));

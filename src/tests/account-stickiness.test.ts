@@ -16,7 +16,9 @@ delete process.env.API_KEY;
 
 import {
 	clearAccountCooldown,
+	markAccountHeadersReady,
 	markAccountRateLimited,
+	unmarkAccountHeadersReady,
 } from "../core/account-manager.ts";
 import { invalidateAccountsCache } from "../core/accounts.ts";
 import { getDatabase } from "../core/database.ts";
@@ -109,16 +111,19 @@ test(
 			{ id: "acc-c", email: "c@test.com", password: "p" },
 		],
 		() => {
+			markAccountHeadersReady("acc-a");
+			markAccountHeadersReady("acc-b");
+			markAccountHeadersReady("acc-c");
 			const first = resolveInitialAccount("acc-b");
-			assert.equal(first.account.id, "acc-b");
+			assert.equal(first.account!.id, "acc-b");
 
 			// Calling again with same sticky preference must stay on same account
 			const second = resolveInitialAccount("acc-b");
-			assert.equal(second.account.id, "acc-b");
+			assert.equal(second.account!.id, "acc-b");
 
 			// undefined preferred falls through to round-robin, not forced switch away
 			const rr1 = resolveInitialAccount(undefined);
-			assert.ok(rr1.account.id);
+			assert.ok(rr1.account!.id);
 		},
 	),
 );
@@ -132,11 +137,14 @@ test(
 			{ id: "acc-c", email: "c@test.com", password: "p" },
 		],
 		() => {
+			markAccountHeadersReady("acc-a");
+			markAccountHeadersReady("acc-b");
+			markAccountHeadersReady("acc-c");
 			const rotated = resolveInitialAccount(null, ["acc-a"]);
-			assert.notEqual(rotated.account.id, "acc-a");
+			assert.notEqual(rotated.account!.id, "acc-a");
 
 			const rotatedSticky = resolveInitialAccount(null, ["acc-b"]);
-			assert.notEqual(rotatedSticky.account.id, "acc-b");
+			assert.notEqual(rotatedSticky.account!.id, "acc-b");
 		},
 	),
 );
@@ -149,9 +157,11 @@ test(
 			{ id: "acc-b", email: "b@test.com", password: "p" },
 		],
 		() => {
+			markAccountHeadersReady("acc-a");
+			markAccountHeadersReady("acc-b");
 			markAccountRateLimited("acc-a", 60_000, "RateLimited");
 			const next = resolveInitialAccount("acc-a");
-			assert.equal(next.account.id, "acc-b");
+			assert.equal(next.account!.id, "acc-b");
 		},
 	),
 );

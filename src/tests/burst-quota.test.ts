@@ -7,12 +7,18 @@ import { StickyMap, STICKY_TTL_MS } from "../services/session/stickyMap.ts";
 import { generateStickyKey } from "../services/session/key.ts";
 import { HealthTracker } from "../services/account/health.ts";
 import { selectAccountForNewSession } from "../services/account/selection.ts";
+import {
+  markAccountHeadersReady,
+  unmarkAccountHeadersReady,
+} from "../core/account-manager.ts";
 
 test("burst 429 does not rebind; quota 429 does", () => {
   const sticky = new StickyMap({ autoSweep: false });
   sticky.clearForTests();
   const health = new HealthTracker();
   try {
+    markAccountHeadersReady("acc-a");
+    markAccountHeadersReady("acc-b");
     const key = generateStickyKey({
       messages: [{ role: "user", content: "burst test session" } as never],
     });

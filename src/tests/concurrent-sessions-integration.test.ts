@@ -12,6 +12,10 @@ import {
   clearSelectionClaimsForTests,
 } from "../services/account/selection.ts";
 import { resetAccountConcurrencyForTests } from "../core/account-concurrency.ts";
+import {
+  markAccountHeadersReady,
+  unmarkAccountHeadersReady,
+} from "../core/account-manager.ts";
 import type { Message } from "../utils/types.ts";
 
 const ACCOUNTS = ["acc-a", "acc-b", "acc-c"];
@@ -34,6 +38,7 @@ test("concurrent sessions: first turns racing an idle pool bind to different acc
   clearSelectionClaimsForTests();
   try {
     for (const acc of ACCOUNTS) {
+      markAccountHeadersReady(acc);
       for (let i = 0; i < 3; i++) health.recordSuccess(acc, 700);
     }
 
@@ -107,6 +112,7 @@ test("concurrent sessions: first turns racing an idle pool bind to different acc
       "session C must not pile on the single-loaded account either",
     );
   } finally {
+    for (const acc of ACCOUNTS) unmarkAccountHeadersReady(acc);
     sticky.clearForTests();
     resetAccountConcurrencyForTests();
     clearSelectionClaimsForTests();

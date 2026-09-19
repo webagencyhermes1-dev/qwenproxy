@@ -359,6 +359,104 @@ export function getNextAvailableAccount(
   return shortestCooldownFallback(getAccountsByPriority(accounts), triedSet);
 }
 
+// ─── HOT-only selection boundary (normal request path) ──────────────────────
+// Invariant: NORMAL REQUESTS MAY ONLY EXECUTE ON HOT ACCOUNTS. A HOT account
+// has its anti-bot headers captured (headers-ready set). WARM (warming in
+// progress) and COLD (uninitialized) accounts must be rejected HERE, at the
+// selection boundary — never discovered as a readiness failure after the
+// lease was claimed. These pickers therefore never degrade to a non-HOT
+// account and never fall back to a cooldown/first-configured account; they
+// return null when zero HOT accounts exist so the caller emits one bounded
+// retryable capacity error and lets the pool readiness controller warm a
+// replacement.
+
+/** HOT = headers captured and usable for a normal request. */
+export function isAccountHot(accountId: string): boolean {
+  return isAccountHeadersReady(accountId);
+}
+
+/** WARM = the pool controller is currently warming this account. */
+export function isAccountWarming(accountId: string): boolean {
+  return getWarmingAccountIds().includes(accountId);
+}
+
+/** Count of HOT accounts among the configured (non-disabled) pool. */
+export function getHotAccountCount(): number {
+  return loadAccounts().filter((a) => isAccountHeadersReady(a.id)).length;
+}
+
+/**
+ * HOT-only rotation picker for the normal request path. Same ranking/cursor
+ * semantics as getNextAvailableAccount, but accounts that are not
+ * headers-ready are NEVER returned — no saturated-ready degradation, no
+ * shortest-cooldown fallback. Returns null when zero HOT accounts are
+ * eligible.
+ */
+export function getNextHotAccount(
+  triedAccountIds?: Set<string> | string,
+): QwenAccount | null {
+  const accounts = loadAccounts();
+  if (accounts.length === 0) return null;
+
+  syncCooldownsFromDb(accounts);
+
+  let triedSet: Set<string>;
+  if (triedAccountIds instanceof Set) {
+    triedSet = triedAccountIds;
+  } else {
+    triedSet = new Set(triedAccountIds ? [triedAccountIds] : []);
+  }
+
+  const candidates = buildSchedulerCandidates(accounts);
+  const ranked = rankSchedulerCandidates(candidates, {
+    triedAccountIds: triedSet,
+    allowSaturatedFallback: true,
+    strictHeadersReady: true,
+  });
+  if (ranked.length === 0) return null;
+  const span = Math.max(1, candidates.length);
+  const picked =
+    pickSchedulerCandidate(ranked, currentIndex, span) ?? ranked[0];
+  currentIndex = (picked.priorityIndex + 1) % span;
+  return picked.account;
+}
+
+// Request-path invariant counters. Normal chat requests must never
+// cold-init, warm-init, or EXECUTE on a non-HOT account. The selection
+// boundary enforces this; these counters make violations observable and
+// regression-testable (all three must stay 0).
+const requestPathInvariantCounters = {
+  requestPathColdInitCount: 0,
+  requestPathWarmInitCount: 0,
+  requestPathNotHotExecutionCount: 0,
+};
+
+export function getRequestPathInvariantCounters(): {
+  requestPathColdInitCount: number;
+  requestPathWarmInitCount: number;
+  requestPathNotHotExecutionCount: number;
+} {
+  return { ...requestPathInvariantCounters };
+}
+
+export function noteRequestPathColdInit(): void {
+  requestPathInvariantCounters.requestPathColdInitCount += 1;
+}
+
+export function noteRequestPathWarmInit(): void {
+  requestPathInvariantCounters.requestPathWarmInitCount += 1;
+}
+
+export function noteRequestPathNotHotExecution(): void {
+  requestPathInvariantCounters.requestPathNotHotExecutionCount += 1;
+}
+
+export function resetRequestPathInvariantCountersForTests(): void {
+  requestPathInvariantCounters.requestPathColdInitCount = 0;
+  requestPathInvariantCounters.requestPathWarmInitCount = 0;
+  requestPathInvariantCounters.requestPathNotHotExecutionCount = 0;
+}
+
 /** Derive the display lifecycle state for one account (no I/O beyond caches). */
 export function getAccountStateSnapshot(accountId: string): AccountState {
   const accounts = loadAccounts();

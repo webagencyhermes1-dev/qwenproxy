@@ -6,6 +6,10 @@ process.env.TEST_MOCK_QWEN_AUTH = "true";
 import { StickyMap } from "../services/session/stickyMap.ts";
 import { HealthTracker } from "../services/account/health.ts";
 import { selectAccountForNewSession } from "../services/account/selection.ts";
+import {
+  markAccountHeadersReady,
+  unmarkAccountHeadersReady,
+} from "../core/account-manager.ts";
 
 function setup(): { sticky: StickyMap; health: HealthTracker } {
   const sticky = new StickyMap({ autoSweep: false });
@@ -17,6 +21,8 @@ function setup(): { sticky: StickyMap; health: HealthTracker } {
 test("selection: highest-scoring account selected", () => {
   const { sticky, health } = setup();
   try {
+    markAccountHeadersReady("acc-good");
+    markAccountHeadersReady("acc-mid");
     for (let i = 0; i < 5; i++) {
       health.recordSuccess("acc-good", 500);
       health.recordSuccess("acc-mid", 4000);
@@ -32,6 +38,8 @@ test("selection: highest-scoring account selected", () => {
     });
     assert.equal(picked, "acc-good");
   } finally {
+    unmarkAccountHeadersReady("acc-good");
+    unmarkAccountHeadersReady("acc-mid");
     sticky.clearForTests();
   }
 });
@@ -39,6 +47,8 @@ test("selection: highest-scoring account selected", () => {
 test("selection: quota-exhausted accounts skipped", () => {
   const { sticky, health } = setup();
   try {
+    markAccountHeadersReady("acc-a");
+    markAccountHeadersReady("acc-b");
     for (let i = 0; i < 3; i++) health.recordSuccess("acc-a", 500);
     for (let i = 0; i < 3; i++) health.recordSuccess("acc-b", 500);
     for (let i = 0; i < 5; i++) health.record429("acc-a", "quota", 3600_000);
@@ -49,6 +59,8 @@ test("selection: quota-exhausted accounts skipped", () => {
     });
     assert.equal(picked, "acc-b");
   } finally {
+    unmarkAccountHeadersReady("acc-a");
+    unmarkAccountHeadersReady("acc-b");
     sticky.clearForTests();
   }
 });
@@ -56,6 +68,8 @@ test("selection: quota-exhausted accounts skipped", () => {
 test("selection: exclusion list honored", () => {
   const { sticky, health } = setup();
   try {
+    markAccountHeadersReady("acc-a");
+    markAccountHeadersReady("acc-b");
     for (let i = 0; i < 3; i++) {
       health.recordSuccess("acc-a", 500);
       health.recordSuccess("acc-b", 500);
@@ -68,6 +82,8 @@ test("selection: exclusion list honored", () => {
     });
     assert.equal(picked, null);
   } finally {
+    unmarkAccountHeadersReady("acc-a");
+    unmarkAccountHeadersReady("acc-b");
     sticky.clearForTests();
   }
 });
@@ -89,6 +105,8 @@ test("selection: empty pool returns null", () => {
 test("selection: deterministic tiebreak (LRU then id)", () => {
   const { sticky, health } = setup();
   try {
+    markAccountHeadersReady("acc-a");
+    markAccountHeadersReady("acc-b");
     // No history: both score 1.0, lastUsed 0 -> lexicographic.
     const picked = selectAccountForNewSession({
       stickyMap: sticky,
@@ -97,6 +115,8 @@ test("selection: deterministic tiebreak (LRU then id)", () => {
     });
     assert.equal(picked, "acc-a");
   } finally {
+    unmarkAccountHeadersReady("acc-a");
+    unmarkAccountHeadersReady("acc-b");
     sticky.clearForTests();
   }
 });

@@ -1,9 +1,10 @@
 import { v4 as uuidv4 } from "uuid";
 import {
 	getAccountCooldownInfo,
-	getNextAccount,
-	getNextAvailableAccount,
+	getNextHotAccount,
+	isAccountHeadersReady,
 	markAccountRateLimited,
+	noteRequestPathNotHotExecution,
 	syncCooldownsFromDb,
 } from "../../core/account-manager.ts";
 import { markAccountSuccessful, markAccountFailed, getAccountsByPriority } from "../../core/account-priority.ts";
@@ -451,12 +452,22 @@ export interface AcquireParams {
 	  retryContext?: RequestRetryContext;
 	}
 
-/** Exported for unit tests — selects the first account for a request. */
+/**
+ * Exported for unit tests — selects the first account for a request.
+ *
+ * NORMAL REQUESTS MAY ONLY EXECUTE ON HOT ACCOUNTS. Every branch enforces the
+ * headers-ready gate BEFORE returning: a WARM/COLD preferred/sticky account is
+ * never returned (it is excluded and a HOT account is picked immediately), and
+ * when ZERO HOT accounts exist this returns `account: null` — the caller
+ * surfaces a single bounded retryable capacity error instead of falling back
+ * to `configuredAccounts[0]` (which used to execute on a cold account and
+ * surface "Account <id> is not warmed" to the client).
+ */
 export function resolveInitialAccount(
   preferredAccountId?: string | null,
   excludeAccountIds?: Iterable<string>,
 ): {
-  account: SelectedAccount;
+  account: SelectedAccount | null;
   configuredAccounts: SelectedAccount[];
 } {
 	if (isAuthMockEnabled()) {
@@ -471,35 +482,61 @@ export function resolveInitialAccount(
 		syncCooldownsFromDb(configuredAccounts);
 		const excluded = new Set(excludeAccountIds ?? []);
 
-		// Explicit preferred account (sticky / same-account retry)
+		// Explicit preferred account (sticky / same-account retry) — honored
+		// ONLY when HOT. A non-HOT preferred account is rejected at the
+		// selection boundary and rotated away from immediately.
 		if (typeof preferredAccountId === "string" && preferredAccountId) {
 			const preferred = configuredAccounts.find(
 				(candidate) => candidate.id === preferredAccountId,
 			);
-			if (preferred && !getAccountCooldownInfo(preferred.id)) {
+			if (
+				preferred &&
+				!getAccountCooldownInfo(preferred.id) &&
+				isAccountHeadersReady(preferred.id)
+			) {
 				return { account: preferred, configuredAccounts };
 			}
-			// Preferred is missing/on cooldown: fall through to next available.
+			// Preferred is missing/on cooldown/not HOT: fall through to HOT rotation.
 			if (preferred) excluded.add(preferred.id);
 		}
 
-		// Error failover: rotate away from sticky/current account when requested.
-		if (preferredAccountId === null || excluded.size > 0) {
-			const next = getNextAvailableAccount(excluded);
-			if (next) return { account: next, configuredAccounts };
-		}
-
-		const account = getNextAccount();
-		if (!account) {
-			// All accounts on cooldown; caller will handle this.
-			return { account: configuredAccounts[0], configuredAccounts };
-		}
+		// HOT-only rotation (failover away from sticky/current AND the plain
+		// round-robin pick). Never degrades to a non-HOT account.
+		const account = getNextHotAccount(excluded);
 		return { account, configuredAccounts };
 	}
 
 		throw new ValidationError(
 		"No Qwen accounts configured on the server. Add an account in the [5] Accounts tab of the TUI.",
 	);
+}
+
+/**
+ * Bounded retry-after for the "zero HOT accounts" capacity error. The pool
+ * readiness controller warms standbys in the background; the client retries
+ * once within this window instead of the request burning lease waits and
+ * retries on a non-HOT account.
+ */
+export const NO_HOT_ACCOUNT_RETRY_AFTER_MS = 3_000;
+
+function createNoHotAccountCapacityError(): Error & {
+	upstreamStatus: number;
+	retryAfterMs: number;
+	code: string;
+} {
+	void import("../../core/readiness-guard.ts")
+		.then((m) => m.triggerReadinessCheck("no-hot-account"))
+		.catch(() => {});
+	const err = new Error(
+		`No warmed accounts are available right now. The pool controller is preparing accounts in the background; retry in about ${Math.ceil(NO_HOT_ACCOUNT_RETRY_AFTER_MS / 1000)}s.`,
+	) as Error & { upstreamStatus: number; retryAfterMs: number; code: string };
+	err.upstreamStatus = 503;
+	err.retryAfterMs = NO_HOT_ACCOUNT_RETRY_AFTER_MS;
+	err.code = "no_hot_account";
+	console.warn(
+		`⚠️  [Chat] No HOT account available | request rejected at selection boundary | retryAfter=${NO_HOT_ACCOUNT_RETRY_AFTER_MS}ms | readiness=triggered`,
+	);
+	return err;
 }
 
 function isAccountUnavailableError(err: any): boolean {
@@ -526,6 +563,10 @@ function hasFreeAlternateAccount(
 		(candidate) =>
 			candidate.id !== currentAccountId &&
 			!triedAccountIds.has(candidate.id) &&
+			// A non-HOT alternate can never serve a normal request; treating it
+			// as "free" would rotate into a WARM/COLD account. Require HOT so
+			// the decision reflects real usable capacity.
+			isAccountHeadersReady(candidate.id) &&
 			!getAccountCooldownInfo(candidate.id) &&
 			!isAccountTemporarilyBusy(candidate.id) &&
 			!isAccountBusy(candidate.id),
@@ -552,15 +593,17 @@ function getNextFreeAccountForParallel(
 		(c) =>
 			c.id !== currentAccountId &&
 			!triedAccountIds.has(c.id) &&
+			isAccountHeadersReady(c.id) &&
 			!getAccountCooldownInfo(c.id) &&
 			!isAccountTemporarilyBusy(c.id) &&
 			!isAccountBusy(c.id),
 	);
 	if (free) return free;
-	// No free slot anywhere: fall back to the normal picker so we still rotate
-	// (the tryAcquireAccountLease fail-fast will report account_busy and the
-	// loop gives up rather than blocking on a busy pool).
-	return getNextAvailableAccount(triedAccountIds);
+	// No free slot anywhere: fall back to the HOT-only picker so rotation stays
+	// within executable accounts (the tryAcquireAccountLease fail-fast will
+	// report account_busy and the loop gives up rather than blocking on a busy
+	// pool). Never degrade to a WARM/COLD account.
+	return getNextHotAccount(triedAccountIds);
 }
 
 
@@ -879,6 +922,16 @@ export async function acquireUpstreamStream(
 			modelId: params.model,
 		});
 		if (!claimed.ok) {
+			// Zero HOT candidates under the lease authority: same contract as the
+			// legacy null pick — bounded capacity error, never a non-HOT claim.
+			if (claimed.failureCode === "NO_CANDIDATES") {
+				return {
+					error: createNoHotAccountCapacityError(),
+					completionId,
+					allOnCooldown: false,
+					retryAfterMs: NO_HOT_ACCOUNT_RETRY_AFTER_MS,
+				};
+			}
 			return {
 				error: TypedRuntimeError.fromCode(
 					claimed.errorCode,
@@ -912,6 +965,20 @@ export async function acquireUpstreamStream(
 		configuredAccounts = resolved.configuredAccounts;
 	}
 
+	if (!account) {
+		// Zero HOT accounts (every configured account is WARM/COLD, on cooldown,
+		// broken or excluded): NORMAL REQUESTS MAY ONLY EXECUTE ON HOT ACCOUNTS,
+		// so reject at the selection boundary with a single bounded retryable
+		// capacity error. The readiness controller is triggered by the error
+		// factory; the request never waits/retries on a non-HOT account.
+		return {
+			error: createNoHotAccountCapacityError(),
+			completionId,
+			allOnCooldown: false,
+			retryAfterMs: NO_HOT_ACCOUNT_RETRY_AFTER_MS,
+		};
+	}
+
 	if (logger.isLevelEnabled("info")) {
 		// Why THIS account? The operator needs the decision, not just the
 		// result — the previous rounds' "stale label" / "switching" confusion
@@ -942,7 +1009,7 @@ export async function acquireUpstreamStream(
 		const accountEmail = maskEmail(account.email);
 
 		if (triedAccountIds.has(accountId)) {
-			account = getNextAvailableAccount(triedAccountIds);
+			account = getNextHotAccount(triedAccountIds);
 			continue;
 		}
 		triedAccountIds.add(accountId);
@@ -963,7 +1030,7 @@ export async function acquireUpstreamStream(
 			console.log(
 				`⏭️  [Chat] Skipping account ${accountEmail} (${accountId}) temporarily busy (chat in progress)`,
 			);
-			const nextCandidate = getNextAvailableAccount(triedAccountIds);
+			const nextCandidate = getNextHotAccount(triedAccountIds);
 			if (nextCandidate && !getAccountCooldownInfo(nextCandidate.id)) {
 				account = nextCandidate;
 				continue;
@@ -985,7 +1052,7 @@ export async function acquireUpstreamStream(
 			console.log(
 				`⏭️  [Chat] Skipping account ${accountEmail} (${accountId}) busy; rotating to a free account`,
 			);
-			const nextCandidate = getNextAvailableAccount(triedAccountIds);
+			const nextCandidate = getNextHotAccount(triedAccountIds);
 			if (nextCandidate && !getAccountCooldownInfo(nextCandidate.id)) {
 				account = nextCandidate;
 				continue;
@@ -1004,7 +1071,7 @@ export async function acquireUpstreamStream(
 					`⚠️  [Chat] Sticky account is on cooldown; recreating upstream chat on another account with compressed context.`,
 				);
 			}
-			account = getNextAvailableAccount(triedAccountIds);
+			account = getNextHotAccount(triedAccountIds);
 			continue;
 		}
 
@@ -1294,7 +1361,7 @@ export async function acquireUpstreamStream(
 				break;
 			}
 
-			const nextAfterChallenge = getNextAvailableAccount(triedAccountIds);
+			const nextAfterChallenge = getNextHotAccount(triedAccountIds);
 			if (!nextAfterChallenge || triedAccountIds.has(nextAfterChallenge.id)) {
 				console.warn(
 					`[Retry Failed] | reason=anti_bot | account=${accountEmail} | no other account available`,
@@ -1332,7 +1399,7 @@ export async function acquireUpstreamStream(
 			});
 		}
 
-		account = getNextAvailableAccount(triedAccountIds);
+		account = getNextHotAccount(triedAccountIds);
 	}
 
 	// All accounts exhausted.
@@ -1549,6 +1616,29 @@ async function tryCreateStreamWithRetry(
 						"client aborted before stream creation",
 					),
 				};
+			}
+
+			// HARD INVARIANT: NORMAL REQUESTS MAY ONLY EXECUTE ON HOT ACCOUNTS.
+			// Selection already gates on headers-ready; if a non-HOT account
+			// still reaches an attempt (e.g. readiness lost mid-request), fail
+			// the attempt immediately and rotate. This guarantees the request
+			// path never spends a lease wait discovering readiness failure and
+			// never lets "Account <id> is not warmed" surface from execution.
+			if (
+				!isAuthMockEnabled() &&
+				currentAccountId !== "global" &&
+				!isAccountHeadersReady(currentAccountId)
+			) {
+				noteRequestPathNotHotExecution();
+				console.error(
+					`⛔ [Chat] Non-HOT account reached the request path: ${currentAccountId} (${currentAccountEmail}) — failing attempt and rotating`,
+				);
+				const notHotError = new Error(
+					`Account ${currentAccountId} is not warmed`,
+				) as Error & { code?: string; switchAccount?: boolean };
+				notHotError.code = "account_not_hot";
+				notHotError.switchAccount = true;
+				throw notHotError;
 			}
 
 			// Always sync the model catalog so the truncation and prompt-limit
@@ -2402,8 +2492,8 @@ async function tryCreateStreamWithRetry(
 		// A PARALLEL escape hops to a FREE account (skip busy/temporarily-busy):
 		// the auxiliary request must land on an available slot fast, never on a
 		// second occupied account (the 2026-08-20 stall rotated ldyjl→cgnx3, both
-		// busy, ~14s lease wait). Normal requests keep the cooldown-only picker so
-		// single-account/saturated pools stay lossless.
+		// busy, ~14s lease wait). Both pickers are HOT-only: a non-HOT account
+		// is never a valid rotation target for a normal request.
 		if (
 			policy.retryable &&
 			shouldSwitchAccount &&
@@ -2412,7 +2502,7 @@ async function tryCreateStreamWithRetry(
 		) {
 			const nextAccount = params.parallelEscape
 				? getNextFreeAccountForParallel(accounts, triedAccounts, currentAccountId)
-				: getNextAvailableAccount(triedAccounts);
+				: getNextHotAccount(triedAccounts);
 		if (nextAccount && nextAccount.id !== currentAccountId) {
 			console.warn(
 				`🔄 [Chat] Switching account after ${policy.reason} | ${currentAccountEmail} -> ${maskEmail(nextAccount.email)}`,

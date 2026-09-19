@@ -87,13 +87,19 @@ export function acquireGenerationAccount(
   if (authority === null) {
     return failure("ACCOUNT_UNAVAILABLE", "not_authorized");
   }
-  const candidates =
+  const rawCandidates =
     request.candidates ??
     buildCandidates(
       authority,
       request.preferredAccountId,
       request.triedAccountIds,
     );
+  // NORMAL REQUESTS MAY ONLY EXECUTE ON HOT ACCOUNTS. Explicit candidate lists
+  // must also be intersected with the READY set: an explicit/sticky candidate
+  // that is WARM/COLD is dropped at the selection boundary instead of being
+  // claimed and discovered as not-warmed after the lease was acquired.
+  const ready = new Set(authority.listAccountsByStatus("READY"));
+  const candidates = rawCandidates.filter((id) => ready.has(id));
   if (candidates.length === 0) {
     return failure("ACCOUNT_UNAVAILABLE", "NO_CANDIDATES");
   }
