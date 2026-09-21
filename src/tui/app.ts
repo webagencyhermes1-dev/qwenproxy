@@ -7,6 +7,7 @@ import type { TuiView, ProxyStatusSnapshot } from "./types.ts";
 import { theme, glyphs, drawBox, stringWidth } from "./theme.ts";
 import { fetchProxyStatus } from "./proxy-client.ts";
 import { ServerManager } from "./server-manager.ts";
+import { ServerProcess } from "./server-process.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -68,8 +69,6 @@ export class TuiApp {
 
   public async start(): Promise<void> {
     if (this.isRunning) return;
-    // Activate stdio sandbox immediately so zero logs can leak to terminal screen
-    ServerManager.getInstance().interceptLogs();
     const ok = this.screen.start();
     if (!ok) {
       console.error(
@@ -96,6 +95,16 @@ export class TuiApp {
       try {
         this.render();
       } catch {}
+    });
+
+    // Listen for server lifecycle events
+    const serverProcess = ServerManager.getInstance().getServerProcess();
+    serverProcess.on("startupFailed", (error) => {
+      this.requestRender();
+    });
+
+    serverProcess.on("exit", (code, signal) => {
+      this.requestRender();
     });
 
     // Start server in-process together with TUI ("all together as one")
@@ -133,7 +142,6 @@ export class TuiApp {
     clearInterval(this.pollInterval!);
     this.screen.stop();
     await ServerManager.getInstance().stop();
-    ServerManager.getInstance().restoreLogs();
   }
 
   private async handleKey(key: KeyEvent): Promise<void> {
@@ -232,12 +240,27 @@ export class TuiApp {
       const frame: string[] = [];
 
     // 1. Header Deck (Tabs & Title)
-    const serverState = ServerManager.getInstance().getState();
+    const serverProcess = ServerManager.getInstance().getServerProcess();
+    const serverState = serverProcess.getState();
+    const serverManagerState = ServerManager.getInstance().getState();
+    
     let statusChip: string;
-    if (this.statusSnapshot?.online || serverState === "online") {
-      statusChip = theme.green(`[ ${glyphs.bullet} Online ]`);
-    } else if (serverState === "warming") {
-      statusChip = theme.yellow("[ ◐ Starting... ]");
+    if (serverState === "online") {
+      const duration = serverProcess.getStartupDuration();
+      if (duration && duration > 30000) {
+        statusChip = theme.green(`[ ${glyphs.bullet} Online (${Math.floor(duration / 1000)}s) ]`);
+      } else {
+        statusChip = theme.green(`[ ${glyphs.bullet} Online ]`);
+      }
+    } else if (serverState === "starting") {
+      const duration = serverProcess.getStartupDuration() || 0;
+      const seconds = Math.floor(duration / 1000);
+      statusChip = theme.yellow(`[ ◐ Starting... ${seconds}s ]`);
+    } else if (serverState === "restarting") {
+      const count = serverProcess.getRestartCount();
+      statusChip = theme.yellow(`[ ◐ Restarting (${count})... ]`);
+    } else if (serverState === "stopping") {
+      statusChip = theme.yellow(`[ ◐ Stopping... ]`);
     } else if (serverState === "error") {
       statusChip = theme.red("[ ✕ Error ]");
     } else {

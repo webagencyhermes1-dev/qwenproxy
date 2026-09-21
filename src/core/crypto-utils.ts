@@ -58,20 +58,13 @@ export function decrypt(ciphertext: string): string {
   const parts = ciphertext.split(":");
   if (parts.length !== 3) return ciphertext;
 
-  try {
-    const key = getOrCreateKey();
-    const iv = Buffer.from(parts[0], "hex");
-    const authTag = Buffer.from(parts[1], "hex");
-    const encrypted = Buffer.from(parts[2], "hex");
-    const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
-    decipher.setAuthTag(authTag);
-    return decipher.update(encrypted).toString("utf-8") + decipher.final("utf-8");
-  } catch (err) {
-    console.error(
-      `❌ [CryptoUtils] Decryption failed (possible key mismatch): ${(err as Error).message}`,
-    );
-    return ciphertext;
-  }
+  const key = getOrCreateKey();
+  const iv = Buffer.from(parts[0], "hex");
+  const authTag = Buffer.from(parts[1], "hex");
+  const encrypted = Buffer.from(parts[2], "hex");
+  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
+  decipher.setAuthTag(authTag);
+  return decipher.update(encrypted).toString("utf-8") + decipher.final("utf-8");
 }
 
 export function isEncrypted(value: string): boolean {

@@ -311,12 +311,19 @@ app.get("/health", async (c) => {
     };
     const accounts = loadAccounts();
     const candidates = manager.buildSchedulerCandidates(accounts);
+    const readyAccountIds = (await import("../core/account-manager.js")).getHeadersReadyAccountIds();
+    const activeAccountIds = (await import("../services/playwright.js")).getActivePlaywrightAccountIds();
     poolAccounts = candidates.map((cand) => {
       const cd = manager.getAccountCooldownInfo(cand.account.id);
+      const isReady = readyAccountIds.includes(cand.account.id);
+      const isActive = activeAccountIds.includes(cand.account.id);
+      const cooldownUntil = cd ? Date.now() + cd.remainingMs : null;
       return {
         // Opaque prefix only — never the full id or email.
         id: maskPoolAccountId(cand.account.id),
         account: maskPoolAccountId(cand.account.email || cand.account.id),
+        // Raw ID for internal TUI use (not masked)
+        rawId: cand.account.id,
         state: stats.states[cand.account.id] ?? "WARMING",
         health: cand.health.healthScore,
         activeStreams: cand.activeStreams,
@@ -330,6 +337,10 @@ app.get("/health", async (c) => {
         lastFailure: cand.health.lastFailureAt,
         cooldownRemainingMs: cd?.remainingMs ?? 0,
         cooldownReason: cd?.reason ?? cand.account.cooldown_reason ?? null,
+        cooldownUntil,
+        onCooldown: cd ? cd.onCooldown : false,
+        headersReady: isReady,
+        isInitialized: isActive,
       };
     });
   } catch {
@@ -945,16 +956,22 @@ export async function startServer(options?: {
         }
       }
 
+      if (isRuntimeMode()) {
+        console.log(
+          `[Server] Runtime mode: pool controller owns all warmup (${accounts.length} accounts registered)`,
+        );
+      }
+
       const remainingAccounts = accounts.filter(
         (account) => !readyAccountIds.has(account.id),
       );
-      if (readyAccountIds.size === 0) {
+      if (!isRuntimeMode() && readyAccountIds.size === 0) {
         console.warn(
           `⚠️  [Server] No account ready during startup; continuing in background`,
         );
       }
 
-      if (config.playwright.prepareAllOnStartup || readyAccountIds.size === 0) {
+      if (!isRuntimeMode() && (config.playwright.prepareAllOnStartup || readyAccountIds.size === 0)) {
         if (config.playwright.prepareAllOnStartup && remainingAccounts.length > 0) {
           console.log(
             `🪶 [Server] Preparing ${remainingAccounts.length} standby account(s) in background`,

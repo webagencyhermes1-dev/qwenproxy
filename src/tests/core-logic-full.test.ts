@@ -147,12 +147,12 @@ test("crypto-utils: empty and unparseable values pass through unchanged", () => 
   assert.strictEqual(decrypt("only:two"), "only:two"); // not 3 parts
 });
 
-test("crypto-utils: tampered ciphertext fails auth and is returned as-is", () => {
+test("crypto-utils: tampered ciphertext fails auth and throws", () => {
   const ciphertext = encrypt("payload");
   const [iv, authTag, data] = ciphertext.split(":");
-  // Zero out the GCM auth tag so decryption must throw internally.
+  // Zero out the GCM auth tag so decryption must throw.
   const corrupted = `${iv}:${"0".repeat(authTag.length)}:${data}`;
-  assert.strictEqual(decrypt(corrupted), corrupted);
+  assert.throws(() => decrypt(corrupted));
 });
 
 test("crypto-utils: isEncrypted shape detection", () => {

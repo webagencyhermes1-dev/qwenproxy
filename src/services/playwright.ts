@@ -64,6 +64,7 @@ import { config } from "../core/config.ts";
 import { maskEmail } from "../core/logger.ts";
 import { Mutex } from "../core/mutex.ts";
 import {
+  isAccountHeadersReady,
   markAccountHeadersReady,
   unmarkAccountHeadersReady,
   markAccountRateLimited,
@@ -2014,6 +2015,18 @@ export interface LoginAttemptResult {
   reason?: string;
 }
 
+function isContextDeathError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes("target page, context or browser has been closed") ||
+    lower.includes("context closed") ||
+    lower.includes("browser has been closed") ||
+    lower.includes("page.context()") ||
+    lower.includes("context was closed") ||
+    lower.includes("browser context closed")
+  );
+}
+
 export function classifyQwenAuthError(
   code?: string,
   details?: string,
@@ -2102,9 +2115,11 @@ async function loginToQwenInner(
   if (!page) return false;
 
   const maxAttempts = 3;
+  let apiResult: LoginAttemptResult = { success: false, reason: "unknown" };
+  let uiResult: LoginAttemptResult = { success: false, reason: "unknown" };
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     // Try API login first
-    const apiResult = await loginViaApi(page, email, password);
+    apiResult = await loginViaApi(page, email, password);
     if (apiResult.success) {
       await saveStorageState(page.context(), accountId);
       return true;
@@ -2129,7 +2144,7 @@ async function loginToQwenInner(
     }
 
     // Fallback to UI login
-    const uiResult = await loginViaUi(page, email, password);
+    uiResult = await loginViaUi(page, email, password);
     if (uiResult.success) {
       await saveStorageState(page.context(), accountId);
       return true;
@@ -2160,6 +2175,16 @@ async function loginToQwenInner(
       );
       await sleep(backoffMs);
     }
+  }
+
+  const lastReason = apiResult?.reason || uiResult?.reason || "unknown";
+  const isContextDeath = isContextDeathError(lastReason);
+
+  if (isContextDeath) {
+    console.warn(
+      `⚠️  [Playwright] Login failed due to context death for ${maskEmail(email)} - not marking permanent failure`,
+    );
+    return false;
   }
 
   console.error(
@@ -3436,14 +3461,21 @@ export async function closeIdlePlaywrightAccounts(
 
   const maxActiveContexts = config.playwright.maxActiveContexts;
 
-  // With an active-context limit, preserve at least that many warm contexts
-  // so one account remains ready for immediate use.
   if (maxActiveContexts > 0 && accountPages.size <= maxActiveContexts) {
     return 0;
   }
 
+  const hotTarget = config.pool.targetReady;
+  const hotCount = Array.from(accountPages.keys()).filter((id) =>
+    isAccountHeadersReady(id),
+  ).length;
+  const hotProtected = hotCount <= hotTarget;
+
   const candidates = priorityOrderForEviction(
-    getIdlePlaywrightAccountIds(idleMs),
+    getIdlePlaywrightAccountIds(idleMs).filter((accountId) => {
+      if (hotProtected && isAccountHeadersReady(accountId)) return false;
+      return true;
+    }),
   ).map((accountId) => ({
     accountId,
     lastActivity: lastAccountActivity.get(accountId) ?? 0,
@@ -3492,8 +3524,15 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
   if (max <= 0) return 0;
   if (accountPages.size <= max) return 0;
 
+  const hotTarget = config.pool.targetReady;
+  const hotCount = Array.from(accountPages.keys()).filter((id) =>
+    isAccountHeadersReady(id),
+  ).length;
+  const hotProtected = hotCount <= hotTarget;
+
   const candidates = priorityOrderForEviction(
     Array.from(accountPages.keys()).filter((accountId) => {
+      if (hotProtected && isAccountHeadersReady(accountId)) return false;
       const mutex = accountMutexes.get(accountId);
       return mutex?.isIdle() && !isAccountServingStream(accountId);
     }),

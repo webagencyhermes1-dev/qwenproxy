@@ -51,11 +51,9 @@ export class Screen {
     this.active = true;
     this.prevRenderedRows = [];
     // Switch to alternate screen buffer, clear screen, hide cursor, and enable mouse tracking
-    ServerManager.getInstance().withTuiRendering(() => {
-      process.stdout.write(
-        ANSI.enterAltScreen + "\x1b[2J" + ANSI.cursorHome + ANSI.hideCursor + ANSI.enableMouse,
-      );
-    });
+    process.stdout.write(
+      ANSI.enterAltScreen + "\x1b[2J" + ANSI.cursorHome + ANSI.hideCursor + ANSI.enableMouse,
+    );
     // Setup raw keyboard input
     if (process.stdin.setRawMode) {
       process.stdin.setRawMode(true);
@@ -259,13 +257,7 @@ export class Screen {
     const restoreSeq = ANSI.disableMouse + ANSI.exitAltScreen + ANSI.showCursor + ANSI.reset;
     try {
       fs.writeSync(1, restoreSeq);
-    } catch {
-      try {
-        ServerManager.getInstance().withTuiRendering(() => {
-          process.stdout.write(restoreSeq);
-        });
-      } catch {}
-    }
+    } catch {}
   }
 
   public onKey(handler: KeyHandler): () => void {
@@ -329,8 +321,6 @@ export class Screen {
 
     this.prevRenderedRows = currentRows;
 
-    ServerManager.getInstance().withTuiRendering(() => {
-      process.stdout.write(ANSI.hideCursor + diffBuffer + ANSI.cursorHome);
-    });
+    process.stdout.write(ANSI.hideCursor + diffBuffer + ANSI.cursorHome);
   }
 }

@@ -15,7 +15,6 @@ import type {
 export const READINESS_CONTROLLER_FLAG = "QWEN_READINESS_CONTROLLER";
 
 const MIN_WARMING = 1;
-const MAX_CONCURRENT_WARMING = 1;
 const VALIDATION_BUCKETS = 3;
 const VALIDATION_BUCKET_WINDOW_MS = 60_000;
 const SWEEP_INTERVAL_MS = 60_000;
@@ -69,6 +68,11 @@ const counters = {
   accountsRevalidated: 0,
   warmupFailures: 0,
 };
+
+const lastContextDeathTrigger = new Map<string, number>();
+const CONTEXT_DEATH_THROTTLE_MS = 5000;
+const lastDeficitReport = new Map<string, number>();
+const DEFICIT_CHANGE_THRESHOLD_MS = 10000;
 
 let guardDeps: ReadinessGuardDeps | null = null;
 let controllerClients: ReadinessControllerClients | null = null;
@@ -171,10 +175,28 @@ export async function ensurePoolReadiness(): Promise<TickReport | undefined> {
 
 export function triggerReadinessCheck(reason?: string): void {
   if (isReadinessControllerEnabled() && controllerClients) {
+    if (reason === "context-death") {
+      const now = Date.now();
+      const last = lastContextDeathTrigger.get("") ?? 0;
+      if (now - last < CONTEXT_DEATH_THROTTLE_MS) {
+        return;
+      }
+      lastContextDeathTrigger.set("", now);
+    }
     void controllerClients.controller.tick().then(noop, noop);
     return;
   }
   if (!guardDeps) return;
+  
+  if (reason === "context-death") {
+    const now = Date.now();
+    const last = lastContextDeathTrigger.get("") ?? 0;
+    if (now - last < CONTEXT_DEATH_THROTTLE_MS) {
+      return;
+    }
+    lastContextDeathTrigger.set("", now);
+  }
+  
   void coalescedPoolCheck().then(noop, noop);
   if (reason) {
     console.log(`🔥 [ReadinessGuard] Check triggered | reason=${reason}`);
@@ -188,7 +210,16 @@ async function coalescedPoolCheck(): Promise<void> {
     counters.coalescedTriggers += 1;
     return checkInFlight;
   }
-  checkInFlight = runPoolCheckLoop();
+  // Set checkInFlight immediately to prevent race condition between
+  // synchronous callers before runPoolCheckLoop() starts executing.
+  let resolved = false;
+  const promise = new Promise<void>((resolve) => {
+    runPoolCheckLoop().then(() => {
+      resolved = true;
+      resolve();
+    });
+  });
+  checkInFlight = promise;
   return checkInFlight;
 }
 
@@ -200,6 +231,8 @@ async function runPoolCheckLoop(): Promise<void> {
     } while (trailingRecheckRequested);
   } finally {
     checkInFlight = null;
+    lastContextDeathTrigger.clear();
+    lastDeficitReport.clear();
   }
 }
 
@@ -229,14 +262,22 @@ async function runPoolCheck(): Promise<void> {
   const totalNeeded = Math.min(deficit + needWarming, standby.length);
   const slots = Math.min(
     totalNeeded,
-    Math.max(0, MAX_CONCURRENT_WARMING - warmingAccounts.size),
+    Math.max(0, config.pool.warmupConcurrency - warmingAccounts.size),
   );
+  
   if (deficit > 0) {
-    console.log(
-      `[Pool Readiness] reconcile | ready=${ready.length} target=${target} deficit=${deficit}`,
-    );
+    const now = Date.now();
+    const lastReported = lastDeficitReport.get("");
+    const shouldReport = !lastReported || (now - lastReported > DEFICIT_CHANGE_THRESHOLD_MS);
+    if (shouldReport) {
+      lastDeficitReport.set("", now);
+      console.log(
+        `[Pool Readiness] reconcile | ready=${ready.length} target=${target} deficit=${deficit}`,
+      );
+    }
   }
 
+  const warmupPromises: Promise<boolean>[] = [];
   for (let i = 0; i < slots; i++) {
     const account = standby[i];
     if (!account) break;
@@ -245,10 +286,14 @@ async function runPoolCheck(): Promise<void> {
     if (warmingAccounts.has(account.id)) continue;
     if (exhaustedAccounts.has(account.id)) continue;
     if (isInWarmupBackoff(account.id)) continue;
+    warmingAccounts.add(account.id);
     console.log(
       `[Pool Readiness] warmup scheduled | account=${mask(account.id)} reason=ready_deficit`,
     );
-    await warmStandbyAccount(deps, account.id);
+    warmupPromises.push(warmStandbyAccount(deps, account.id));
+  }
+  if (warmupPromises.length > 0) {
+    await Promise.allSettled(warmupPromises);
   }
 }
 
@@ -258,7 +303,6 @@ async function warmStandbyAccount(
 ): Promise<boolean> {
   const credentials = deps.getAccountCredentials(accountId);
   if (!credentials) return false;
-  warmingAccounts.add(accountId);
   const startedAt = Date.now();
   const timeoutMs = config.pool?.warmupTimeoutMs ?? 90_000;
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;

@@ -59,6 +59,26 @@ const dirty = new Set<string>();
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 const FLUSH_DEBOUNCE_MS = 2000;
 
+interface RollingEvent {
+  timestamp: number;
+  isRateLimited: boolean;
+}
+
+const ROLLING_WINDOW_SIZE = 20;
+const rollingEvents = new Map<string, RollingEvent[]>();
+
+export function recordRollingRequestEvent(accountId: string, isRateLimited: boolean): void {
+  let events = rollingEvents.get(accountId);
+  if (!events) {
+    events = [];
+    rollingEvents.set(accountId, events);
+  }
+  events.push({ timestamp: Date.now(), isRateLimited });
+  if (events.length > ROLLING_WINDOW_SIZE) {
+    events.splice(0, events.length - ROLLING_WINDOW_SIZE);
+  }
+}
+
 function defaultRecord(accountId: string): AccountHealthRecord {
   return {
     accountId,
@@ -275,6 +295,7 @@ export function recordAccountSuccess(
   rec.healthScore = Math.min(100, rec.healthScore + SUCCESS_DELTA);
   rec.successCount += 1;
   rec.consecutiveFailures = 0;
+  recordRollingRequestEvent(accountId, false);
   const now = Date.now();
   rec.lastRequestAt = now;
   rec.lastSuccessAt = now;
@@ -311,6 +332,9 @@ export function recordAccountFailure(
   if (kind === "auth") rec.authFailures += 1;
   if (kind === "network") rec.networkFailures += 1;
   if (kind === "waf") rec.wafEvents += 1;
+  if (kind === "rate_limit" || kind === "quota") {
+    recordRollingRequestEvent(accountId, true);
+  }
   const now = Date.now();
   rec.lastRequestAt = now;
   rec.lastFailureAt = now;
@@ -397,6 +421,7 @@ export function resetAccountHealthForTests(): void {
   }
   cache.clear();
   dirty.clear();
+  rollingEvents.clear();
 }
 
 // ─── TTFB Tracking (Cycle 2) ─────────────────────────────────────────────────
@@ -435,21 +460,15 @@ export function getP50Ttfb(accountId: string): number {
 
 const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
 
-/**
- * Recent 429 rate: fraction of the last N requests that were rate-limited.
- * Uses rateLimitEvents + quotaEvents vs total requests (bounded window).
- */
 export function getRecent429Rate(accountId: string): number {
-  const rec = getAccountHealth(accountId);
-  const total = rec.successCount + rec.failureCount;
-  if (total === 0) return 0;
+  const events = rollingEvents.get(accountId);
+  if (!events || events.length === 0) return 0;
   const now = Date.now();
-  const window = Math.min(total, 20);
-  if (rec.lastRequestAt != null && now - rec.lastRequestAt > RATE_LIMIT_WINDOW_MS) {
+  if (now - events[events.length - 1].timestamp > RATE_LIMIT_WINDOW_MS) {
     return 0;
   }
-  const rateLimited = Math.min(rec.rateLimitEvents + rec.quotaEvents, window);
-  return rateLimited / window;
+  const rateLimited = events.filter((e) => e.isRateLimited).length;
+  return rateLimited / events.length;
 }
 
 /**

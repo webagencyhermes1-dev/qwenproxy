@@ -109,10 +109,16 @@ function getCachedAccounts(): QwenAccount[] {
     )
     .all() as QwenAccount[];
 
-  accountsCache = rows.map((row) => ({
-    ...row,
-    password: decrypt(row.password),
-  }));
+  accountsCache = rows.flatMap((row) => {
+    try {
+      return [{ ...row, password: decrypt(row.password) }];
+    } catch (err) {
+      console.warn(
+        `[Accounts] Skipping account ${row.email}: decryption failed (${(err as Error).message})`,
+      );
+      return [];
+    }
+  });
   accountsCacheTime = now;
   return accountsCache;
 }

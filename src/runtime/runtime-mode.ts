@@ -1,2 +1,2 @@
-﻿export const getRuntimeMode = (): string => 'legacy';
-export const isRuntimeMode = (): boolean => false;
+﻿export const getRuntimeMode = (): string => process.env.QWEN_RUNTIME_MODE ?? 'production';
+export const isRuntimeMode = (): boolean => getRuntimeMode() !== 'legacy';

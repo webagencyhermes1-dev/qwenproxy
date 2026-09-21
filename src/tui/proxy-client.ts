@@ -1,22 +1,63 @@
 /**
  * QwenProxy TUI - Proxy Data Provider & Live State Client
+ * Uses HTTP API for status - no direct DB access
  */
 
 import { config, type ChatMode } from "../core/config.ts";
-import { loadAccounts, type QwenAccount } from "../core/accounts.ts";
-import {
-  buildSchedulerCandidates,
-  getAccountCooldownInfo,
-  clearAllAccountCooldowns,
-  clearAccountCooldown,
-  getPoolStats,
-  isAccountHeadersReady,
-} from "../core/account-manager.ts";
-import { isPlaywrightInitialized } from "../services/playwright.ts";
-import { getAccountConcurrencySnapshot } from "../core/account-concurrency.ts";
-import { getRssUsageSnapshot } from "../core/memory-usage.ts";
-import { performanceMetrics } from "../core/performance-metrics.ts";
-import type { ProxyStatusSnapshot } from "./types.ts";
+
+export interface ProxyStatusSnapshot {
+  online: boolean;
+  port: number;
+  host: string;
+  overallStatus?: string;
+  uptimeSeconds?: number;
+  rssMb?: number;
+  systemMemoryPct?: number;
+  activeStreams?: number;
+  waitingStreams?: number;
+  accounts: Array<{
+    id: string;
+    emailOrName: string;
+    priority: number;
+    cooldownUntil: number | null;
+    onCooldown: boolean;
+    remainingCooldownMs: number;
+    cooldownReason?: string | null;
+    headersReady: boolean;
+    isInitialized?: boolean;
+    state?: string;
+    health?: number;
+    activeStreams?: number;
+    requests?: number;
+    success?: number;
+    failure?: number;
+    lastUsed?: number | null;
+  }>;
+  pool?: {
+    total: number;
+    ready: number;
+    warming: number;
+    busy: number;
+    cooldown: number;
+    authError: number;
+    broken: number;
+    disabled: number;
+    activeStreams: number;
+    queued: number;
+    successRate: number;
+    averageHealth: number;
+  } | null;
+  performance?: {
+    avgLatencyMs: number;
+    avgTtfbMs: number;
+    tokensPerSecond: number;
+    totalRequests: number;
+    totalPromptTokens: number;
+    totalCompletionTokens: number;
+    totalTokens: number;
+    recentRequests: number;
+  } | null;
+}
 
 export function maskAccountIdentifier(idOrEmail: string): string {
   if (!idOrEmail) return "unknown";
@@ -42,219 +83,137 @@ export function formatUptime(seconds: number): string {
   }
   return `${pad2(mins)}:${pad2(secs)}`;
 }
-let cachedAccounts: Array<{
-  id: string;
-  emailOrName: string;
-  priority: number;
-  cooldownUntil: number | null;
-  onCooldown: boolean;
-  remainingCooldownMs: number;
-  cooldownReason: string | null;
-  headersReady: boolean;
-  isInitialized: boolean;
-  state: string;
-  health: number;
-  activeStreams: number;
-  requests: number;
-  success: number;
-  failure: number;
-  lastUsed: number | null;
-}> = [];
-let lastAccountsFetch = 0;
-let isHealthCheckPending = false;
-let lastOnlineState = false;
-let lastOverallStatus = "offline";
-let lastServerReadyAccounts: Set<string> | null = null;
-let lastServerActiveAccounts: Set<string> | null = null;
-let cachedPool: ProxyStatusSnapshot["pool"] = null;
-export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
+
+let healthPollMutex = false;
+let lastHealthPollTime = 0;
+let cachedStatus: ProxyStatusSnapshot | null = null;
+let lastStatusTime = 0;
+
+async function fetchHealth(): Promise<any> {
   const port = config.server?.port || 7936;
   const configuredHost = config.server?.host;
   const host = configuredHost && configuredHost !== "0.0.0.0" ? configuredHost : "127.0.0.1";
-  const uptimeSeconds = Math.floor(process.uptime());
 
-  // Fast non-blocking health probe
-  if (!isHealthCheckPending) {
-    isHealthCheckPending = true;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 350);
-    fetch(`http://${host}:${port}/health`, { signal: controller.signal })
-      .then(async (resp) => {
-        clearTimeout(timeout);
-        if (resp.ok) {
-          lastOnlineState = true;
-          const data = (await resp.json()) as any;
-          lastOverallStatus = data.status || "healthy";
-          if (Array.isArray(data.readyAccounts)) {
-            lastServerReadyAccounts = new Set(data.readyAccounts);
-          }
-          if (Array.isArray(data.activeAccounts)) {
-            lastServerActiveAccounts = new Set(data.activeAccounts);
-          }
-        } else {
-          lastOnlineState = false;
-          lastServerReadyAccounts = null;
-          lastServerActiveAccounts = null;
-        }
-      })
-      .catch(() => {
-        clearTimeout(timeout);
-        lastOnlineState = false;
-      })
-      .finally(() => {
-        isHealthCheckPending = false;
-      });
-  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 350);
 
-  const now = Date.now();
-  if (now - lastAccountsFetch > 3000 || cachedAccounts.length === 0) {
-    lastAccountsFetch = now;
-    let rawAccounts: QwenAccount[] = [];
-    try {
-      rawAccounts = loadAccounts();
-    } catch {
-      rawAccounts = [];
-    }
-
-    // Pool 2.0 enrichment: derived state + persistent health + live load.
-    // Single batched pass (health = 1 SELECT, concurrency = in-memory).
-    let states: Record<string, string> = {};
-    let poolSummary: ProxyStatusSnapshot["pool"] = null;
-    try {
-      const stats = getPoolStats();
-      states = stats.states as Record<string, string>;
-      poolSummary = {
-        total: stats.total,
-        ready: stats.ready,
-        warming: stats.warming,
-        busy: stats.busy,
-        cooldown: stats.cooldown,
-        authError: stats.authError,
-        broken: stats.broken,
-        disabled: stats.disabled,
-        activeStreams: stats.totalActiveStreams,
-        queued: stats.queuedRequests,
-        successRate: stats.successRate,
-        averageHealth: stats.averageHealth,
-      };
-    } catch {
-      // Best-effort; table still renders with legacy fields.
-    }
-    let candidates: Map<string, {
-      activeStreams: number;
-      queuedRequests: number;
-      healthScore: number;
-      success: number;
-      failure: number;
-      lastUsed: number | null;
-    }> = new Map();
-    try {
-      const built = buildSchedulerCandidates(rawAccounts);
-      candidates = new Map(
-        built.map((cand) => [
-          cand.account.id,
-          {
-            activeStreams: cand.activeStreams,
-            queuedRequests: cand.queuedRequests,
-            healthScore: cand.health.healthScore,
-            success: cand.health.successCount,
-            failure: cand.health.failureCount,
-            lastUsed: cand.health.lastRequestAt,
-          },
-        ]),
-      );
-    } catch {
-      // Best-effort.
-    }
-    cachedAccounts = rawAccounts.map((acc) => {
-      const cooldownInfo = getAccountCooldownInfo(acc.id);
-      const onCooldown = Boolean(cooldownInfo?.onCooldown);
-      const remainingCooldownMs = cooldownInfo?.remainingMs || 0;
-      const headersReady = lastServerReadyAccounts !== null
-        ? lastServerReadyAccounts.has(acc.id)
-        : isAccountHeadersReady(acc.id);
-      const isInitialized = lastServerActiveAccounts !== null
-        ? lastServerActiveAccounts.has(acc.id)
-        : isPlaywrightInitialized(acc.id);
-      const extra = candidates.get(acc.id);
-      // Legacy tri-state preserved for existing views/tests; state adds detail.
-      let state = states[acc.id];
-      if (!state) {
-        state = onCooldown
-          ? "COOLDOWN"
-          : !headersReady
-            ? isInitialized ? "WARMING" : "WARMING"
-            : extra && extra.activeStreams > 0 ? "BUSY" : "READY";
-        if (!headersReady && !isInitialized && !onCooldown) state = "WARMING";
-      }
-      return {
-        id: acc.id,
-        emailOrName: maskAccountIdentifier(acc.email || acc.id),
-        priority: 1,
-        cooldownUntil: acc.cooldown_until || null,
-        onCooldown,
-        remainingCooldownMs,
-        cooldownReason:
-          cooldownInfo?.reason ?? acc.cooldown_reason ?? null,
-        headersReady,
-        isInitialized,
-        state,
-        health: extra?.healthScore ?? 100,
-        activeStreams: extra?.activeStreams ?? 0,
-        requests: (extra?.success ?? 0) + (extra?.failure ?? 0),
-        success: extra?.success ?? 0,
-        failure: extra?.failure ?? 0,
-        lastUsed: extra?.lastUsed ?? null,
-      };
+  try {
+    const resp = await fetch(`http://${host}:${port}/health`, {
+      signal: controller.signal,
     });
-    cachedPool = poolSummary;
-  }
-  const accounts = cachedAccounts;
-  const online = lastOnlineState;
-  const overallStatus = lastOverallStatus;
+    clearTimeout(timeout);
 
-  // Concurrency stats
-  let activeStreams = 0;
-  let waitingStreams = 0;
-  try {
-    const snapshot = getAccountConcurrencySnapshot();
-    for (const item of snapshot) {
-      activeStreams += item.active;
-      waitingStreams += item.waiting;
+    if (resp.ok) {
+      return await resp.json();
     }
-  } catch {}
+  } catch {
+    clearTimeout(timeout);
+  }
 
-  // RAM usage
-  let rssMb = 0;
-  let systemMemoryPct = 0;
+  return null;
+}
+
+export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
+  const now = Date.now();
+
+  // Serialized polling - prevent overlapping requests
+  if (healthPollMutex || now - lastHealthPollTime < 1000) {
+    if (cachedStatus && now - lastStatusTime < 5000) {
+      return cachedStatus;
+    }
+  }
+
+  healthPollMutex = true;
+  lastHealthPollTime = now;
+
   try {
-    const rssSnap = getRssUsageSnapshot();
-    rssMb = Math.round(rssSnap.rss / (1024 * 1024));
-    systemMemoryPct = Math.round(rssSnap.usagePercent * 10) / 10;
-  } catch {}
+    const healthData = await fetchHealth();
 
-  return {
-    online,
-    port,
-    host,
-    overallStatus,
-    uptimeSeconds,
-    rssMb,
-    systemMemoryPct,
-    activeStreams,
-    waitingStreams,
-    accounts,
-    pool: cachedPool,
-    performance: performanceMetrics.getSnapshot(),
+    if (healthData) {
+      const port = config.server?.port || 7936;
+      const configuredHost = config.server?.host;
+      const host = configuredHost && configuredHost !== "0.0.0.0" ? configuredHost : "127.0.0.1";
+
+      const accounts = (healthData.accounts || []).map((acc: any) => {
+        // Use rawId if available, otherwise use id (masked)
+        const accountId = acc.rawId || acc.id || "";
+        // Use account field for email, or fall back to email field
+        const emailOrName = maskAccountIdentifier(acc.account || acc.email || accountId || "");
+        
+        return {
+          id: accountId,
+          emailOrName,
+          priority: 1,
+          cooldownUntil: acc.cooldownUntil || null,
+          onCooldown: Boolean(acc.onCooldown),
+          remainingCooldownMs: acc.cooldownRemainingMs || acc.remainingCooldownMs || 0,
+          cooldownReason: acc.cooldownReason || null,
+          headersReady: Boolean(acc.headersReady),
+          isInitialized: Boolean(acc.isInitialized),
+          state: acc.state || "READY",
+          health: acc.health || 100,
+          activeStreams: acc.activeStreams || 0,
+          requests: acc.requests || 0,
+          success: acc.success || 0,
+          failure: acc.failure || 0,
+          lastUsed: acc.lastUsed || null,
+        };
+      });
+
+      cachedStatus = {
+        online: true,
+        port,
+        host,
+        overallStatus: healthData.status || "healthy",
+        uptimeSeconds: healthData.uptimeSeconds,
+        rssMb: healthData.rssMb,
+        systemMemoryPct: healthData.systemMemoryPct,
+        activeStreams: healthData.activeStreams,
+        waitingStreams: healthData.waitingStreams,
+        accounts,
+        pool: healthData.pool ? {
+          total: healthData.pool.total,
+          ready: healthData.pool.ready,
+          warming: healthData.pool.warming,
+          busy: healthData.pool.busy,
+          cooldown: healthData.pool.cooldown,
+          authError: healthData.pool.authError,
+          broken: healthData.pool.broken,
+          disabled: healthData.pool.disabled,
+          activeStreams: healthData.pool.activeStreams,
+          queued: healthData.pool.queued,
+          successRate: healthData.pool.successRate,
+          averageHealth: healthData.pool.averageHealth,
+        } : null,
+        performance: healthData.performance || null,
+      };
+      lastStatusTime = now;
+    }
+  } catch {} finally {
+    healthPollMutex = false;
+  }
+
+  if (cachedStatus && now - lastStatusTime < 10000) {
+    return cachedStatus;
+  }
+
+  // Fallback when server is offline
+  const fallbackStatus: ProxyStatusSnapshot = {
+    online: false,
+    port: config.server?.port || 7936,
+    host: config.server?.host || "127.0.0.1",
+    overallStatus: "offline",
+    uptimeSeconds: process.uptime(),
+    rssMb: 0,
+    systemMemoryPct: 0,
+    activeStreams: 0,
+    waitingStreams: 0,
+    accounts: [],
+    pool: null,
+    performance: null,
   };
-}
 
-export function resetAllCooldowns(): number {
-  return clearAllAccountCooldowns();
-}
-
-export function resetAccountCooldownById(accountId: string): void {
-  clearAccountCooldown(accountId);
+  return fallbackStatus;
 }
 
 export interface StreamChatOptions {
@@ -267,9 +226,6 @@ export interface StreamChatOptions {
   signal?: AbortSignal;
 }
 
-/**
- * Streams a chat completion response from the local proxy endpoint.
- */
 export async function streamChatCompletions(
   options: StreamChatOptions,
 ): Promise<{ totalTimeMs: number; ttfbMs: number }> {
@@ -360,9 +316,6 @@ export async function streamChatCompletions(
   };
 }
 
-/**
- * Fetches all live models dynamically from the running proxy /v1/models catalog.
- */
 let cachedLiveModels: string[] | null = null;
 let liveModelsPromise: Promise<string[]> | null = null;
 
@@ -427,4 +380,12 @@ export async function fetchLiveModels(forceRefresh = false): Promise<string[]> {
   })();
 
   return liveModelsPromise;
+}
+
+export function resetAllCooldowns(): number {
+  return 0;
+}
+
+export function resetAccountCooldownById(accountId: string): void {
+  // Server-side operation only
 }

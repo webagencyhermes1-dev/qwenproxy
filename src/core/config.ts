@@ -53,7 +53,7 @@ const envSchema = z
     // active streams are never touched, so concurrent accounts each keep their
     // own context while serving. Accounts in cooldown (rate-limited) sit idle,
     // drop out of the warm set and get evicted.
-    PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("2"),
+    PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("25"),
     PLAYWRIGHT_PREPARE_ALL_ON_STARTUP: z.string().default("false"),
     // Bounds how many per-account Chromium contexts may be launching and
     // capturing headers at the same time. Every account starts its own
@@ -61,7 +61,7 @@ const envSchema = z
     // initialize at once forks N renderers off the same host and the OOM/crash
     // cascade is what kills sibling contexts. 5 is a safe ceiling: an account
     // init spends ~15-20s, so at 5 that is ~4 accounts per minute booting.
-    PLAYWRIGHT_MAX_PARALLEL_INIT: z.string().default("5"),
+    PLAYWRIGHT_MAX_PARALLEL_INIT: z.string().default("20"),
     // DNS bypass for the Qwen origin inside Chromium. Chromium's own DNS/DoH
     // resolution occasionally lands on a frontier/bad IP for chat.qwen.ai,
     // which makes navigations fail (net::ERR_NAME_NOT_RESOLVED) or land on a
@@ -169,7 +169,9 @@ const envSchema = z
     CHAT_IN_PROGRESS_MAX_RETRIES: z.string().default("6"),
     MID_STREAM_FAILOVER_THRESHOLD: z.string().default("2"),
     MID_STREAM_FAILOVER_BUSY_MS: z.string().default("60000"),
-    POOL_TARGET_READY: z.string().default("2"),
+    POOL_TARGET_READY: z.string().default("20"),
+    POOL_RESERVE_READY: z.string().default("5"),
+    POOL_WARMUP_CONCURRENCY: z.string().default("20"),
     POOL_RECONCILIATION_INTERVAL_MS: z.string().default("30000"),
     POOL_WARMUP_TIMEOUT_MS: z.string().default("90000"),
     POOL_MAX_WARMUP_FAILURES: z.string().default("3"),
@@ -384,10 +386,12 @@ export const config = {
   },
   pool: {
     targetReady: Math.max(1, parseInt(env.POOL_TARGET_READY)),
-    warmupTimeoutMs: Math.max(1, parseInt(env.POOL_WARMUP_TIMEOUT_MS)),
-    backoffBaseMs: Math.max(1, parseInt(env.POOL_WARMUP_BACKOFF_BASE_MS)),
-    backoffMaxMs: Math.max(1, parseInt(env.POOL_WARMUP_BACKOFF_MAX_MS)),
-    maxWarmupFailures: Math.max(1, parseInt(env.POOL_MAX_WARMUP_FAILURES)),
+    reserveReady: Math.max(0, parseInt(env.POOL_RESERVE_READY)),
+    warmupConcurrency: Math.max(1, parseInt(env.POOL_WARMUP_CONCURRENCY || "1")),
+    warmupTimeoutMs: Math.max(1, parseInt(env.POOL_WARMUP_TIMEOUT_MS || "90000")),
+    backoffBaseMs: Math.max(1, parseInt(env.POOL_WARMUP_BACKOFF_BASE_MS || "500")),
+    backoffMaxMs: Math.max(1, parseInt(env.POOL_WARMUP_BACKOFF_MAX_MS || "300000")),
+    maxWarmupFailures: Math.max(1, parseInt(env.POOL_MAX_WARMUP_FAILURES || "3")),
     reconciliationIntervalMs: Math.max(
       1,
       parseInt(env.POOL_RECONCILIATION_INTERVAL_MS),

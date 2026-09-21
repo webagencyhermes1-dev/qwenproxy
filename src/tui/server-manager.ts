@@ -1,11 +1,12 @@
 /**
- * QwenProxy TUI - In-Process Server Manager ("All Together As One")
- * Starts and manages the Hono + Playwright proxy server directly within the TUI process.
+ * QwenProxy TUI - Server Manager with Child Process Isolation
+ * Manages the QwenProxy server as a separate child process to ensure
+ * TUI responsiveness during heavy server workload.
  */
 
 import { config } from "../core/config.ts";
-import { startServer, stopServer } from "../api/server.ts";
-import { stripAnsi } from "./theme.ts";
+import { ServerProcess } from "./server-process.ts";
+
 export type ServerLifecycleState = "offline" | "warming" | "online" | "error";
 
 export interface ServerLogEntry {
@@ -16,21 +17,15 @@ export interface ServerLogEntry {
 
 export class ServerManager {
   private static instance: ServerManager | null = null;
-
+  private serverProcess: ServerProcess;
   private state: ServerLifecycleState = "offline";
-  private lastError: string | null = null;
   private logEntries: ServerLogEntry[] = [];
   private logBuffer: string[] = [];
-  private originalLog = console.log;
-  private originalInfo = console.info;
-  private originalDebug = console.debug;
-  private originalWarn = console.warn;
-  private originalError = console.error;
-  private originalStdoutWrite = process.stdout.write.bind(process.stdout);
-  private originalStderrWrite = process.stderr.write.bind(process.stderr);
-  private intercepted = false;
-  private isTuiRendering = false;
-  private startPromise: Promise<void> | null = null;
+
+  private constructor() {
+    this.serverProcess = new ServerProcess();
+    this.setupEventHandlers();
+  }
 
   public static getInstance(): ServerManager {
     if (!ServerManager.instance) {
@@ -39,25 +34,42 @@ export class ServerManager {
     return ServerManager.instance;
   }
 
+  private setupEventHandlers(): void {
+    this.serverProcess.on("stateChange", (state) => {
+      const mappedState = this.mapServerProcessState(state);
+      if (mappedState) {
+        this.state = mappedState;
+      }
+    });
+
+    this.serverProcess.on("log", (event) => {
+      this.appendLog(event.level, event.message);
+    });
+  }
+
+  private mapServerProcessState(state: string): ServerLifecycleState | null {
+    switch (state) {
+      case "offline":
+      case "stopping":
+        return "offline";
+      case "starting":
+      case "restarting":
+        return "warming";
+      case "online":
+        return "online";
+      case "error":
+        return "error";
+      default:
+        return null;
+    }
+  }
+
   public getState(): ServerLifecycleState {
     return this.state;
   }
 
-  public withTuiRendering<T>(fn: () => T): T {
-    this.isTuiRendering = true;
-    try {
-      return fn();
-    } finally {
-      this.isTuiRendering = false;
-    }
-  }
-
-  public getRawStdoutWrite(): (chunk: string | Uint8Array) => boolean {
-    return this.originalStdoutWrite;
-  }
-
-  public getLastError(): string | null {
-    return this.lastError;
+  public getServerProcess(): ServerProcess {
+    return this.serverProcess;
   }
 
   public getRecentLogs(max = 12): string[] {
@@ -81,146 +93,45 @@ export class ServerManager {
 
   private appendLog(level: "INFO" | "WARN" | "ERROR", text: string): void {
     if (!text) return;
-    const clean = stripAnsi(text).trim();
+    const clean = text.trim();
     if (!clean || clean.length === 0) return;
 
-    const time = new Date().toLocaleTimeString("en-US", {
+    const last = this.logEntries[this.logEntries.length - 1];
+    if (last && last.time === this.getCurrentTime() && last.level === level && last.message === clean) {
+      return;
+    }
+
+    const time = this.getCurrentTime();
+    const entry: ServerLogEntry = { time, level, message: clean };
+
+    this.logEntries.push(entry);
+    if (this.logEntries.length > 500) {
+      this.logEntries.shift();
+    }
+
+    const formatted = `[${time}] ${clean}`;
+    this.logBuffer.push(formatted);
+    if (this.logBuffer.length > 500) {
+      this.logBuffer.shift();
+    }
+  }
+
+  private getCurrentTime(): string {
+    return new Date().toLocaleTimeString("en-US", {
       hour: "2-digit",
       minute: "2-digit",
       second: "2-digit",
     });
-
-    const lines = clean.split(/\r?\n/);
-    for (const raw of lines) {
-      let line = raw.trim();
-      if (!line) continue;
-
-      // Filter out raw ASCII box frames and border rows entirely
-      if (/^[+\-=#]{5,}$/.test(line)) continue;
-      if (/^\|\s*\|$/.test(line)) continue;
-      if (line.startsWith("|") && line.endsWith("|")) continue;
-
-      // Filter out any box remnants (startup banner is for headless npm start only)
-      if (
-        line === "QwenProxy" ||
-        line === "OpenAI & Anthropic Compatible API" ||
-        /^Endpoint\s+http/i.test(line) ||
-        /^Port\s+\d+/i.test(line) ||
-        /^Accounts\s+\d+\/\d+/i.test(line) ||
-        /^API Key\s+/i.test(line) ||
-        /^Status\s+●/i.test(line)
-      ) {
-        continue;
-      }
-      if (!line) continue;
-
-      // Prevent identical consecutive duplicate logs in the same second
-      const last = this.logEntries[this.logEntries.length - 1];
-      if (last && last.time === time && last.level === level && last.message === line) {
-        continue;
-      }
-
-      this.logEntries.push({ time, level, message: line });
-      if (this.logEntries.length > 500) {
-        this.logEntries.shift();
-      }
-
-      const levelTag = level === "ERROR" ? "[ERR]" : level === "WARN" ? "[WARN]" : "";
-      const formatted = `[${time}] ${levelTag ? levelTag + " " : ""}${line}`;
-      this.logBuffer.push(formatted);
-      if (this.logBuffer.length > 500) {
-        this.logBuffer.shift();
-      }
-    }
   }
 
-  public interceptLogs(): void {
-    if (this.intercepted) return;
-    this.intercepted = true;
-
-    console.log = (...args: any[]) => {
-      this.appendLog(
-        "INFO",
-        args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "),
-      );
-    };
-
-    console.info = (...args: any[]) => {
-      this.appendLog(
-        "INFO",
-        args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "),
-      );
-    };
-
-    console.debug = (...args: any[]) => {
-      this.appendLog(
-        "INFO",
-        args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "),
-      );
-    };
-
-    console.warn = (...args: any[]) => {
-      this.appendLog(
-        "WARN",
-        args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "),
-      );
-    };
-
-    console.error = (...args: any[]) => {
-      this.appendLog(
-        "ERROR",
-        args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "),
-      );
-    };
-
-    // Sandbox direct process.stdout.write calls (Playwright, Hono, etc.)
-    process.stdout.write = ((chunk: any, encoding?: any, cb?: any) => {
-      if (this.isTuiRendering) {
-        return this.originalStdoutWrite(chunk, encoding, cb);
-      }
-      const str = typeof chunk === "string" ? chunk : chunk?.toString(encoding);
-      // Terminal escape sequences (OSC 52 clipboard, cursor codes) bypass log capture
-      if (typeof str === "string" && (str.startsWith("\x1b]") || str.startsWith("\x1b[") || str.startsWith("\x1b"))) {
-        return this.originalStdoutWrite(chunk, encoding, cb);
-      }
-      this.appendLog("INFO", str);
-      if (typeof cb === "function") cb();
-      return true;
-    }) as any;
-
-    // Sandbox direct process.stderr.write calls
-    process.stderr.write = ((chunk: any, encoding?: any, cb?: any) => {
-      const str = typeof chunk === "string" ? chunk : chunk?.toString(encoding);
-      this.appendLog("ERROR", str);
-      if (typeof cb === "function") cb();
-      return true;
-    }) as any;
-  }
-
-  public restoreLogs(): void {
-    if (!this.intercepted) return;
-    console.log = this.originalLog;
-    console.info = this.originalInfo;
-    console.debug = this.originalDebug;
-    console.warn = this.originalWarn;
-    console.error = this.originalError;
-    process.stdout.write = this.originalStdoutWrite;
-    process.stderr.write = this.originalStderrWrite;
-    this.intercepted = false;
-  }
-
-  /**
-   * Checks if proxy is already running on port 7936, or boots it up in-process.
-   */
   public async ensureStarted(): Promise<void> {
     if (this.state === "online") return;
-    if (this.startPromise) return this.startPromise;
+    if (this.serverProcess.getState() === "starting") return;
 
     const port = config.server?.port || 7936;
     const host = config.server?.host || "127.0.0.1";
     const cleanHost = host === "0.0.0.0" ? "127.0.0.1" : host;
 
-    // 1. Probe if already online
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 600);
@@ -230,49 +141,19 @@ export class ServerManager {
       clearTimeout(timeout);
       if (resp.ok) {
         this.state = "online";
-        this.appendLog(
-          "INFO",
-          `✨ [Server] Connected to the running instance on port ${port}`,
-        );
+        this.appendLog("INFO", `✨ [Server] Connected to the running instance on port ${port}`);
         return;
       }
     } catch {}
 
-    // 2. Start in-process
-    this.state = "warming";
-    this.appendLog(
-      "INFO",
-      `🚀 [Server] Starting server on port ${port}...`,
-    );
-
-    this.interceptLogs();
-
-    this.startPromise = (async () => {
-      try {
-        await startServer({ installSignalHandlers: false, showBanner: false });
-        this.state = "online";
-        this.appendLog(
-          "INFO",
-          `✨ [Server] QwenProxy ready and online at http://${cleanHost}:${port}/v1`,
-        );
-      } catch (err: any) {
-        this.state = "error";
-        this.lastError = err?.message || String(err);
-        this.appendLog(
-          "ERROR",
-          `❌ [Server] Failed to start server: ${this.lastError}`,
-        );
-      } finally {
-        this.startPromise = null;
-      }
-    })();
+    await this.serverProcess.start(port, host);
   }
 
   public async stop(): Promise<void> {
-    this.restoreLogs();
-    try {
-      await stopServer();
-      this.state = "offline";
-    } catch {}
+    await this.serverProcess.stop();
+  }
+
+  public cleanup(): void {
+    this.serverProcess.cleanup();
   }
 }

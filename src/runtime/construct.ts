@@ -27,7 +27,6 @@ export interface ConstructRuntimeDeps {
 }
 
 const SYSTEM_FENCE = { leaseId: "system", ownerToken: "system" };
-const READINESS_TICK_INTERVAL_MS = 5_000;
 const MAINTENANCE_POLL_INTERVAL_MS = 15_000;
 const MAINTENANCE_MAX_QUEUE_DEPTH = 256;
 
@@ -87,7 +86,9 @@ export async function constructRuntime(
 ): Promise<{ runtime: QwenRuntime; runtimeServices: RuntimeServices }> {
   bootPersistence();
 
-  const ownership = new AccountResourceManager();
+  const ownership = new AccountResourceManager({
+    targetReady: config.pool.targetReady,
+  });
   for (const account of accounts) {
     ownership.registerAccount(account.id, {
       accountId: account.id,
@@ -125,7 +126,14 @@ export async function constructRuntime(
 
   const readiness = new ReadinessController(
     ownership,
-    { warmupConcurrency: Math.max(1, config.playwright.initBatchSize) },
+    {
+      targetReady: config.pool.targetReady,
+      warmupConcurrency: config.pool.warmupConcurrency,
+      warmupTimeoutMs: config.pool.warmupTimeoutMs,
+      maxWarmupFailures: config.pool.maxWarmupFailures,
+      backoffBaseMs: config.pool.backoffBaseMs,
+      backoffMaxMs: config.pool.backoffMaxMs,
+    },
     {
       warmWarmup: (accountId) =>
         warmAccount(ownership, accountId, deps?.warmupExecutor),
@@ -142,7 +150,7 @@ export async function constructRuntime(
 
   const tickTimer = setInterval(() => {
     void readiness.tick();
-  }, READINESS_TICK_INTERVAL_MS);
+  }, config.pool.reconciliationIntervalMs);
   tickTimer.unref?.();
 
   const runtimeServices: RuntimeServices = {
