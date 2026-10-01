@@ -99,14 +99,21 @@ test("prompt limits reject byte and model-context overages locally", () => {
   const compactModel = "qwen3-omni-flash-2025-12-01";
   const stats = getPromptLimitStats("", compactModel);
   const overContextPrompt = "a".repeat((stats.usableInputTokens + 1) * 4);
-  assert.throws(
-    () => assertPromptWithinLimits(overContextPrompt, compactModel),
-    (error: unknown) => {
-      assert.ok(error instanceof ContextLengthExceededError);
-      assert.match(error.message, /usable context/);
-      return true;
-    },
-  );
+  // Lift the byte budget so the model-context check (not the byte check) fires.
+  const priorMaxPromptBytes = config.qwen.maxPromptBytes;
+  config.qwen.maxPromptBytes = overContextPrompt.length + 1;
+  try {
+    assert.throws(
+      () => assertPromptWithinLimits(overContextPrompt, compactModel),
+      (error: unknown) => {
+        assert.ok(error instanceof ContextLengthExceededError);
+        assert.match(error.message, /usable context/);
+        return true;
+      },
+    );
+  } finally {
+    config.qwen.maxPromptBytes = priorMaxPromptBytes;
+  }
 
   if (config.qwen.maxPersonalizationBytes > 0) {
     assert.equal(

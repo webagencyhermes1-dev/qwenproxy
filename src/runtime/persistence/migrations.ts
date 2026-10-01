@@ -10,6 +10,9 @@
  */
 
 import type BetterSqlite3Database from "better-sqlite3";
+import fs from "node:fs";
+import path from "node:path";
+import { backupDatabase } from "../../core/database.ts";
 import { CURRENT_SCHEMA_VERSION, NEW_TABLE_DDL } from "./schema.ts";
 
 /**
@@ -82,6 +85,135 @@ const MIGRATIONS: ReadonlyMap<number, MigrationStep> = new Map<
 ]);
 
 /**
+ * Phase-3.2 durability: pre-migration backup conventions.
+ *
+ * Before any migration step runs, the runner best-effort backs up to
+ * `<dbdir>/pre-migrate-<timestamp>.db` via `backupDatabase` and keeps only
+ * the newest 3 backups. Backup failures never block migration.
+ */
+export const PRE_MIGRATE_BACKUP_PREFIX = "pre-migrate-";
+export const PRE_MIGRATE_BACKUP_KEEP = 3;
+
+/** Builds `<dbdir>/pre-migrate-<timestamp>.db`. */
+export function buildPreMigrationBackupPath(
+  dbDir: string,
+  now: number = Date.now(),
+): string {
+  return path.join(dbDir, `${PRE_MIGRATE_BACKUP_PREFIX}${now}.db`);
+}
+
+/** Lists pre-migration backups in `dbDir`, oldest-first (timestamp names sort). */
+export function listPreMigrationBackups(dbDir: string): string[] {
+  try {
+    return fs
+      .readdirSync(dbDir)
+      .filter(
+        (f) => f.startsWith(PRE_MIGRATE_BACKUP_PREFIX) && f.endsWith(".db"),
+      )
+      .sort()
+      .map((f) => path.join(dbDir, f));
+  } catch {
+    return [];
+  }
+}
+
+/** Keeps only the newest `keep` backups, deleting older ones best-effort. */
+export function prunePreMigrationBackups(
+  dbDir: string,
+  keep: number = PRE_MIGRATE_BACKUP_KEEP,
+): void {
+  try {
+    const files = listPreMigrationBackups(dbDir);
+    if (files.length <= keep) return;
+    for (const f of files.slice(0, files.length - keep)) {
+      try {
+        fs.unlinkSync(f);
+      } catch {
+        /* best-effort per file */
+      }
+    }
+  } catch {
+    /* never block */
+  }
+}
+
+function resolveDbDir(db: BetterSqlite3Database.Database): string | null {
+  try {
+    const name = (db as unknown as { name?: unknown }).name;
+    if (typeof name === "string" && name.length > 0 && name !== ":memory:") {
+      return path.dirname(path.resolve(name));
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+/**
+ * Best-effort pre-migration backup. Never throws and never blocks migration:
+ * a synchronous file-copy snapshot is taken first for determinism, then
+ * `backupDatabase` is invoked (floating promise, errors swallowed), then
+ * rotation prunes to the newest 3.
+ */
+function ensurePreMigrationBackup(db: BetterSqlite3Database.Database): void {
+  try {
+    const dbDir = resolveDbDir(db);
+    if (!dbDir) return;
+    try {
+      fs.mkdirSync(dbDir, { recursive: true });
+    } catch {
+      /* ignore */
+    }
+    const dest = buildPreMigrationBackupPath(dbDir);
+    // Synchronous snapshot of the migrating handle for determinism.
+    try {
+      const src = path.resolve(
+        (db as unknown as { name: string }).name,
+      );
+      if (fs.existsSync(src) && !fs.existsSync(dest)) {
+        try {
+          db.pragma("wal_checkpoint(TRUNCATE)");
+        } catch {
+          /* best-effort */
+        }
+        fs.copyFileSync(src, dest);
+      }
+    } catch {
+      /* best-effort */
+    }
+    // Canonical online backup (best-effort, never blocks).
+    try {
+      const p = backupDatabase(dest);
+      p.then(
+        () => {
+          try {
+            prunePreMigrationBackups(dbDir);
+          } catch {
+            /* ignore */
+          }
+        },
+        () => {
+          try {
+            prunePreMigrationBackups(dbDir);
+          } catch {
+            /* ignore */
+          }
+        },
+      );
+    } catch {
+      /* never block */
+    }
+    try {
+      prunePreMigrationBackups(dbDir);
+    } catch {
+      /* ignore */
+    }
+  } catch {
+    /* never block */
+  }
+}
+
+/**
  * Reads `PRAGMA user_version`. Fresh and legacy databases report 0.
  */
 export function getSchemaVersion(db: BetterSqlite3Database.Database): number {
@@ -110,6 +242,11 @@ export function runVersionedMigrations(
 
   if (current > CURRENT_SCHEMA_VERSION) {
     throw new UnsupportedSchemaVersionError(current, CURRENT_SCHEMA_VERSION);
+  }
+
+  if (current < CURRENT_SCHEMA_VERSION) {
+    // Phase-3.2: best-effort pre-migration backup, never blocks migration.
+    ensurePreMigrationBackup(db);
   }
 
   while (current < CURRENT_SCHEMA_VERSION) {

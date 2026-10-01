@@ -1,15 +1,16 @@
 /**
- * Hermetic request-path tests for the QWEN_RUNTIME_LEASE_AUTHORITY flag.
+ * Hermetic request-path tests for the single account authority.
  *
  * No DB, no network, no browser: the ownership authority is exercised directly
  * with in-memory accounts, and the request-path seams (gateway claim, fenced
- * release, bounded compaction, legacy pass-through) are tested in isolation.
+ * release, failover compaction, slot pass-through) are tested in isolation.
+ * Bound tests register an in-memory authority; unbound tests exercise the
+ * slot path used by hermetic suites that never bind.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import type { ModelCapabilitySource } from "../context/context-service.ts";
-import { TypedRuntimeError } from "../../domain/errors.ts";
+import { ContextLengthExceededError } from "../../core/errors.ts";
 import {
   acquireAccountLease,
   resetAccountConcurrencyForTests,
@@ -23,22 +24,14 @@ import {
 import {
   getAccountOwnership,
   initAccountOwnership,
-  isLeaseAuthorityEnabled,
   resetAccountOwnershipForTests,
   toLegacyAccountLease,
 } from "./instance.ts";
-import { prepareCompressedFailoverPrompt } from "../../routes/chat/account.ts";
-import { isTerminalLocalError } from "../../routes/chat/retry-policy.ts";
-
-const FLAG = "QWEN_RUNTIME_LEASE_AUTHORITY";
-
-function enableFlag(): void {
-  process.env[FLAG] = "true";
-}
-
-function disableFlag(): void {
-  delete process.env[FLAG];
-}
+import { buildCompressedFailoverPrompt } from "../../routes/chat/account.ts";
+import {
+  isContextLengthExceededError,
+  isTerminalLocalError,
+} from "../../routes/chat/retry-policy.ts";
 
 /** A generation claim requires a READY account; register and warm one. */
 function registerReady(...accountIds: string[]): void {
@@ -66,29 +59,13 @@ function winningAccountIds(
     .map((r) => r.accountId);
 }
 
-test.before(() => {
-  disableFlag();
-});
-
 test.afterEach(() => {
-  disableFlag();
   resetGatewayForTests();
   resetAccountOwnershipForTests();
   resetAccountConcurrencyForTests();
 });
 
-test("flag is OFF by default and unreadable as anything but a boolean", () => {
-  assert.equal(isLeaseAuthorityEnabled(), false);
-  process.env[FLAG] = "1";
-  assert.equal(isLeaseAuthorityEnabled(), false);
-  process.env[FLAG] = "true";
-  assert.equal(isLeaseAuthorityEnabled(), true);
-  disableFlag();
-  assert.equal(isLeaseAuthorityEnabled(), false);
-});
-
-test("flag ON: two concurrent acquires for the same candidate list claim each account exactly once", async () => {
-  enableFlag();
+test("bound: two concurrent acquires for the same candidate list claim each account exactly once", async () => {
   registerReady("g1", "g2");
 
   let resolveA!: () => void;
@@ -135,8 +112,7 @@ test("flag ON: two concurrent acquires for the same candidate list claim each ac
   );
 });
 
-test("flag ON: fenced release rejects a stale token and keeps the current owner", () => {
-  enableFlag();
+test("bound: fenced release rejects a stale token and keeps the current owner", () => {
   registerReady("h1");
 
   const claimed = acquireGenerationAccount({
@@ -180,25 +156,21 @@ test("flag ON: fenced release rejects a stale token and keeps the current owner"
   assert.equal(reclaimed.ok, true);
 });
 
-test("flag ON: a context-budget failure in the retry loop terminates with a typed error instead of looping", () => {
-  enableFlag();
-  // A model whose window is far smaller than the request: the invariant
-  // (system + current turn) cannot fit, so compaction fails closed.
-  const tinyWindow: ModelCapabilitySource = {
-    getContextWindowTokens: () => 100,
-    getMaxOutputTokens: () => 16,
-  };
-
+test("bound: a context-budget failure in the retry loop terminates with a typed error instead of looping", () => {
+  // An oversized system payload cannot fit any budget: the single failover
+  // compressor fails closed with a typed error on the first attempt.
   let iterations = 0;
   let caught: unknown = null;
   try {
     while (iterations < 5) {
       iterations++;
-      prepareCompressedFailoverPrompt({
-        messages: [{ role: "user", content: "x".repeat(50_000) }],
-        systemPrompt: "system prompt",
-        contextModelId: "test-model",
-        capabilities: tinyWindow,
+      buildCompressedFailoverPrompt({
+        systemPrompt: `System: ${"S".repeat(1_500_000)}`,
+        toolInstructions: "",
+        tools: [],
+        messages: [{ role: "user", content: "x".repeat(100) }],
+        usePersonalization: false,
+        reason: "request-path-test",
       });
     }
   } catch (err) {
@@ -206,10 +178,10 @@ test("flag ON: a context-budget failure in the retry loop terminates with a type
   }
 
   assert.equal(iterations, 1, "the loop must stop on the first budget failure");
-  assert.ok(caught instanceof TypedRuntimeError, "must be a typed error");
+  assert.ok(caught instanceof ContextLengthExceededError, "must be a typed error");
   assert.equal(
-    (caught as TypedRuntimeError).code,
-    "CONTEXT_TOO_LARGE",
+    isContextLengthExceededError(caught),
+    true,
     "must carry the typed context-budget code",
   );
   assert.equal(
@@ -219,8 +191,7 @@ test("flag ON: a context-budget failure in the retry loop terminates with a type
   );
 });
 
-test("flag ON: account-concurrency delegates to the authority and keeps the legacy lease shape", async () => {
-  enableFlag();
+test("bound: account-concurrency delegates to the authority and keeps the legacy lease shape", async () => {
   registerReady("d1");
 
   const lease = await acquireAccountLease("d1", { label: "session-S" });
@@ -229,10 +200,13 @@ test("flag ON: account-concurrency delegates to the authority and keeps the lega
   assert.equal(typeof lease.release, "function");
   assert.equal(lease.accountId, "d1");
 
-  // A different session cannot take it while it is held.
+  // A different session cannot take it while it is held (fail-fast, no queue).
   await assert.rejects(
     () => acquireAccountLease("d1", { label: "session-T", timeoutMs: 50 }),
-    /unavailable under lease authority/,
+    (err: unknown) => {
+      assert.equal((err as { code?: string }).code, "account_busy");
+      return true;
+    },
   );
 
   // Same-session re-entrancy is allowed (retry on the same logical operation).
@@ -248,8 +222,7 @@ test("flag ON: account-concurrency delegates to the authority and keeps the lega
   again.release();
 });
 
-test("flag ON: the legacy adapter release is fenced and idempotent", () => {
-  enableFlag();
+test("bound: the legacy adapter release is fenced and idempotent", () => {
   registerReady("d1");
 
   const claimed = acquireGenerationAccount({
@@ -267,8 +240,7 @@ test("flag ON: the legacy adapter release is fenced and idempotent", () => {
   assert.equal(getAccountOwnership().getAccountStatus("d1"), "READY");
 });
 
-test("flag OFF: the legacy lease path returns the legacy lease shape", async () => {
-  disableFlag();
+test("unbound: the legacy lease path returns the legacy lease shape", async () => {
   // Per-account capacity is 1 under the repo's test env (.env.test pins
   // ACCOUNT_MAX_CONCURRENT_STREAMS=1 at import time); run this file with
   // --env-file=.env.test like the rest of the suite.

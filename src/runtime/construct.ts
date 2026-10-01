@@ -1,4 +1,5 @@
 ﻿import { config } from "../core/config.ts";
+import { metrics as coreMetrics } from "../core/metrics.ts";
 import type { QwenAccount } from "../core/accounts.ts";
 import { AccountResourceManager } from "./account/resource-manager.ts";
 import { GenerationCoordinator } from "./generation/generation-coordinator.ts";
@@ -17,18 +18,46 @@ import {
   defaultStreamRegistry,
   getStream,
 } from "./stream/stream-manager.ts";
-import { bindGateway } from "./gateway.ts";
+import { setAccountOwnership } from "./account/instance.ts";
 import type { QwenRuntime } from "./runtime.ts";
 import type { RuntimeServices } from "./bootstrap.ts";
 
 export interface ConstructRuntimeDeps {
   warmupExecutor?: (accountId: string) => Promise<boolean>;
   keepAliveExecutor?: (accountId: string) => Promise<void>;
+  terminateWarmup?: (accountId: string) => Promise<void> | void;
 }
 
 const SYSTEM_FENCE = { leaseId: "system", ownerToken: "system" };
 const MAINTENANCE_POLL_INTERVAL_MS = 15_000;
 const MAINTENANCE_MAX_QUEUE_DEPTH = 256;
+
+/**
+ * The live readiness controller (set by constructRuntime / startRuntimeServices).
+ * Lets any layer request an out-of-band reconcile pass (capacity miss,
+ * context death, quarantine) without depending on server startup state.
+ * Unset (tests, pre-startup) → requests are safe no-ops.
+ */
+let activeReadiness: ReadinessController | null = null;
+
+export function requestReadinessTick(reason?: string): void {
+  const controller = activeReadiness;
+  if (!controller) return;
+  if (reason) {
+    console.log(`🔥 [Readiness] Tick requested | reason=${reason}`);
+  }
+  void controller.tick();
+}
+
+/** Point the process-wide tick target at `controller` (startup/test setup). */
+export function setActiveReadiness(controller: ReadinessController | null): void {
+  activeReadiness = controller;
+}
+
+/** Test hook: detach the active controller. */
+export function clearActiveReadinessForTests(): void {
+  activeReadiness = null;
+}
 
 function recoverNonterminalGenerations(
   repository: GenerationRepository,
@@ -53,6 +82,17 @@ async function warmAccount(
   warmupExecutor: ((accountId: string) => Promise<boolean>) | undefined,
 ): Promise<WarmupOutcome> {
   if (!warmupExecutor) return "failed";
+  // A RECOVERING account re-enters the pool via STANDBY first (the state
+  // machine has no direct RECOVERING → WARMING edge).
+  if (ownership.getAccountStatus(accountId) === "RECOVERING") {
+    const requeued = ownership.transition(
+      accountId,
+      "STANDBY",
+      SYSTEM_FENCE,
+      "recovery-requeue",
+    );
+    if (!requeued.transitioned) return "failed";
+  }
   const claimed = ownership.transition(
     accountId,
     "WARMING",
@@ -112,7 +152,10 @@ export async function constructRuntime(
     streams: { createStream, getStream },
   });
 
-  bindGateway(ownership);
+  // Single authority handoff: the instance manager and the gateway lease
+  // path observe the same AccountResourceManager (see instance.ts). Without
+  // this, readiness/lease queries would silently fall back to legacy stores.
+  setAccountOwnership(ownership);
 
   const runtime: QwenRuntime = {
     ownership,
@@ -137,6 +180,15 @@ export async function constructRuntime(
     {
       warmWarmup: (accountId) =>
         warmAccount(ownership, accountId, deps?.warmupExecutor),
+      terminateWarmup: deps?.terminateWarmup,
+      onOutcome: (accountId, outcome, timedOut) => {
+        if (outcome === "failed") {
+          coreMetrics.increment("warmup.failures", 1, {
+            account: accountId,
+            reason: timedOut ? "timeout" : "failed",
+          });
+        }
+      },
     },
   );
   void readiness.tick();
@@ -149,7 +201,8 @@ export async function constructRuntime(
   maintenance.start();
 
   const tickTimer = setInterval(() => {
-    void readiness.tick();
+  setActiveReadiness(readiness);
+  void readiness.tick();
   }, config.pool.reconciliationIntervalMs);
   tickTimer.unref?.();
 

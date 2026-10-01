@@ -7,12 +7,18 @@ process.env.ACCOUNT_MAX_CONCURRENT_STREAMS = "1";
 import { StickyMap, STICKY_TTL_MS } from "../services/session/stickyMap.ts";
 import { generateStickyKey } from "../services/session/key.ts";
 import { HealthTracker } from "../services/account/health.ts";
-import { selectAccountForNewSession } from "../services/account/selection.ts";
+import { suggestAccountForNewSession } from "../services/account/advisory.ts";
 import { assembleCompressedContext } from "../services/context/tiered.ts";
 import {
   acquireAccountLease,
   resetAccountConcurrencyForTests,
 } from "../core/account-concurrency.ts";
+import { addAccount, removeAccount } from "../core/accounts.ts";
+import {
+  clearAllHeadersReadyAccounts,
+  markAccountHeadersReady,
+  unmarkAccountHeadersReady,
+} from "../core/account-manager.ts";
 import type { Message } from "../utils/types.ts";
 
 function bigConversation(exchanges: number): Message[] {
@@ -30,6 +36,18 @@ test("two sessions: different first messages bind different accounts; A failover
   const health = new HealthTracker();
   resetAccountConcurrencyForTests();
   try {
+    clearAllHeadersReadyAccounts();
+    // Create test accounts and mark them as headers ready
+    for (const acc of ["acc-a", "acc-b", "acc-c"]) {
+      try {
+        removeAccount(acc);
+      } catch {}
+      unmarkAccountHeadersReady(acc);
+      addAccount(`${acc}@test.com`, "secret", acc);
+      markAccountHeadersReady(acc);
+      for (let i = 0; i < 3; i++) health.recordSuccess(acc, 700);
+    }
+
     const keyA = generateStickyKey({
       messages: [{ role: "user", content: "session A: refactor auth module" } as Message],
     });
@@ -38,12 +56,8 @@ test("two sessions: different first messages bind different accounts; A failover
     });
     assert.notEqual(keyA, keyB);
 
-    for (const acc of ["acc-a", "acc-b", "acc-c"]) {
-      for (let i = 0; i < 3; i++) health.recordSuccess(acc, 700);
-    }
-
     // Session A binds first.
-    const pickA = selectAccountForNewSession({
+    const pickA = suggestAccountForNewSession({
       stickyMap: sticky,
       healthTracker: health,
       availableAccounts: ["acc-a", "acc-b", "acc-c"],
@@ -61,7 +75,7 @@ test("two sessions: different first messages bind different accounts; A failover
     health.recordSuccess(pickA!, 700);
 
     // Session B binds to a different account.
-    const pickB = selectAccountForNewSession({
+    const pickB = suggestAccountForNewSession({
       stickyMap: sticky,
       healthTracker: health,
       availableAccounts: ["acc-a", "acc-b", "acc-c"],
@@ -83,7 +97,7 @@ test("two sessions: different first messages bind different accounts; A failover
     try {
       // B's selection must not block on A's generation (<500ms).
       const t0 = Date.now();
-      const pickB2 = selectAccountForNewSession({
+      const pickB2 = suggestAccountForNewSession({
         stickyMap: sticky,
         healthTracker: health,
         availableAccounts: ["acc-a", "acc-b", "acc-c"],
@@ -99,7 +113,7 @@ test("two sessions: different first messages bind different accounts; A failover
 
     // Exhaust A's account with quota.
     for (let i = 0; i < 5; i++) health.record429(pickA!, "quota", 3600_000);
-    const rebindTo = selectAccountForNewSession({
+    const rebindTo = suggestAccountForNewSession({
       stickyMap: sticky,
       healthTracker: health,
       availableAccounts: ["acc-a", "acc-b", "acc-c"],
@@ -131,7 +145,14 @@ test("two sessions: different first messages bind different accounts; A failover
       sticky.touch(keyA);
     }
   } finally {
+    for (const acc of ["acc-a", "acc-b", "acc-c"]) {
+      try {
+        removeAccount(acc);
+      } catch {}
+      unmarkAccountHeadersReady(acc);
+    }
     sticky.clearForTests();
     resetAccountConcurrencyForTests();
   }
 });
+

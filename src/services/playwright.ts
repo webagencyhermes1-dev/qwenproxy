@@ -61,7 +61,8 @@ import { loadAccounts, type QwenAccount } from "../core/accounts.ts";
 // acyclic, while the reverse direction would drag the browser layer into core.
 import { hasActiveAccountLease } from "../core/account-concurrency.ts";
 import { config } from "../core/config.ts";
-import { maskEmail } from "../core/logger.ts";
+import { logger, maskEmail } from "../core/logger.ts";
+import { metrics } from "../core/metrics.ts";
 import { Mutex } from "../core/mutex.ts";
 import {
   isAccountHeadersReady,
@@ -1700,7 +1701,13 @@ export async function initPlaywrightForAccount(
 
     await withPlaywrightInitSlot(async () => {
     // If a context limit is configured, make room by closing idle contexts.
-    await evictIdlePlaywrightContextsToLimit().catch(() => {});
+    await evictIdlePlaywrightContextsToLimit().catch((error: unknown) => {
+      logger.warn("[Playwright] idle eviction cleanup suppressed", {
+        accountId: account.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      metrics.increment("browser.close.suppressed_errors");
+    });
 
     const profilePath = getAccountProfilePath(account.id);
     const fingerprint = getFingerprintProfile(account.id);
@@ -1762,7 +1769,13 @@ export async function initPlaywrightForAccount(
       if (restorableCookies.length > 0) {
         const currentCookies = await acctContext.cookies();
         if (currentCookies.length === 0) {
-          await acctContext.addCookies(restorableCookies).catch(() => {});
+          await acctContext.addCookies(restorableCookies).catch((error: unknown) => {
+            logger.warn("[Playwright] cookie restore suppressed", {
+              accountId: account.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            metrics.increment("browser.close.suppressed_errors");
+          });
         }
       }
 
@@ -1779,7 +1792,13 @@ export async function initPlaywrightForAccount(
       // profile/startup, but keep the primary page selected above.
       for (const extraPage of existingPages.slice(1)) {
         if (extraPage !== acctPage && extraPage.url() === "about:blank") {
-          await extraPage.close({ runBeforeUnload: false }).catch(() => {});
+          await extraPage.close({ runBeforeUnload: false }).catch((error: unknown) => {
+            logger.warn("[Playwright] extra page close suppressed", {
+              accountId: account.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            metrics.increment("browser.close.suppressed_errors");
+          });
         }
       }
 
@@ -1949,7 +1968,13 @@ export async function validateAccountLogin(
       if (restorableCookies.length > 0) {
         const currentCookies = await acctContext.cookies();
         if (currentCookies.length === 0) {
-          await acctContext.addCookies(restorableCookies).catch(() => {});
+          await acctContext.addCookies(restorableCookies).catch((error: unknown) => {
+            logger.warn("[Playwright] cookie restore suppressed", {
+              accountId: account.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            metrics.increment("browser.close.suppressed_errors");
+          });
         }
       }
 
@@ -3641,7 +3666,13 @@ export function installContextDeathHandlers(
 ): void {
   const onDeath = (): void => {
     cleanupPlaywrightAccountState(accountId);
-    void closePlaywrightContextBestEffort(accountId, context, { skipStorageSave: true }).catch(() => {});
+    void closePlaywrightContextBestEffort(accountId, context, { skipStorageSave: true }).catch((error: unknown) => {
+      logger.warn("[Playwright] context-death close suppressed", {
+        accountId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      metrics.increment("browser.close.suppressed_errors");
+    });
   };
   context.on("close", onDeath);
   page.on("crash", onDeath);
@@ -3659,8 +3690,10 @@ function cleanupPlaywrightAccountState(accountId: string): void {
   // page is gone, so it must not be selected by the rotation gate until a
   // fresh capture succeeds again.
   unmarkAccountHeadersReady(accountId);
-  void import("../core/readiness-guard.ts")
-    .then((m) => m.triggerReadinessCheck("context-death"))
+  // The ownership move (READY → RECOVERING) makes the account a warmup
+  // candidate; wake the controller so re-warm starts now, not next interval.
+  void import("../runtime/construct.ts")
+    .then((m) => m.requestReadinessTick("context-death"))
     .catch(() => {});
 }
 
@@ -3681,7 +3714,13 @@ async function closePlaywrightContextBestEffort(
     const pages = context.pages();
     for (const page of pages) {
       if (!page.isClosed()) {
-        await (page as any).unrouteAll?.({ behavior: "ignoreErrors" }).catch(() => {});
+        await (page as any).unrouteAll?.({ behavior: "ignoreErrors" }).catch((error: unknown) => {
+          logger.warn("[Playwright] unrouteAll suppressed", {
+            accountId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          metrics.increment("browser.close.suppressed_errors");
+        });
       }
     }
     await Promise.all(
@@ -3690,7 +3729,13 @@ async function closePlaywrightContextBestEffort(
           page.close({ runBeforeUnload: false }),
           2_000,
           `Timed out closing page for ${accountId}`,
-        ).catch(() => {}),
+        ).catch((error: unknown) => {
+          logger.warn("[Playwright] page close suppressed", {
+            accountId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          metrics.increment("browser.close.suppressed_errors");
+        }),
       ),
     );
 
@@ -3799,7 +3844,12 @@ export async function closeAllPlaywright(): Promise<void> {
       await closePlaywrightForAccount(accountId);
     }
     if (sharedBrowser && sharedBrowser.isConnected()) {
-      await sharedBrowser.close().catch(() => {});
+      await sharedBrowser.close().catch((error: unknown) => {
+        logger.warn("[Playwright] shared browser close suppressed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        metrics.increment("browser.close.suppressed_errors");
+      });
       sharedBrowser = null;
     }
   } finally {

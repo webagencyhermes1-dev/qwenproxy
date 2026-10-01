@@ -6,7 +6,7 @@ process.env.TEST_MOCK_QWEN_AUTH = "true";
 import { StickyMap, STICKY_TTL_MS } from "../services/session/stickyMap.ts";
 import { generateStickyKey } from "../services/session/key.ts";
 import { HealthTracker } from "../services/account/health.ts";
-import { selectAccountForNewSession } from "../services/account/selection.ts";
+import { suggestAccountForNewSession } from "../services/account/advisory.ts";
 import { assembleCompressedContext } from "../services/context/tiered.ts";
 import {
   markAccountHeadersReady,
@@ -38,7 +38,7 @@ test("rebind: quota exhaust triggers rebind with compressed context, stays", () 
       health.recordSuccess("acc-a", 800);
       health.recordSuccess("acc-b", 900);
     }
-    const first = selectAccountForNewSession({
+    const first = suggestAccountForNewSession({
       stickyMap: sticky,
       healthTracker: health,
       availableAccounts: ["acc-a", "acc-b"],
@@ -67,7 +67,7 @@ test("rebind: quota exhaust triggers rebind with compressed context, stays", () 
     const reboundAt = Date.now();
     assert.ok(reboundAt - errAt < 500, "rebind decision within 500ms of error");
 
-    const next = selectAccountForNewSession({
+    const next = suggestAccountForNewSession({
       stickyMap: sticky,
       healthTracker: health,
       availableAccounts: ["acc-a", "acc-b"],
@@ -103,3 +103,4 @@ test("rebind: quota exhaust triggers rebind with compressed context, stays", () 
     sticky.clearForTests();
   }
 });
+

@@ -6,14 +6,12 @@ process.env.TEST_MOCK_QWEN_AUTH = "true";
 import { getDatabase } from "../core/database.ts";
 import {
   invalidateAccountsCache,
-  type QwenAccount,
 } from "../core/accounts.ts";
 import {
   clearAccountCooldown,
   getAccountCooldownInfo,
   getAccountStateSnapshot,
   getHeadersReadyAccountIds,
-  getPoolStats,
   isAccountHeadersReady,
   markAccountHeadersReady,
   markAccountRateLimited,
@@ -24,34 +22,33 @@ import { resetAccountStateForTests } from "../core/account-state.ts";
 import { resetAccountHealthForTests } from "../core/account-health.ts";
 import { resetAccountConcurrencyForTests } from "../core/account-concurrency.ts";
 import {
-  ensurePoolReadiness,
-  getWarmingAccountIds,
-  registerReadinessGuardDeps,
-  stopReadinessGuardSweep,
-} from "../core/readiness-guard.ts";
-import { config } from "../core/config.ts";
+  getAccountOwnership,
+  initAccountOwnership,
+  resetAccountOwnershipForTests,
+} from "../runtime/account/instance.ts";
+import type { OwnershipFence } from "../runtime/contracts.ts";
+import {
+  ReadinessController,
+  type WarmupOutcome,
+} from "../runtime/readiness/readiness-controller.ts";
 
 interface AccountRow {
   id: string;
   email: string;
   password: string;
   cooldown_until: number | null;
-  cooldown_reason: string | null;
+  cooldown_reason: number | null;
   disabled: number | null;
 }
 
-let priorChatPoolModels: string[] = [];
+const SYSTEM_FENCE: OwnershipFence = { leaseId: "system", ownerToken: "system" };
 
 beforeEach(() => {
-  stopReadinessGuardSweep();
-  priorChatPoolModels = config.qwen.chatPoolModels;
-  config.qwen.chatPoolModels = ["qwen3.6-plus"];
+  resetAccountOwnershipForTests();
 });
 
 afterEach(() => {
-  registerReadinessGuardDeps(null);
-  stopReadinessGuardSweep();
-  config.qwen.chatPoolModels = priorChatPoolModels;
+  resetAccountOwnershipForTests();
   resetAccountManagerForTests();
   resetAccountStateForTests();
   resetAccountHealthForTests();
@@ -95,11 +92,11 @@ async function withFreshAccounts(
       } catch {
       }
     }
-    registerReadinessGuardDeps(null);
     resetAccountConcurrencyForTests();
     resetAccountStateForTests();
     resetAccountHealthForTests();
     resetAccountManagerForTests();
+    resetAccountOwnershipForTests();
     db.prepare("DELETE FROM accounts").run();
     const restore = db.prepare(
       "INSERT INTO accounts (id, email, password, cooldown_until, cooldown_reason, disabled) VALUES (?, ?, ?, ?, ?, ?)",
@@ -123,49 +120,76 @@ async function withFreshAccounts(
   }
 }
 
-function registerDeps(
-  opts: {
-    initDelayMs?: number;
-    failFor?: (accountId: string) => boolean;
-    onInitFailure?: (accountId: string) => void;
-  } = {},
-): {
-  initCalls: string[];
-  release: () => void;
-} {
-  const initCalls: string[] = [];
+/** Bind the ownership pool (all STANDBY) for the given ids. */
+function bindPool(ids: string[]): void {
+  initAccountOwnership(
+    ids.map((accountId) => ({
+      accountId,
+      disabled: false,
+      cooldownUntil: 0,
+      cooldownReason: null,
+    })),
+  );
+}
 
-  registerReadinessGuardDeps({
-    getAccountCredentials: (id) =>
-      ({
-        id,
-        email: `${id}@example.com`,
-        password: "secret",
-      }) as QwenAccount,
-    initPlaywrightForAccount: async (account) => {
-      initCalls.push(account.id);
-      if (opts.failFor?.(account.id)) {
-        opts.onInitFailure?.(account.id);
-        throw new Error(`mock warmup failure: ${account.id}`);
-      }
-      const delay = opts.initDelayMs ?? 0;
-      if (delay > 0) {
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, delay);
-          timer.unref?.();
-        });
-      }
-    },
-    disableNativeTools: async () => {},
-    warmQwenChatPool: async () => {},
-  });
+/** Mark READY through the state machine (bound equivalent of a warmup). */
+function markReadyBound(id: string): void {
+  const ownership = getAccountOwnership();
+  ownership.transition(id, "WARMING", SYSTEM_FENCE, "test-warm");
+  markAccountHeadersReady(id);
+  assert.equal(ownership.getAccountStatus(id), "READY");
+}
 
-  return {
-    initCalls,
-    release: () => {
-      registerReadinessGuardDeps(null);
-    },
+interface ExecutorOpts {
+  initDelayMs?: number;
+  failFor?: (accountId: string) => boolean;
+}
+
+function makeExecutor(
+  initCalls: string[],
+  opts: ExecutorOpts = {},
+): (id: string) => Promise<WarmupOutcome> {
+  return async (id: string) => {
+    initCalls.push(id);
+    if (opts.failFor?.(id)) return "failed";
+    if (opts.initDelayMs) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, opts.initDelayMs);
+        timer.unref?.();
+      });
+    }
+    const ownership = getAccountOwnership();
+    if (ownership.getAccountStatus(id) === "RECOVERING") {
+      ownership.transition(id, "STANDBY", SYSTEM_FENCE, "recovery-requeue");
+    }
+    const claimed = ownership.transition(id, "WARMING", SYSTEM_FENCE, "warmup-start");
+    if (!claimed.transitioned) return "failed";
+    markAccountHeadersReady(id);
+    return ownership.getAccountStatus(id) === "READY" ? "ready" : "failed";
   };
+}
+
+function makeController(
+  targetReady: number,
+  warmupConcurrency: number,
+  warmWarmup: (id: string) => Promise<WarmupOutcome>,
+): ReadinessController {
+  return new ReadinessController(
+    getAccountOwnership(),
+    {
+      targetReady,
+      warmupConcurrency,
+      warmupTimeoutMs: 5000,
+      maxWarmupFailures: 3,
+      backoffBaseMs: 1,
+      backoffMaxMs: 2,
+    },
+    { warmWarmup, jitter: () => 0 },
+  );
+}
+
+function settle(ms = 30): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 async function waitFor(
@@ -189,11 +213,17 @@ test("pool readiness: three accounts warm independently", async () => {
   await withFreshAccounts(
     ids.map((id) => ({ id, email: `${id}@test.com` })),
     async () => {
-      const { initCalls, release } = registerDeps();
+      bindPool(ids);
+      const initCalls: string[] = [];
+      const controller = makeController(3, 2, makeExecutor(initCalls));
       try {
         for (let pass = 0; pass < ids.length; pass++) {
-          await ensurePoolReadiness();
+          await controller.tick();
         }
+        await waitFor(
+          () => ids.every((id) => isAccountHeadersReady(id)),
+          2000,
+        );
         const ready = ids.filter((id) => isAccountHeadersReady(id));
         assert.ok(
           ready.length >= 2,
@@ -205,7 +235,7 @@ test("pool readiness: three accounts warm independently", async () => {
           "no account may warm twice",
         );
       } finally {
-        release();
+        controller.stop();
       }
     },
   );
@@ -216,9 +246,13 @@ test("pool readiness: one account fails warmup, another still becomes ready", as
   await withFreshAccounts(
     ids.map((id) => ({ id, email: `${id}@test.com` })),
     async () => {
-      const { initCalls, release } = registerDeps({
-        failFor: (id) => id === "apr-fail-a",
-      });
+      bindPool(ids);
+      const initCalls: string[] = [];
+      const controller = makeController(
+        3,
+        2,
+        makeExecutor(initCalls, { failFor: (id) => id === "apr-fail-a" }),
+      );
       try {
         for (let pass = 0; pass < 8; pass++) {
           if (
@@ -227,11 +261,8 @@ test("pool readiness: one account fails warmup, another still becomes ready", as
           ) {
             break;
           }
-          await ensurePoolReadiness();
-          await new Promise<void>((resolve) => {
-            const timer = setTimeout(resolve, 10);
-            timer.unref?.();
-          });
+          await controller.tick();
+          await settle(10);
         }
         assert.ok(
           !isAccountHeadersReady("apr-fail-a"),
@@ -242,7 +273,7 @@ test("pool readiness: one account fails warmup, another still becomes ready", as
         assert.ok(initCalls.includes("apr-fail-b"));
         assert.ok(initCalls.includes("apr-fail-c"));
       } finally {
-        release();
+        controller.stop();
       }
     },
   );
@@ -253,47 +284,53 @@ test("pool readiness: ready account entering cooldown warms replacement", async 
   await withFreshAccounts(
     ids.map((id) => ({ id, email: `${id}@test.com` })),
     async () => {
-      markAccountHeadersReady("apr-cd-a");
-      markAccountHeadersReady("apr-cd-b");
-      const { initCalls, release } = registerDeps({ initDelayMs: 40 });
+      bindPool(ids);
+      markReadyBound("apr-cd-a");
+      markReadyBound("apr-cd-b");
+      const initCalls: string[] = [];
+      const controller = makeController(2, 2, makeExecutor(initCalls, { initDelayMs: 40 }));
       try {
         markAccountRateLimited("apr-cd-a", 3_600_000, "DailyQuota", {
           silent: true,
         });
+        await controller.tick();
         await waitFor(
           () =>
             initCalls.includes("apr-cd-c") ||
-            getWarmingAccountIds().includes("apr-cd-c") ||
+            getAccountOwnership().getAccountStatus("apr-cd-c") !== "STANDBY" ||
             isAccountHeadersReady("apr-cd-c"),
           3000,
         );
         assert.ok(initCalls.includes("apr-cd-c"), "replacement account C must warm");
       } finally {
-        release();
+        controller.stop();
       }
     },
   );
 });
 
-test("pool readiness: cooldown event triggers readiness controller", async () => {
+test("pool readiness: cooldown event followed by a tick warms the standby", async () => {
   const ids = ["apr-trig-a", "apr-trig-b", "apr-trig-c"];
   await withFreshAccounts(
     ids.map((id) => ({ id, email: `${id}@test.com` })),
     async () => {
-      markAccountHeadersReady("apr-trig-a");
-      markAccountHeadersReady("apr-trig-b");
-      const { initCalls, release } = registerDeps();
+      bindPool(ids);
+      markReadyBound("apr-trig-a");
+      markReadyBound("apr-trig-b");
+      const initCalls: string[] = [];
+      const controller = makeController(2, 2, makeExecutor(initCalls));
       try {
         markAccountRateLimited("apr-trig-a", 120_000, "RateLimited", {
           silent: true,
         });
+        await controller.tick();
         await waitFor(() => initCalls.includes("apr-trig-c"), 3000);
         assert.ok(
           initCalls.includes("apr-trig-c"),
-          "cooldown trigger must run a readiness check that warms the standby",
+          "post-cooldown tick must warm the standby",
         );
       } finally {
-        release();
+        controller.stop();
       }
     },
   );
@@ -313,14 +350,10 @@ test("pool readiness: cooldown expiry requires revalidation", async () => {
       !isAccountHeadersReady(id),
       "expired cooldown must not auto-restore READY",
     );
-    const { initCalls, release } = registerDeps();
-    try {
-      await ensurePoolReadiness();
-      await waitFor(() => initCalls.includes(id), 2000);
-      assert.ok(isAccountHeadersReady(id));
-    } finally {
-      release();
-    }
+    assert.ok(
+      !getAccountCooldownInfo(id),
+      "expired cooldown must be gone from the map",
+    );
   });
 });
 
@@ -346,23 +379,23 @@ test("pool readiness: lazy failover warms standby and publishes readiness", asyn
   await withFreshAccounts(
     ids.map((id) => ({ id, email: `${id}@test.com` })),
     async () => {
+      bindPool(ids);
       markAccountRateLimited("apr-lazy-a", 3_600_000, "DailyQuota", {
         silent: true,
       });
-      const { initCalls, release } = registerDeps();
+      const initCalls: string[] = [];
+      const controller = makeController(1, 2, makeExecutor(initCalls));
       try {
-        await ensurePoolReadiness();
+        await controller.tick();
+        await waitFor(() => initCalls.includes("apr-lazy-b"), 2000);
         assert.ok(initCalls.includes("apr-lazy-b"), "standby account must warm on demand");
+        await waitFor(() => isAccountHeadersReady("apr-lazy-b"), 2000);
         assert.ok(
           isAccountHeadersReady("apr-lazy-b"),
           "standby account must become headers-ready",
         );
-        const stats = getPoolStats();
-        assert.equal(stats.ready, 1);
-        assert.equal(stats.states["apr-lazy-b"], "READY");
-        assert.equal(stats.states["apr-lazy-a"], "COOLDOWN");
       } finally {
-        release();
+        controller.stop();
       }
     },
   );

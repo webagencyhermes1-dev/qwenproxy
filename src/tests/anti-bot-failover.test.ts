@@ -15,7 +15,7 @@ import { RetryableQwenStreamError } from "../services/qwen.ts";
 import {
   clearAccountCooldown,
   getAccountCooldownInfo,
-  getNextAvailableAccount,
+  pickNextHotCandidate,
   markAccountHeadersReady,
   unmarkAccountHeadersReady,
 } from "../core/account-manager.ts";
@@ -273,9 +273,14 @@ test(
 
       // A excluded even though cooldown would otherwise allow fallback:
       // the scheduler's tried-set exclusion is authoritative.
-      const next = getNextAvailableAccount(new Set(["ab-a"]));
-      assert.ok(next);
-      assert.equal(next!.id, "ab-b");
+      markAccountHeadersReady("ab-b");
+      try {
+        const next = pickNextHotCandidate(new Set(["ab-a"]));
+        assert.ok(next);
+        assert.equal(next!.id, "ab-b");
+      } finally {
+        unmarkAccountHeadersReady("ab-b");
+      }
     },
   ),
 );
@@ -289,17 +294,21 @@ test(
       { id: "abc-c", email: "c@test.com" },
     ],
     () => {
+      markAccountHeadersReady("abc-b");
+      markAccountHeadersReady("abc-c");
       // A challenged -> excluded.
       const tried = new Set(["abc-a"]);
       // B busy (single slot in .env.test).
       const lease = tryAcquireAccountLease("abc-b", "busy-label");
       assert.ok(lease, "should hold B slot");
       try {
-        const next = getNextAvailableAccount(tried);
+        const next = pickNextHotCandidate(tried);
         assert.ok(next);
         assert.equal(next!.id, "abc-c");
       } finally {
         lease!.release();
+        unmarkAccountHeadersReady("abc-b");
+        unmarkAccountHeadersReady("abc-c");
       }
     },
   ),
@@ -315,16 +324,11 @@ test(
     () => {
       recordWafHardBlock("abb-a");
       recordWafHardBlock("abb-b");
-      // Both on cooldown: scheduler falls back to shortest-cooldown account,
-      // but the request-level tried set already contains both, so the outer
-      // loop treats it as exhausted (no eligible account remains).
+      // Both on cooldown and both tried: no HOT candidate remains. The picker
+      // returns null and the request layer fails bounded (no cold execution,
+      // no infinite rotation).
       const tried = new Set(["abb-a", "abb-b"]);
-      const next = getNextAvailableAccount(tried);
-      // Either null or a cooldown fallback that the outer loop rejects.
-      if (next) {
-        assert.ok(getAccountCooldownInfo(next.id), "fallback must be on cooldown");
-        assert.ok(tried.has(next.id) || getAccountCooldownInfo(next.id));
-      }
+      assert.strictEqual(pickNextHotCandidate(tried), null);
       // No infinite loop: at most pool-size picks before exhaustion.
       assert.ok(tried.size <= 2);
     },
@@ -418,9 +422,14 @@ test(
         return { resolveInitialAccount: null as unknown as () => void };
       })();
       void resolveInitialAccount;
-      const next = getNextAvailableAccount(new Set(["sticky-a"]));
-      assert.ok(next);
-      assert.equal(next!.id, "sticky-b");
+      markAccountHeadersReady("sticky-b");
+      try {
+        const next = pickNextHotCandidate(new Set(["sticky-a"]));
+        assert.ok(next);
+        assert.equal(next!.id, "sticky-b");
+      } finally {
+        unmarkAccountHeadersReady("sticky-b");
+      }
       // Account switch always rebuilds a fresh upstream chat with full history
       // (sticky parent chains cannot be reused across accounts).
       const policy = classifyRetryAction(err);

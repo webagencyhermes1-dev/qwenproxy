@@ -110,10 +110,11 @@ function installMockFetch(failures = 4) {
 test("chat_in_progress budget exhaustion escalates ONCE with a full replay, then succeeds", async () => {
   // CHAT_IN_PROGRESS_MAX_RETRIES default 6: failures 1-6 are the same-chat
   // settle budget; the 7th failure triggers exactly ONE escalation (fresh chat
-  // + full prompt) and the 8th attempt succeeds. The ~1MB replay that used to
+  // + full prompt) and the 8th attempt succeeds. The replay that used to
   // happen on EVERY stuck turn is now bounded: once, and only after ~35s of
   // same-chat settle retries (observed: a 2.1MB turn held a chat busy ~9min).
-  const bigPrompt = "user: " + "lorem ipsum dolor sit amet. ".repeat(20000);
+  // Sized under the QWEN_MAX_PROMPT_BYTES ingest cap (200KB default).
+  const bigPrompt = "user: " + "lorem ipsum dolor sit amet. ".repeat(2000);
   const mock = installMockFetch(7);
   const capture = captureWarns();
   try {

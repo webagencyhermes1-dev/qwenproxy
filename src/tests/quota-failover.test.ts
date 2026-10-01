@@ -6,7 +6,10 @@ delete process.env.API_KEY;
 
 import {
   clearAccountCooldown,
+  clearAllHeadersReadyAccounts,
   getAccountCooldownInfo,
+  markAccountHeadersReady,
+  unmarkAccountHeadersReady,
 } from "../core/account-manager.ts";
 import { getDatabase } from "../core/database.ts";
 import { invalidateAccountsCache } from "../core/accounts.ts";
@@ -65,6 +68,7 @@ function withFreshAccounts(
     resetAccountConcurrencyForTests();
     resetAccountManagerForTests();
     invalidatePriorityCache();
+    clearAllHeadersReadyAccounts();
     try {
       const insert = db.prepare(
         "INSERT INTO accounts (id, email, password) VALUES (?, ?, ?)",
@@ -75,6 +79,7 @@ function withFreshAccounts(
         clearAccountCooldown(row.id);
         clearWafIsolation(row.id);
         noteWafRecovery(row.id);
+        markAccountHeadersReady(row.id);
       }
       clearAccountCooldown("mock-account");
       clearWafIsolation("mock-account");
@@ -88,6 +93,9 @@ function withFreshAccounts(
         } catch {}
         try {
           clearWafIsolation(row.id);
+        } catch {}
+        try {
+          unmarkAccountHeadersReady(row.id);
         } catch {}
       }
       try {

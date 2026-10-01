@@ -13,6 +13,7 @@
 import { createHash } from "node:crypto";
 import { getDatabase } from "../../core/database.ts";
 import { logger } from "../../core/logger.ts";
+import { metrics } from "../../core/metrics.ts";
 
 export const STICKY_TTL_MS = 6 * 60 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 60_000;
@@ -153,7 +154,11 @@ export class StickyMap {
         if (isExpired(b, now)) continue;
         if (!this.mem.has(r.session_key)) this.mem.set(r.session_key, b);
       }
-    } catch {
+    } catch (err) {
+      logger.warn("[Session] sticky hydrate suppressed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      metrics.increment("sticky.persist.suppressed_errors");
       // Best-effort; mem stays authoritative this run.
     }
   }
@@ -182,7 +187,11 @@ export class StickyMap {
   private deleteFromDb(key: string): void {
     try {
       getDatabase().prepare("DELETE FROM sticky_bindings WHERE session_key = ?").run(key);
-    } catch {
+    } catch (err) {
+      logger.warn("[Session] sticky delete suppressed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      metrics.increment("sticky.persist.suppressed_errors");
       // Best-effort.
     }
   }
@@ -208,7 +217,12 @@ export class StickyMap {
     if (this.redisReady && this.redis) {
       void this.redis
         .set(redisKey(key), JSON.stringify(copy), "PX", copy.ttlMs)
-        .catch(() => {});
+        .catch((err: unknown) => {
+          logger.warn("[Session] sticky redis set suppressed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+          metrics.increment("sticky.persist.suppressed_errors");
+        });
     }
     if (logger.isLevelEnabled("info")) {
       console.log(
@@ -233,7 +247,12 @@ export class StickyMap {
     if (this.redisReady && this.redis) {
       void this.redis
         .set(redisKey(key), JSON.stringify(next), "PX", next.ttlMs)
-        .catch(() => {});
+        .catch((err: unknown) => {
+          logger.warn("[Session] sticky redis rebind suppressed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+          metrics.increment("sticky.persist.suppressed_errors");
+        });
     }
     this.rebindCount++;
     this.rebindTimestamps.push(now);
@@ -249,7 +268,12 @@ export class StickyMap {
     this.mem.delete(key);
     this.deleteFromDb(key);
     if (this.redisReady && this.redis) {
-      void this.redis.del(redisKey(key)).catch(() => {});
+      void this.redis.del(redisKey(key)).catch((err: unknown) => {
+        logger.warn("[Session] sticky redis del suppressed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        metrics.increment("sticky.persist.suppressed_errors");
+      });
     }
   }
 
@@ -267,7 +291,12 @@ export class StickyMap {
     if (this.redisReady && this.redis) {
       void this.redis
         .set(redisKey(key), JSON.stringify(b), "PX", b.ttlMs)
-        .catch(() => {});
+        .catch((err: unknown) => {
+          logger.warn("[Session] sticky redis touch suppressed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+          metrics.increment("sticky.persist.suppressed_errors");
+        });
     }
     if (logger.isLevelEnabled("info")) {
       console.log(`[Session] Touch | key=${key} | account=${b.accountId}`);
@@ -303,7 +332,11 @@ export class StickyMap {
           if (!this.mem.has(r.session_key)) removed++;
         }
       }
-    } catch {
+    } catch (err) {
+      logger.warn("[Session] sticky sweep suppressed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      metrics.increment("sticky.persist.suppressed_errors");
       // Best-effort.
     }
     if (removed > 0 || logger.isLevelEnabled("info")) {
@@ -334,7 +367,11 @@ export class StickyMap {
     this.sweepTimer = setInterval(() => {
       try {
         this.sweep();
-      } catch {
+      } catch (err) {
+        logger.warn("[Session] sticky background sweep suppressed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        metrics.increment("sticky.persist.suppressed_errors");
         // Never throw from background sweep.
       }
     }, SWEEP_INTERVAL_MS);
@@ -355,7 +392,11 @@ export class StickyMap {
     this.rebindTimestamps = [];
     try {
       getDatabase().prepare("DELETE FROM sticky_bindings").run();
-    } catch {
+    } catch (err) {
+      logger.warn("[Session] sticky clear suppressed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      metrics.increment("sticky.persist.suppressed_errors");
       // Best-effort.
     }
   }

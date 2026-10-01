@@ -8,6 +8,7 @@ import { fork, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { tuiAuthHeaders } from "./proxy-client.ts";
 
 export type ServerProcessState =
   | "offline"
@@ -282,6 +283,7 @@ export class ServerProcess extends EventEmitter {
         const timeout = setTimeout(() => controller.abort(), 1000);
         const resp = await fetch(`http://${cleanHost}:${port}/health`, {
           signal: controller.signal,
+          headers: tuiAuthHeaders(),
         });
         clearTimeout(timeout);
 
@@ -303,6 +305,7 @@ export class ServerProcess extends EventEmitter {
               const to = setTimeout(() => ctrl.abort(), 2000);
               const r = await fetch(`http://${cleanHost}:${port}/health`, {
                 signal: ctrl.signal,
+                headers: tuiAuthHeaders(),
               });
               clearTimeout(to);
               if (!r.ok && this.state === "online") {

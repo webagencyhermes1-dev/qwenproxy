@@ -31,7 +31,23 @@ import {
   rankSchedulerCandidates,
   type SchedulerCandidate,
 } from "./account-scheduler.ts";
-import { getWarmingAccountIds } from "./readiness-guard.ts";
+import {
+  getAccountOwnership,
+  isAccountOwnershipBound,
+} from "../runtime/account/instance.ts";
+
+/** Accounts currently warming (ownership WARMING status; empty when unbound). */
+function getWarmingAccountIds(): string[] {
+  if (isAccountOwnershipBound()) {
+    return [...getAccountOwnership().listAccountsByStatus("WARMING")];
+  }
+  return [];
+}
+import type { OwnershipFence } from "../runtime/contracts.ts";
+import { peekReadyAccountIds } from "../runtime/gateway.ts";
+
+/** System fence for readiness marking (mirrors the resource manager's own). */
+const SYSTEM_FENCE: OwnershipFence = { leaseId: "system", ownerToken: "system" };
 
 let currentIndex = 0;
 
@@ -98,6 +114,17 @@ export function markAccountRateLimited(
     }
   }
 
+  // Single truth: mirror the window into the ownership authority so the
+  // gateway (legality) and the controller (candidacy) observe it. The legacy
+  // in-memory map stays as the request-path read cache.
+  if (accountId !== "global" && isAccountOwnershipBound()) {
+    try {
+      getAccountOwnership().setCooldownUntil(accountId, until, cooldownReason);
+    } catch {
+      // Best-effort: the map + DB already hold the window.
+    }
+  }
+
   if (!options.silent) {
     console.log(
       `⏱️  [AccountManager] Cooldown set | ${accountId} | reason=${cooldownReason} | ${Math.round(duration / 1000)}s | until=${formatCooldownUntil(new Date(until))}`,
@@ -107,8 +134,8 @@ export function markAccountRateLimited(
   // An account just left the active pool: check whether we need to warm a
   // replacement so the ready-account floor is maintained.
   if (duration > 60_000) {
-    void import("./readiness-guard.ts")
-      .then((m) => m.triggerReadinessCheck())
+    void import("../runtime/construct.ts")
+      .then((m) => m.requestReadinessTick("cooldown-set"))
       .catch(() => {});
   }
 }
@@ -123,6 +150,13 @@ export function clearAccountCooldown(accountId: string): void {
         `❌ [AccountManager] Failed to clear cooldown in DB for ${accountId}:`,
         (err as Error).message,
       );
+    }
+    if (isAccountOwnershipBound()) {
+      try {
+        getAccountOwnership().setCooldownUntil(accountId, 0, null);
+      } catch {
+        // Best-effort.
+      }
     }
   }
 }
@@ -158,8 +192,8 @@ export function getAccountCooldownInfo(
         );
       }
     }
-    void import("./readiness-guard.ts")
-      .then((m) => m.triggerReadinessCheck("cooldown-expired"))
+    void import("../runtime/construct.ts")
+      .then((m) => m.requestReadinessTick("cooldown-expired"))
       .catch(() => {});
     return null;
   }
@@ -180,41 +214,67 @@ function isAccountOnCooldown(accountId: string): boolean {
 // lossless — exactly the upstream `anyReady` rule.
 const headersReadyAccounts = new Set<string>();
 
+/**
+ * Single readiness truth with two backings:
+ * - ownership BOUND (production, or tests that bind explicitly): the
+ *   AccountResourceManager status machine is authoritative. Marking READY is
+ *   idempotent; unmarking (context death) moves READY → RECOVERING so the
+ *   ReadinessController re-warms instead of stranding the account.
+ * - ownership UNBOUND (hermetic mock tests): the legacy in-memory set.
+ */
 export function markAccountHeadersReady(accountId: string): void {
   if (!accountId || accountId === "global") return;
+  if (isAccountOwnershipBound()) {
+    const ownership = getAccountOwnership();
+    const status = ownership.getAccountStatus(accountId);
+    if (status === "READY" || status === "RESERVED" || status === "GENERATING") {
+      return; // Already serving-capable; a live lease must not be disturbed.
+    }
+    if (status === "WARMING" || status === "RECOVERING" || status === "DRAINING") {
+      ownership.transition(accountId, "READY", SYSTEM_FENCE, "headers-ready");
+      return;
+    }
+    // STANDBY / FAILED / COOLDOWN / DISABLED cannot legally become READY
+    // without a warmup — leave for the controller; log at debug.
+    return;
+  }
   headersReadyAccounts.add(accountId);
 }
 
 export function unmarkAccountHeadersReady(accountId: string): void {
   if (!accountId) return;
+  if (isAccountOwnershipBound()) {
+    const ownership = getAccountOwnership();
+    // Only a lease-free READY account may move; RESERVED/GENERATING carry a
+    // live generation and recover through the release path instead.
+    if (ownership.getAccountStatus(accountId) === "READY") {
+      void ownership.recoverAccount(accountId, "context-death").catch(() => {});
+    }
+    return;
+  }
   headersReadyAccounts.delete(accountId);
 }
 
 export function isAccountHeadersReady(accountId: string): boolean {
+  if (isAccountOwnershipBound()) {
+    const status = getAccountOwnership().getAccountStatus(accountId);
+    // A leased account (RESERVED/GENERATING) is hot by construction: the set
+    // stayed marked for the whole generation under the legacy model, and the
+    // same-generation re-entry check depends on passing here.
+    return status === "READY" || status === "RESERVED" || status === "GENERATING";
+  }
   return headersReadyAccounts.has(accountId);
 }
 
 export function getHeadersReadyAccountIds(): string[] {
+  if (isAccountOwnershipBound()) {
+    return [...getAccountOwnership().listAccountsByStatus("READY")];
+  }
   return Array.from(headersReadyAccounts);
 }
 
-function anyUsableAccountHeadersReady(
-  accounts: QwenAccount[],
-  triedSet?: Set<string>,
-): boolean {
-  return accounts.some(
-    (a) =>
-      (!triedSet || !triedSet.has(a.id)) &&
-      !isAccountOnCooldown(a.id) &&
-      isAccountHeadersReady(a.id),
-  );
-}
-
-function passesHeadersReadyGate(
-  accountId: string,
-  anyReady: boolean,
-): boolean {
-  return !anyReady || isAccountHeadersReady(accountId);
+export function clearAllHeadersReadyAccounts(): void {
+  headersReadyAccounts.clear();
 }
 
 export function syncCooldownsFromDb(accounts: QwenAccount[]): void {
@@ -284,113 +344,22 @@ export function buildSchedulerCandidates(
   });
 }
 
-function pickFromCandidates(
-  candidates: SchedulerCandidate[],
-  triedSet?: Set<string>,
-): QwenAccount | null {
-  const ranked = rankSchedulerCandidates(candidates, {
-    triedAccountIds: triedSet,
-    allowSaturatedFallback: true,
-  });
-  if (ranked.length === 0) return null;
-  const span = Math.max(1, candidates.length);
-  const picked =
-    pickSchedulerCandidate(ranked, currentIndex, span) ?? ranked[0];
-  // Advance the cursor in priority space (historic semantics: the next pick
-  // scans forward from the account after the one just returned).
-  currentIndex = (picked.priorityIndex + 1) % span;
-  return picked.account;
-}
-
-function shortestCooldownFallback(
-  accounts: QwenAccount[],
-  triedSet?: Set<string>,
-): QwenAccount | null {
-  let best: QwenAccount | null = null;
-  let bestRemaining = Infinity;
-  for (const account of accounts) {
-    if (triedSet?.has(account.id)) continue;
-    const info = getAccountCooldownInfo(account.id);
-    if (info && info.remainingMs < bestRemaining) {
-      bestRemaining = info.remainingMs;
-      best = account;
-    }
-  }
-  return best;
-}
-
-export function getNextAccount(): QwenAccount | null {
-  const accounts = loadAccounts();
-  if (accounts.length === 0) {
-    return null;
-  }
-
-  syncCooldownsFromDb(accounts);
-
-  const candidates = buildSchedulerCandidates(accounts);
-  const picked = pickFromCandidates(candidates);
-  if (picked) return picked;
-
-  // All eligible accounts excluded (cooldown/disabled/broken/auth) — return
-  // the one with the shortest remaining cooldown so callers can report wait.
-  return shortestCooldownFallback(getAccountsByPriority(accounts));
-}
-
-export function getNextAvailableAccount(
-  triedAccountIds?: Set<string> | string,
-): QwenAccount | null {
-  const accounts = loadAccounts();
-  if (accounts.length === 0) return null;
-
-  syncCooldownsFromDb(accounts);
-
-  let triedSet: Set<string>;
-  if (triedAccountIds instanceof Set) {
-    triedSet = triedAccountIds;
-  } else {
-    triedSet = new Set(triedAccountIds ? [triedAccountIds] : []);
-  }
-
-  const candidates = buildSchedulerCandidates(accounts);
-  const picked = pickFromCandidates(candidates, triedSet);
-  if (picked) return picked;
-
-  // 2. If all untried accounts are on cooldown, return the untried one with the shortest remaining cooldown
-  return shortestCooldownFallback(getAccountsByPriority(accounts), triedSet);
-}
-
 // ─── HOT-only selection boundary (normal request path) ──────────────────────
 // Invariant: NORMAL REQUESTS MAY ONLY EXECUTE ON HOT ACCOUNTS. A HOT account
-// has its anti-bot headers captured (headers-ready set). WARM (warming in
-// progress) and COLD (uninitialized) accounts must be rejected HERE, at the
-// selection boundary — never discovered as a readiness failure after the
-// lease was claimed. These pickers therefore never degrade to a non-HOT
-// account and never fall back to a cooldown/first-configured account; they
-// return null when zero HOT accounts exist so the caller emits one bounded
-// retryable capacity error and lets the pool readiness controller warm a
-// replacement.
-
-/** HOT = headers captured and usable for a normal request. */
-export function isAccountHot(accountId: string): boolean {
-  return isAccountHeadersReady(accountId);
-}
-
-/** WARM = the pool controller is currently warming this account. */
-export function isAccountWarming(accountId: string): boolean {
-  return getWarmingAccountIds().includes(accountId);
-}
-
-/** Count of HOT accounts among the configured (non-disabled) pool. */
-export function getHotAccountCount(): number {
-  return loadAccounts().filter((a) => isAccountHeadersReady(a.id)).length;
-}
+// is READY in the ownership state machine (bound) or headers-marked (unbound
+// mock seam). WARM (warming in progress) and COLD (uninitialized) accounts
+// must be rejected HERE, at the selection boundary — never discovered as a
+// readiness failure after the lease was claimed. pickNextHotCandidate never
+// degrades to a non-HOT account and never falls back to a cooldown or
+// first-configured account; it returns null when zero HOT accounts exist so
+// the caller emits one bounded retryable capacity error and lets the pool
+// readiness controller warm a replacement.
 
 /**
- * HOT-only rotation picker for the normal request path. Same ranking/cursor
- * semantics as getNextAvailableAccount, but accounts that are not
- * headers-ready are NEVER returned — no saturated-ready degradation, no
- * shortest-cooldown fallback. Returns null when zero HOT accounts are
- * eligible.
+ * HOT-only rotation picker. Unbound-mode seam (hermetic mock tests) and
+ * fallback behind pickNextHotCandidate. Accounts that are not headers-ready
+ * are NEVER returned — no saturated-ready degradation, no shortest-cooldown
+ * fallback. Returns null when zero HOT accounts are eligible.
  */
 export function getNextHotAccount(
   triedAccountIds?: Set<string> | string,
@@ -419,6 +388,34 @@ export function getNextHotAccount(
     pickSchedulerCandidate(ranked, currentIndex, span) ?? ranked[0];
   currentIndex = (picked.priorityIndex + 1) % span;
   return picked.account;
+}
+
+/**
+ * Single rotation-resolution entry point for the request path.
+ * - ownership BOUND (production): resolve through the gateway's READY-only
+ *   peek (tried excluded, order preserved); the atomic claim still happens at
+ *   the caller's claim site, which re-validates.
+ * - ownership UNBOUND (hermetic mock tests): legacy HOT-only round-robin.
+ * Returns null when zero HOT accounts are eligible.
+ */
+export function pickNextHotCandidate(
+  triedAccountIds?: Set<string> | string,
+): QwenAccount | null {
+  if (isAccountOwnershipBound()) {
+    const triedSet =
+      triedAccountIds instanceof Set
+        ? triedAccountIds
+        : new Set(triedAccountIds ? [triedAccountIds] : []);
+    const accounts = loadAccounts();
+    if (accounts.length === 0) return null;
+    syncCooldownsFromDb(accounts);
+    for (const id of peekReadyAccountIds(triedSet)) {
+      const account = accounts.find((a) => a.id === id);
+      if (account) return account;
+    }
+    return null;
+  }
+  return getNextHotAccount(triedAccountIds);
 }
 
 // Request-path invariant counters. Normal chat requests must never

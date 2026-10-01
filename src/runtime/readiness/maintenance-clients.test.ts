@@ -1,6 +1,6 @@
 /**
  * Hermetic tests for the Phase 12-wire maintenance CLIENTS (spec §14): the
- * ReadinessGuard and SessionKeeper must never independently decide an account
+ * readiness controller and SessionKeeper must never independently decide an account
  * is safe to mutate — they query the ownership authority and submit bounded
  * jobs. No real browser, no DB.
  */
@@ -14,15 +14,7 @@ import {
   type MaintenanceJob,
 } from "../maintenance/maintenance-scheduler.ts";
 import { ReadinessController } from "../readiness/readiness-controller.ts";
-import {
-  READINESS_CONTROLLER_FLAG,
-  ensurePoolReadiness,
-  registerReadinessControllerClients,
-  resetReadinessControllerClientsForTests,
-  resetReadinessCountersForTests,
-  triggerReadinessCheck,
-  warmupDedupeKey,
-} from "../../core/readiness-guard.ts";
+import { ensurePoolReadiness, registerReadinessControllerClients, resetReadinessControllerClientsForTests, warmupDedupeKey } from "../bootstrap.ts";
 import {
   keepAliveDedupeKey,
   registerSessionKeeperClients,
@@ -43,12 +35,6 @@ import {
 import type { Page } from "patchright";
 import { resetAccountConcurrencyForTests } from "../../core/account-concurrency.ts";
 
-function flagOn(): void {
-  process.env[READINESS_CONTROLLER_FLAG] = "true";
-}
-function flagOff(): void {
-  delete process.env[READINESS_CONTROLLER_FLAG];
-}
 
 interface FakeAccount {
   status: AccountStatus;
@@ -110,6 +96,13 @@ class FakeOwnership implements IAccountOwnership {
 
   registerAccount(): void {}
   setDraining(): void {}
+  setCooldownUntil(): void {}
+  isCoolingDown(): boolean {
+    return false;
+  }
+  reapExpiredCooldowns(): number {
+    return 0;
+  }
 
   async recoverAccount(id: string): Promise<void> {
     this.recoverCalls.push(id);
@@ -131,49 +124,19 @@ function neverResolves(): Promise<boolean> {
   return new Promise<boolean>(() => {});
 }
 
-test("guard with the flag OFF keeps its legacy standalone behavior", async () => {
-  flagOff();
-  const own = makePool(2);
-  const sched = new MaintenanceScheduler({
-    workerConcurrency: 2,
-    maxQueueDepth: 8,
-    pollIntervalMs: 60_000,
-    execute: async () => {},
-  });
-  const ctrl = new ReadinessController(
-    own,
-    { targetReady: 3 },
-    { warmWarmup: async () => "ready" },
-  );
-  registerReadinessControllerClients({
-    ownership: own,
-    scheduler: sched,
-    controller: ctrl,
-  });
+test("ensurePoolReadiness with no registered clients is a safe no-op", async () => {
+  resetReadinessControllerClientsForTests();
+  const { clearActiveReadinessForTests } = await import("../construct.ts");
+  clearActiveReadinessForTests();
   try {
-    let delegatedTicks = 0;
-    ctrl.tick = async () => {
-      delegatedTicks++;
-      return {
-        launched: [],
-        skipped: [],
-        deficit: 0,
-        ready: 0,
-        warming: 0,
-        target: 3,
-      };
-    };
-    // No guard deps registered: the legacy path bails out, and — crucially —
-    // the flag gate means the controller is never consulted either.
-    await ensurePoolReadiness();
-    assert.equal(delegatedTicks, 0, "no delegation when the flag is off");
+    const report = await ensurePoolReadiness();
+    assert.equal(report, undefined, "no clients and no active controller → undefined");
   } finally {
     resetReadinessControllerClientsForTests();
   }
 });
 
 test("a GENERATING account is never selected for warmup by the controller", async () => {
-  flagOn();
   const own = makePool(4);
   own.accounts.get("acct1")!.status = "GENERATING";
   const warmed: string[] = [];
@@ -200,12 +163,10 @@ test("a GENERATING account is never selected for warmup by the controller", asyn
   } finally {
     await stopRuntimeServices(services);
     resetRuntimeServicesForTests();
-    flagOff();
   }
 });
 
 test("two ticks while warmups are slow produce at most one warmup job per account", async () => {
-  flagOn();
   const own = makePool(6);
   own.accounts.get("acct1")!.status = "READY";
   own.accounts.get("acct2")!.status = "READY";
@@ -236,12 +197,10 @@ test("two ticks while warmups are slow produce at most one warmup job per accoun
   } finally {
     await stopRuntimeServices(services);
     resetRuntimeServicesForTests();
-    flagOff();
   }
 });
 
 test("duplicate direct submits coalesce to one warmup job (dedupe key warmup:<id>)", async () => {
-  flagOn();
   const own = makePool(2);
   const services = startRuntimeServices({
     ownership: own,
@@ -270,12 +229,10 @@ test("duplicate direct submits coalesce to one warmup job (dedupe key warmup:<id
   } finally {
     await stopRuntimeServices(services);
     resetRuntimeServicesForTests();
-    flagOff();
   }
 });
 
-test("startRuntimeServices wires the guard/keeper as clients and stopRuntimeServices leaves no orphan jobs", async () => {
-  flagOn();
+test("startRuntimeServices wires the controller/keeper as clients and stopRuntimeServices leaves no orphan jobs", async () => {
   const own = makePool(4);
   own.accounts.get("acct1")!.status = "GENERATING";
   const services: RuntimeServices = startRuntimeServices({
@@ -284,9 +241,8 @@ test("startRuntimeServices wires the guard/keeper as clients and stopRuntimeServ
     executors: { warmup: neverResolves },
   });
   try {
-    // The guard is a client: ensurePoolReadiness delegates to the controller
+    // The controller is a client: ensurePoolReadiness delegates to the controller
     // the composition root registered.
-    resetReadinessCountersForTests();
     const report = await ensurePoolReadiness();
     if (!report) {
       assert.fail("client mode must return the controller's tick report");
@@ -325,12 +281,10 @@ test("startRuntimeServices wires the guard/keeper as clients and stopRuntimeServ
   } finally {
     resetReadinessControllerClientsForTests();
     resetRuntimeServicesForTests();
-    flagOff();
   }
 });
 
-test("guard with the flag ON delegates to the controller, not its internal sets", async () => {
-  flagOn();
+test("registered clients delegate to the controller, not internal sets", async () => {
   const own = makePool(4);
   own.accounts.get("acct1")!.status = "READY";
   const sched = new MaintenanceScheduler({
@@ -364,21 +318,26 @@ test("guard with the flag ON delegates to the controller, not its internal sets"
     assert.equal(
       sched.getInflight().filter((j) => j.kind === "WARM_ACCOUNT").length,
       1,
-      "the tick launched a scheduler job, not the guard's own loop",
+      "the tick launched a scheduler job through the controller",
     );
 
     delegatedTicks = 0;
-    triggerReadinessCheck();
-    await settle();
-    assert.ok(delegatedTicks >= 1, "triggerReadinessCheck delegates too");
+    const { requestReadinessTick, setActiveReadiness, clearActiveReadinessForTests } =
+      await import("../construct.ts");
+    setActiveReadiness(ctrl);
+    try {
+      requestReadinessTick("test-trigger");
+      await settle();
+      assert.ok(delegatedTicks >= 1, "tick request delegates to the active controller");
+    } finally {
+      clearActiveReadinessForTests();
+    }
   } finally {
     resetReadinessControllerClientsForTests();
-    flagOff();
   }
 });
 
 test("keep-alive skips a GENERATING account and submits a bounded job for an idle one", async () => {
-  flagOn();
   resetAccountConcurrencyForTests();
   const own = new FakeOwnership();
   own.register("busy", "GENERATING");
@@ -421,6 +380,6 @@ test("keep-alive skips a GENERATING account and submits a bounded job for an idl
     unregisterPlaywrightAccountForTests("busy");
     unregisterPlaywrightAccountForTests("idle");
     resetSessionKeeperClientsForTests();
-    flagOff();
   }
 });
+

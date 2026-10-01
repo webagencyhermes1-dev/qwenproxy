@@ -27,19 +27,21 @@ import {
 } from "../core/account-health.js";
 import {
   isAccountEffectivelyBroken,
-  markAccountAuthError,
   markAccountBroken,
   noteAccountRecovered,
-} from "../core/account-state.js";
-import { getRuntimeMode, isRuntimeMode } from "../runtime/runtime-mode.ts";
+} from "../core/account-state.ts";
 import { constructRuntime } from "../runtime/construct.ts";
-import { getAccountsByPriority } from "../core/account-priority.ts";
-import type { QwenRuntime } from "../runtime/runtime.ts";
 import type { RuntimeServices } from "../runtime/bootstrap.ts";
+import { runWithRequestContext } from "../core/request-context.ts";
+import {
+  createRateLimiter,
+  rateLimitMiddleware,
+} from "../core/rate-limit.ts";
 
 // Module-level state (initialized in startServer)
 let cache: MemoryCache | undefined;
 let watchdog: Watchdog | undefined;
+let unsubscribeTransitionAudit: (() => void) | undefined;
 let server: any;
 let startPromise: Promise<StartedServerInfo> | null = null;
 let stopPromise: Promise<void> | null = null;
@@ -51,6 +53,11 @@ const app = new Hono();
 function formatAccountId(accountId: string): string {
   const normalized = accountId.trim();
   return normalized.length > 12 ? `${normalized.slice(0, 12)}…` : normalized;
+}
+
+/** True for wildcard binds that expose the server beyond loopback. */
+function isPublicBind(host: string): boolean {
+  return host === "0.0.0.0" || host === "::" || host === "::0";
 }
 
 function buildPortInUseMessage(port: number, host: string): string {
@@ -150,7 +157,9 @@ app.use("*", async (c, next) => {
 
   metrics.increment("requests.total");
   const start = Date.now();
-  await next();
+  // Serve the whole downstream chain inside the request context so every
+  // logger.* call (route, account selection, browser ops) carries requestId.
+  await runWithRequestContext(requestId, () => next());
   const duration = Date.now() - start;
   metrics.histogram("latency.request", duration);
   c.header("X-Response-Time", `${duration}ms`);
@@ -239,6 +248,40 @@ app.use("/v1/*", async (c, next) => {
   await next();
 });
 
+// Enforced per-key request rate (token bucket; disabled when
+// RATE_LIMIT_PER_MINUTE=0). Keyed on the presented credential so one client
+// cannot starve the pool; keyless localhost shares the "anon" bucket.
+const requestLimiter = createRateLimiter({
+  requestsPerMinute: config.server.rateLimit.perMinute,
+});
+function rateLimitKey(c: Context): string {
+  const auth = c.req.header("Authorization");
+  if (auth?.startsWith("Bearer ")) {
+    const token = auth.slice(7).trim();
+    if (token) return `key:${token.slice(0, 12)}`;
+  }
+  const xApiKey = c.req.header("x-api-key")?.trim();
+  if (xApiKey) return `key:${xApiKey.slice(0, 12)}`;
+  return "anon";
+}
+app.use("/v1/*", rateLimitMiddleware(requestLimiter, rateLimitKey));
+
+// Operational introspection carries account identifiers and session bindings:
+// it requires the API key exactly like /v1/* (verifyApiKey stays open only
+// when no key is configured — keyless localhost dev). /readyz is intentionally
+// unauthenticated: orchestrators probe it without secrets and it returns
+// counts only, never identifiers.
+app.use("/health", async (c, next) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  await next();
+});
+app.use("/health/*", async (c, next) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  await next();
+});
+
 // Routes
 app.route("", modelsApp);
 app.post("/v1/chat/completions", chatCompletions);
@@ -309,6 +352,10 @@ app.get("/health", async (c) => {
       readinessTarget,
       readinessDeficit,
     };
+    // Prometheus pool gauges (Phase 3 observability).
+    metrics.gauge("pool.ready", stats.ready);
+    metrics.gauge("pool.warming", stats.warming);
+    metrics.gauge("pool.deficit", readinessDeficit);
     const accounts = loadAccounts();
     const candidates = manager.buildSchedulerCandidates(accounts);
     const readyAccountIds = (await import("../core/account-manager.js")).getHeadersReadyAccountIds();
@@ -370,6 +417,41 @@ app.get("/health", async (c) => {
   });
 });
 
+// Deep readiness probe for orchestrators (k8s readinessProbe, Docker
+// HEALTHCHECK). Unlike /health (always 200, diagnostics), /readyz answers
+// the single serving question: can this instance accept traffic RIGHT NOW?
+// 200 when >= 1 account is READY, 503 otherwise (startup warmup, full
+// cooldown, zero pool). Unauthenticated by design; returns counts only,
+// never identifiers. `degraded` flags ready-below-target (still serving).
+app.get("/readyz", async (c) => {
+  try {
+    const { getHeadersReadyAccountIds } =
+      await import("../core/account-manager.js");
+    const ready = getHeadersReadyAccountIds().length;
+    const target = config.pool?.targetReady ?? 2;
+    const body = {
+      ready: ready > 0,
+      readyAccounts: ready,
+      targetReady: target,
+      degraded: ready > 0 && ready < target,
+      timestamp: Date.now(),
+    };
+    return ready > 0 ? c.json(body) : c.json(body, 503);
+  } catch (err) {
+    return c.json(
+      {
+        ready: false,
+        readyAccounts: 0,
+        targetReady: config.pool?.targetReady ?? 2,
+        degraded: false,
+        timestamp: Date.now(),
+        error: err instanceof Error ? err.message : String(err),
+      },
+      503,
+    );
+  }
+});
+
 // Sticky session observability: size, active bindings, rebinds last hour.
 app.get("/health/sessions", async (c) => {
   try {
@@ -396,16 +478,11 @@ app.get("/health/sessions", async (c) => {
   }
 });
 
-// Recovery observability: readiness guard counters, per-account lease load and
-// the account manager's pool aggregates. Proves the Loop 6 coalescing/validation
-// guards are engaging (vs. a silent thundering herd) and surfaces lease churn.
+// Recovery observability: readiness controller in-flight warmups,
+// per-account lease load and the pool aggregates. No request queue exists
+// (admission is fail-fast), so queuedLeaseCount is always 0.
 app.get("/health/recovery", async (c) => {
   try {
-    const {
-      getReadinessDiagnostics,
-      getWarmupFailureInfo,
-      getWarmingAccountIds,
-    } = await import("../core/readiness-guard.js");
     const { getAccountConcurrencySnapshot } = await import(
       "../core/account-concurrency.js"
     );
@@ -413,23 +490,26 @@ app.get("/health/recovery", async (c) => {
       "../core/account-manager.js"
     );
     const leases = getAccountConcurrencySnapshot();
-    const warmupFailures = getWarmupFailureInfo();
-    const warmingAccounts = getWarmingAccountIds();
+    const poolStats = getPoolStats();
     const targetReady = config.pool?.targetReady ?? 2;
     const readyCount = getHeadersReadyAccountIds().length;
     return c.json({
-      readiness: getReadinessDiagnostics(),
+      readiness: {
+        inFlight: runtimeServices?.readiness.getInFlight() ?? [],
+        targetReady,
+        readyCount,
+        deficit: Math.max(0, targetReady - readyCount),
+      },
       leases,
       activeLeaseCount: leases.reduce((n, s) => n + s.active, 0),
-      queuedLeaseCount: leases.reduce((n, s) => n + s.waiting, 0),
+      queuedLeaseCount: 0,
       pool: {
-        ready: getPoolStats().ready,
-        warming: getPoolStats().warming,
-        cooldown: getPoolStats().cooldown,
-        broken: getPoolStats().broken,
+        ready: poolStats.ready,
+        warming: poolStats.warming,
+        cooldown: poolStats.cooldown,
+        broken: poolStats.broken,
       },
-      warmupFailures,
-      warmingAccounts,
+      warmingAccounts: poolStats.warmingAccounts,
       targetReady,
       readyCount,
       deficit: Math.max(0, targetReady - readyCount),
@@ -503,6 +583,60 @@ function buildStartedServerInfo(): StartedServerInfo {
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function getServerPidLockPath(): Promise<string> {
+  // Dynamic imports keep startup-time module load order unchanged.
+  const { getDataDir } = await import("../core/paths.ts");
+  const path = await import("node:path");
+  return path.join(getDataDir(), "server.pid");
+}
+
+/**
+ * Single-replica guard for the data dir. A second live server would
+ * double-book accounts (leases are per-process). Stale lockfiles from a
+ * crashed predecessor are claimed (pid no longer answers).
+ */
+async function claimDataDirLock(): Promise<void> {
+  const fs = await import("node:fs");
+  const lockPath = await getServerPidLockPath();
+  try {
+    const raw = fs.readFileSync(lockPath, "utf8").trim();
+    const pid = Number.parseInt(raw, 10);
+    if (Number.isFinite(pid) && pid > 0) {
+      try {
+        process.kill(pid, 0);
+        throw new Error(
+          `❌ [Server] Another live QwenProxy instance holds this data dir (pid ${pid}). Stop it first, or use a separate data dir.`,
+        );
+      } catch (killErr) {
+        if ((killErr as Error)?.message?.startsWith("❌ [Server] Another live")) {
+          throw killErr;
+        }
+        // ESRCH: predecessor is gone — stale lock, reclaim below.
+      }
+    }
+  } catch (readErr) {
+    if ((readErr as Error)?.message?.startsWith("❌ [Server] Another live")) {
+      throw readErr;
+    }
+    // No lockfile — first claim.
+  }
+  try {
+    fs.mkdirSync((await import("node:path")).dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, String(process.pid), "utf8");
+  } catch {
+    // Best-effort: the port check below still prevents the common collision.
+  }
+}
+
+async function releaseDataDirLock(): Promise<void> {
+  try {
+    const fs = await import("node:fs");
+    fs.rmSync(await getServerPidLockPath(), { force: true });
+  } catch {
+    // Best-effort.
+  }
 }
 
 async function warmConfiguredChatPools(
@@ -624,59 +758,25 @@ async function prepareAccountRuntime(
   });
 }
 
-async function prepareRemainingAccountsInBackground(params: {
-  accounts: QwenAccount[];
-  batchSize: number;
-  totalAccounts: number;
-  getAccountCredentials: (accountId: string) => QwenAccount | undefined;
-  initPlaywrightForAccount: (
-    account: QwenAccount,
-    headless: boolean,
-    browserType?: "chromium" | "chrome" | "edge",
-  ) => Promise<void>;
-  disableNativeTools: (accountId?: string) => Promise<void>;
-  warmQwenChatPool: (
-    accountId: string | undefined,
-    modelId: string,
-  ) => Promise<void>;
-}): Promise<void> {
-  const remaining = params.accounts;
-  if (remaining.length === 0) return;
-
-  // First account was already prepared successfully (displayed as 1/N),
-  // so remaining accounts start at display index 2.
-  let nextDisplayIndex = 2;
-  for (let i = 0; i < remaining.length; i += params.batchSize) {
-    const batch = remaining.slice(i, i + params.batchSize);
-    const batchDisplayStart = nextDisplayIndex;
-    nextDisplayIndex += batch.length;
-
-    await Promise.all(
-      batch.map((account, batchIndex) =>
-        prepareAccountRuntime(
-          account,
-          params.getAccountCredentials,
-          params.initPlaywrightForAccount,
-          params.disableNativeTools,
-          params.warmQwenChatPool,
-        ).then((ok) => {
-          if (ok) {
-            const displayIndex = batchDisplayStart + batchIndex;
-            console.log(
-              `✅ [Server] Account ready (${displayIndex}/${params.totalAccounts}): ${maskEmail(account.email)}`,
-            );
-          }
-          return ok;
-        }),
-      ),
-    );
-  }
-}
-
 async function cleanupServerResources(): Promise<void> {
   watchdog?.stop();
   watchdog = undefined;
   metrics.stopCollection();
+
+  try {
+    const { stopStreamSweepTimer } = await import("../core/stream-registry.ts");
+    stopStreamSweepTimer();
+  } catch {
+    // Stream sweep may not have been started.
+  }
+  try {
+    unsubscribeTransitionAudit?.();
+  } catch {
+    // Audit subscription is best-effort.
+  } finally {
+    unsubscribeTransitionAudit = undefined;
+  }
+  await releaseDataDirLock();
 
   try {
     await cache?.close();
@@ -725,13 +825,6 @@ async function cleanupServerResources(): Promise<void> {
         resolve();
       }
     });
-  }
-
-  try {
-    const { stopReconciliationTimer } = await import("../core/readiness-guard.ts");
-    stopReconciliationTimer();
-  } catch {
-    // Readiness guard may not have been initialized.
   }
 
   // Stop runtime services (readiness controller + maintenance scheduler)
@@ -845,8 +938,19 @@ export async function startServer(options?: {
     cache = new MemoryCache();
     await cache.connect();
 
-    if (!config.apiKey && config.server.host === "0.0.0.0") {
-      // API key status will be shown in startup banner
+    // Open-proxy guard: binding a public interface without an API key exposes
+    // every configured Qwen account to the LAN. Fail fast with a fix; bind
+    // HOST=127.0.0.1 for keyless local-only use.
+    if (!config.apiKey && isPublicBind(config.server.host)) {
+      throw new Error(
+        `❌ [Server] Refusing to bind ${config.server.host}:${config.server.port} without API_KEY (open proxy).` +
+          ` Set API_KEY, or bind HOST=127.0.0.1 for local-only use.`,
+      );
+    }
+    if (!config.apiKey) {
+      console.warn(
+        `⚠️  [Server] Running without API_KEY on ${config.server.host} — any local process can call this proxy. Set API_KEY for shared machines.`,
+      );
     }
 
     const { loadAccounts, getAccountCredentials } =
@@ -858,6 +962,27 @@ export async function startServer(options?: {
         "❌ [Server] No Qwen accounts configured. Configure an account with `npm run login`, the QWEN_ACCOUNTS environment variable, or the accounts database before starting the server.",
       );
     }
+
+    // Single-replica guard: two live servers on one data dir double-book
+    // accounts (module-level leases are per-process). Refuse when the pid in
+    // the lockfile still answers.
+    await claimDataDirLock();
+
+    // Orphaned-stream sweep (crash-leaked removeStream misses) + account
+    // transition audit trail (debug-gated inside the listener).
+    const { startStreamSweepTimer } = await import("../core/stream-registry.ts");
+    startStreamSweepTimer();
+    const { onTransition } = await import("../runtime/account/resource-manager.ts");
+    unsubscribeTransitionAudit = onTransition((e) => {
+      if (logger.isLevelEnabled("debug")) {
+        logger.debug("[audit] account transition", {
+          accountId: e.accountId,
+          from: e.from,
+          to: e.to,
+          reason: e.reason,
+        });
+      }
+    });
 
     // Fail fast on a taken port (the most common startup crash) BEFORE the
     // slow account warmup — the previous behavior bound only after warmup and
@@ -874,230 +999,42 @@ export async function startServer(options?: {
 
     const { disableNativeTools, warmQwenChatPool } =
       await import("../services/qwen.ts");
-    const { initPlaywrightForAccount, isPlaywrightInitialized } =
+    const { initPlaywrightForAccount } =
       await import("../services/playwright.ts");
 
-    const { registerReadinessGuardDeps, startReadinessGuardSweep, startReconciliationTimer } = await import("../core/readiness-guard.ts");
-    registerReadinessGuardDeps({
-      getAccountCredentials,
-      initPlaywrightForAccount: (account) => initPlaywrightForAccount(account, config.playwright.headless, config.playwright.browser),
-      disableNativeTools,
-      warmQwenChatPool,
-    });
-    startReadinessGuardSweep();
-    startReconciliationTimer();
-    console.log("[Pool Readiness] controller registered | deps=ready");
-
-    const BATCH_SIZE = config.playwright.initBatchSize;
+    // The ReadinessController (constructed runtime below) is the SOLE warmup
+    // authority. No reserve warmups, no standby validation sweeps, no legacy
+    // guard timers — those doubled browser concurrency and raced the
+    // controller over account mutexes.
 
     if (accounts.length > 0) {
-      const totalAccounts = accounts.length;
-
-      // In runtime mode, construct the single runtime container with all 9 components.
-      // This handles crash recovery, account registration, readiness controller,
-      // maintenance scheduler, and warmup via the bounded controller.
-      let runtime: QwenRuntime | null = null;
-      const readyAccountIds = new Set<string>();
-
-      if (isRuntimeMode()) {
-        // New contract: constructRuntime(accounts, deps?) — server.ts supplies
-        // the warmup executor via its existing prepareAccountRuntime path and
-        // defers keep-alive to bootstrap's default executor (undefined).
-        // construct.ts is mid-migration to the deps-carrying contract. Cast to
-        // the new signature so this call site compiles against both the old and
-        // new construct.ts; at runtime constructRuntime already returns
-        // bootstrap's RuntimeServices (readiness included).
-        type ConstructRuntimeDeps = {
-          warmupExecutor?: (accountId: string) => Promise<boolean>;
-          keepAliveExecutor?: (accountId: string) => Promise<void>;
-        };
-        const constructRuntimeWithDeps = constructRuntime as unknown as (
-          accounts: QwenAccount[],
-          deps?: ConstructRuntimeDeps,
-        ) => Promise<{ runtime: QwenRuntime; runtimeServices: RuntimeServices }>;
-        const { runtime: rt, runtimeServices: rs } = await constructRuntimeWithDeps(accounts, {
-          warmupExecutor: async (accountId: string) => {
-            const account = accounts.find((a) => a.id === accountId);
-            if (!account) return false;
-            return prepareAccountRuntime(
-              account,
-              getAccountCredentials,
-              initPlaywrightForAccount,
-              disableNativeTools,
-              warmQwenChatPool,
-            );
-          },
-          keepAliveExecutor: undefined,
-        });
-        runtime = rt;
-        runtimeServices = rs;
-        console.log(`🚀 [Server] Runtime mode active — ${getRuntimeMode().toUpperCase()}`);
-      } else {
-        // Legacy warmup path for non-runtime mode
-        const warmOrder = getAccountsByPriority(accounts).filter(
-          (account) => !getAccountCooldownInfo(account.id),
-        );
-
-        for (let i = 0; i < warmOrder.length; i++) {
-          const ok = await prepareAccountRuntime(
-            warmOrder[i],
+      // Construct the single runtime container: crash recovery, account
+      // registration, readiness controller, maintenance scheduler, and warmup
+      // via the bounded controller.
+      const { runtimeServices: rs } = await constructRuntime(accounts, {
+        warmupExecutor: async (accountId: string) => {
+          const account = accounts.find((a) => a.id === accountId);
+          if (!account) return false;
+          return prepareAccountRuntime(
+            account,
             getAccountCredentials,
             initPlaywrightForAccount,
             disableNativeTools,
             warmQwenChatPool,
           );
-          if (ok) {
-            readyAccountIds.add(warmOrder[i].id);
-            console.log(
-              `✅ [Server] Account ready (${readyAccountIds.size}/${totalAccounts}): ${maskEmail(warmOrder[i].email)}`,
-            );
-            if (readyAccountIds.size >= (config.pool?.targetReady ?? 2)) break;
-          }
-        }
-      }
-
-      if (isRuntimeMode()) {
-        console.log(
-          `[Server] Runtime mode: pool controller owns all warmup (${accounts.length} accounts registered)`,
-        );
-      }
-
-      const remainingAccounts = accounts.filter(
-        (account) => !readyAccountIds.has(account.id),
+        },
+        keepAliveExecutor: undefined,
+        terminateWarmup: async (accountId: string) => {
+          const { closePlaywrightForAccount } = await import(
+            "../services/playwright.ts"
+          );
+          await closePlaywrightForAccount(accountId).catch(() => {});
+        },
+      });
+      runtimeServices = rs;
+      console.log(
+        `[Server] Pool controller owns all warmup (${accounts.length} accounts registered)`,
       );
-      if (!isRuntimeMode() && readyAccountIds.size === 0) {
-        console.warn(
-          `⚠️  [Server] No account ready during startup; continuing in background`,
-        );
-      }
-
-      if (!isRuntimeMode() && (config.playwright.prepareAllOnStartup || readyAccountIds.size === 0)) {
-        if (config.playwright.prepareAllOnStartup && remainingAccounts.length > 0) {
-          console.log(
-            `🪶 [Server] Preparing ${remainingAccounts.length} standby account(s) in background`,
-          );
-        }
-        void prepareRemainingAccountsInBackground({
-          accounts: remainingAccounts,
-          batchSize: BATCH_SIZE,
-          totalAccounts,
-          getAccountCredentials,
-          initPlaywrightForAccount,
-          disableNativeTools,
-          warmQwenChatPool,
-        }).catch((error) => {
-          console.warn(
-            `❌ [Server] Background account preparation failed: ${getErrorMessage(error)}`,
-          );
-        });
-      } else if (remainingAccounts.length > 0) {
-        console.log(
-          `🪶 [Server] ${remainingAccounts.length} standby account(s) will initialize on demand`,
-        );
-
-        // In background: warm 1 reserve account (if maxActiveContexts > 1) and
-        // validate the rest of the standby accounts
-        void (async () => {
-          const { validateAccountLogin } = await import("../services/playwright.ts");
-          const { ensureAccountInPriority } = await import("../core/account-priority.ts");
-
-          let accountsToValidate = remainingAccounts;
-
-          // Warm reserve account in background for fast failover without delaying startup
-          if (config.playwright.maxActiveContexts > 1 && remainingAccounts.length > 0) {
-            let reserveCandidateIdx = 0;
-            for (; reserveCandidateIdx < remainingAccounts.length; reserveCandidateIdx++) {
-              const reserveAccount = remainingAccounts[reserveCandidateIdx];
-              try {
-                const ok = await prepareAccountRuntime(
-                  reserveAccount,
-                  getAccountCredentials,
-                  initPlaywrightForAccount,
-                  disableNativeTools,
-                  warmQwenChatPool,
-                );
-                if (ok) {
-                  ensureAccountInPriority(reserveAccount.id);
-                  console.log(
-                    `✅ [Server] Reserve account ready (2/${totalAccounts}): ${maskEmail(reserveAccount.email)}`,
-                  );
-                  reserveCandidateIdx++;
-                  break;
-                }
-              } catch (err) {
-                console.warn(
-                  `⚠️  [Server] Failed to warm reserve account ${maskEmail(reserveAccount.email)}: ${getErrorMessage(err)}`,
-                );
-              }
-            }
-            accountsToValidate = remainingAccounts.slice(reserveCandidateIdx);
-          }
-
-          let validated = 0;
-          let failed = 0;
-
-          for (const account of accountsToValidate) {
-            try {
-              const creds = getAccountCredentials(account.id) ?? account;
-              // Validate login in background with real unmasked credentials
-              const ok = await validateAccountLogin(
-                creds,
-                config.playwright.headless,
-                config.playwright.browser,
-              );
-              if (ok) {
-                // Add to priority list only once validated
-                ensureAccountInPriority(account.id);
-                validated++;
-                try {
-                  noteAccountInitSuccess(account.id);
-                  noteAccountRecovered(account.id);
-                } catch {
-                  // Best-effort.
-                }
-                console.log(
-                  `✅ [Server] Standby account validated: ${maskEmail(account.email)}`,
-                );
-              } else {
-                failed++;
-                try {
-                  noteAccountInitFailure(account.id);
-                  markAccountAuthError(account.id);
-                  if (isAccountEffectivelyBroken(account.id)) {
-                    markAccountBroken(account.id);
-                  }
-                } catch {
-                  // Best-effort.
-                }
-                console.warn(
-                  `⚠️  [Server] Standby account login failed: ${maskEmail(account.email)} (quarantined)`,
-                );
-              }
-            } catch (error) {
-              failed++;
-              console.warn(
-                `⚠️  [Server] Standby account validation error: ${maskEmail(account.email)}: ${getErrorMessage(error)} (quarantined)`,
-              );
-              const { markAccountRateLimited } = await import("../core/account-manager.ts");
-              markAccountRateLimited(
-                account.id,
-                24 * 3600 * 1000,
-                `StandbyValidationError: ${getErrorMessage(error)}`,
-              );
-            }
-          }
-
-          if (validated > 0 || failed > 0) {
-            console.log(
-              `✅ [Server] Standby validation complete: ${validated} account(s) ready${failed > 0 ? `, ${failed} failed` : ""}`,
-            );
-          }
-        })().catch((error) => {
-          console.warn(
-            `❌ [Server] Background standby validation failed: ${getErrorMessage(error)}`,
-          );
-        });
-      }
     }
 
     const serverInstance = serve({
@@ -1129,8 +1066,12 @@ export async function startServer(options?: {
 
     const started = buildStartedServerInfo();
     const accountCount = accounts.length;
+    // Single readiness definition: an account is warm only when its anti-bot
+    // headers were captured (headers-ready), not merely when a browser page
+    // exists. Matches the HOT gate on the request path.
+    const { isAccountHeadersReady } = await import("../core/account-manager.ts");
     const warmCount = accounts.filter((account) =>
-      isPlaywrightInitialized(account.id),
+      isAccountHeadersReady(account.id),
     ).length;
 
     // API key display: just show if it's set or not

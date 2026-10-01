@@ -8,6 +8,7 @@ import {
 import { logger } from "../core/logger.ts";
 import { sendOpenAIError } from "../api/error-helpers.ts";
 import { ValidationError } from "../core/errors.ts";
+import { fetchUserMedia } from "../utils/egress.ts";
 
 const DEFAULT_SIZE = "auto";
 
@@ -34,7 +35,7 @@ function validationError(message: string, param: string): ValidationError {
 }
 
 async function urlToBase64(url: string): Promise<string> {
-  const response = await fetch(url);
+  const response = await fetchUserMedia(url);
   if (!response.ok) {
     throw new Error(`Failed to download generated image: HTTP ${response.status}`);
   }

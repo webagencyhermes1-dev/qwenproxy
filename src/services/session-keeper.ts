@@ -1,6 +1,5 @@
 import { config } from "../core/config.ts";
 import { hasActiveAccountLease } from "../core/account-concurrency.ts";
-import { isReadinessControllerEnabled } from "../core/readiness-guard.ts";
 import type { IAccountOwnership } from "../runtime/contracts.ts";
 import type { MaintenanceScheduler } from "../runtime/maintenance/maintenance-scheduler.ts";
 
@@ -27,9 +26,8 @@ const GENERATING_STATUSES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * The bounded scheduler the keeper submits to when the readiness controller
- * flag is on (spec §14). Registered by startRuntimeServices; while null the
- * keeper keeps its legacy per-account interval loop.
+ * The bounded scheduler the keeper submits to when clients are registered.
+ * While null the keeper keeps its direct per-account loop.
  */
 export interface SessionKeeperClients {
   readonly ownership: IAccountOwnership;
@@ -120,7 +118,9 @@ async function runKeepAliveCycle(): Promise<void> {
   cycleInProgress = true;
   try {
     if (config.sessionKeeper.enabled) {
-      if (isReadinessControllerEnabled() && keeperClients) {
+      // Scheduler path when clients are registered (production runtime via
+      // the maintenance scheduler); direct per-account loop otherwise.
+      if (keeperClients) {
         submitKeepAliveJobs();
       } else {
         const accountIds = getActivePlaywrightAccountIds();

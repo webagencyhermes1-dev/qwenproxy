@@ -47,6 +47,32 @@ function now(): number {
   return Date.now();
 }
 
+export interface AccountTransitionEvent {
+  accountId: string;
+  from: AccountStatus;
+  to: AccountStatus;
+  reason: string;
+  at: number;
+}
+
+const transitionListeners = new Set<
+  (e: AccountTransitionEvent) => void
+>();
+
+/**
+ * OPTIONAL module-level transition listener hook (Phase 3.1 observability).
+ * Returns an unsubscribe function. Listener errors are swallowed so they
+ * never break transitions.
+ */
+export function onTransition(
+  listener: (e: AccountTransitionEvent) => void,
+): () => void {
+  transitionListeners.add(listener);
+  return () => {
+    transitionListeners.delete(listener);
+  };
+}
+
 /**
  * SOLE authority for account acquisition, lease ownership, release, state
  * transitions and recovery coordination. Other components may query or REQUEST
@@ -186,6 +212,19 @@ export class AccountResourceManager implements IAccountOwnership {
         to,
         `release:${request.outcome}${request.reason ? `:${request.reason}` : ""}`,
       );
+      // A cooldown that landed mid-generation re-holds the account now that
+      // it is lease-free, instead of leaking a cooled account as READY.
+      if (
+        to === "READY" &&
+        record.cooldownUntil > now() &&
+        canTransitionAccount("READY", "COOLDOWN")
+      ) {
+        this.applyTransition(
+          record,
+          "COOLDOWN",
+          `cooldown:${record.cooldownReason ?? "rate-limit"}`,
+        );
+      }
     }
     return { released: true, stale: false };
   }
@@ -303,7 +342,7 @@ export class AccountResourceManager implements IAccountOwnership {
         errorCode: "ACCOUNT_UNAVAILABLE",
       };
     }
-    if (this.isCoolingDown(record)) {
+    if (this.checkCooldown(record)) {
       return {
         usable: false,
         reason: `cooldown:${record.cooldownReason ?? "rate-limit"}`,
@@ -420,7 +459,50 @@ export class AccountResourceManager implements IAccountOwnership {
     }
   }
 
-  private isCoolingDown(record: InternalAccountRecord): boolean {
+  setCooldownUntil(accountId: string, untilMs: number, reason: string | null): void {
+    const record = this.accounts.get(accountId);
+    if (!record) return;
+    if (untilMs > now()) {
+      record.cooldownUntil = untilMs;
+      record.cooldownReason = reason;
+      // A live generation keeps serving; the release path re-holds the
+      // account once it returns to READY (see release()).
+      if (record.lease === null && canTransitionAccount(record.status, "COOLDOWN")) {
+        this.applyTransition(record, "COOLDOWN", `cooldown:${reason ?? "rate-limit"}`);
+      }
+    } else {
+      record.cooldownUntil = 0;
+      record.cooldownReason = null;
+      if (record.status === "COOLDOWN") {
+        this.applyTransition(record, "STANDBY", "cooldown-cleared");
+      }
+    }
+  }
+
+  isCoolingDown(accountId: string): boolean {
+    const record = this.accounts.get(accountId);
+    if (!record) return false;
+    return this.checkCooldown(record);
+  }
+
+  reapExpiredCooldowns(nowMs: number = now()): number {
+    let reaped = 0;
+    for (const record of this.accounts.values()) {
+      if (
+        record.status === "COOLDOWN" &&
+        record.cooldownUntil > 0 &&
+        record.cooldownUntil <= nowMs
+      ) {
+        record.cooldownUntil = 0;
+        record.cooldownReason = null;
+        this.applyTransition(record, "STANDBY", "cooldown-expired");
+        reaped += 1;
+      }
+    }
+    return reaped;
+  }
+
+  private checkCooldown(record: InternalAccountRecord): boolean {
     if (record.cooldownUntil <= 0) return false;
     if (record.cooldownUntil > now()) return true;
     // Expired cooldown auto-clears to STANDBY.
@@ -437,9 +519,26 @@ export class AccountResourceManager implements IAccountOwnership {
     to: AccountStatus,
     reason: string,
   ): void {
-    assertAccountTransition(record.status, to);
+    const from = record.status;
+    assertAccountTransition(from, to);
     record.status = to;
     record.lastTransitionReason = reason;
+    if (transitionListeners.size > 0) {
+      const event: AccountTransitionEvent = {
+        accountId: record.accountId,
+        from,
+        to,
+        reason,
+        at: Date.now(),
+      };
+      for (const listener of [...transitionListeners]) {
+        try {
+          listener(event);
+        } catch {
+          // Never break transitions.
+        }
+      }
+    }
   }
 
   private accountIdForLease(fence: OwnershipFence): string {

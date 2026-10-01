@@ -5,6 +5,15 @@
 
 import { config, type ChatMode } from "../core/config.ts";
 
+/**
+ * Auth headers for TUI→server calls (health polls, control endpoints).
+ * Attaches the configured API key when one exists; without a key the server
+ * leaves operational routes open (keyless localhost dev) so nothing is sent.
+ */
+export function tuiAuthHeaders(): Record<string, string> {
+  return config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {};
+}
+
 export interface ProxyStatusSnapshot {
   online: boolean;
   port: number;
@@ -100,6 +109,7 @@ async function fetchHealth(): Promise<any> {
   try {
     const resp = await fetch(`http://${host}:${port}/health`, {
       signal: controller.signal,
+      headers: tuiAuthHeaders(),
     });
     clearTimeout(timeout);
 

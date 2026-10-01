@@ -6,6 +6,7 @@ export type QwenProxyStatusCode =
   | 401
   | 403
   | 404
+  | 413
   | 429
   | 499
   | 500
@@ -41,7 +42,7 @@ export abstract class QwenProxyError extends Error {
 }
 
 export class ValidationError extends QwenProxyError {
-  readonly statusCode = 400;
+  readonly statusCode: QwenProxyStatusCode = 400;
   readonly type = "invalid_request_error";
   readonly code: string = "bad_request";
 }
@@ -54,6 +55,12 @@ export class ContextLengthExceededError extends ValidationError {
     super(message);
     this.param = param;
   }
+}
+
+/** Request body exceeds the configured JSON ingest limit. */
+export class PayloadTooLargeError extends ValidationError {
+  readonly statusCode = 413;
+  readonly code = "body_too_large";
 }
 
 export class AuthError extends QwenProxyError {

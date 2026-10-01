@@ -76,6 +76,13 @@ class FakeOwnership implements IAccountOwnership {
 
   registerAccount(): void {}
   setDraining(): void {}
+  setCooldownUntil(): void {}
+  isCoolingDown(): boolean {
+    return false;
+  }
+  reapExpiredCooldowns(): number {
+    return 0;
+  }
 
   async recoverAccount(id: string, reason: string): Promise<void> {
     this.recoverCalls.push(id);
@@ -234,6 +241,41 @@ test("44-account pool, target 4, concurrency 2: at most 2 jobs globally and 1 pe
   const second = await ctrl.tick();
   assert.equal(second.launched.length, 0, "no duplicate warmups while in flight");
   assert.ok(maxConcurrent <= 2, `maxConcurrent ${maxConcurrent} must be <= 2`);
+});
+
+test("RECOVERING accounts are warmup candidates (no stranding after context death)", async () => {
+  const own = makePool(4);
+  own.accounts.get("acct1")!.status = "READY";
+  own.accounts.get("acct2")!.status = "RECOVERING";
+  own.accounts.get("acct3")!.status = "RECOVERING";
+  const launched: string[] = [];
+  const ctrl = new ReadinessController(
+    own,
+    {
+      targetReady: 5,
+      warmupConcurrency: 2,
+      warmupTimeoutMs: 1000,
+      maxWarmupFailures: 3,
+      backoffBaseMs: 1,
+      backoffMaxMs: 1,
+    },
+    {
+      warmWarmup: async (id) => {
+        launched.push(id);
+        return "failed";
+      },
+      jitter: () => 0,
+    },
+  );
+  // ready=1, recovering=2 (counted as warming), deficit=2: one STANDBY plus
+  // one RECOVERING launch. RECOVERING accounts must be launchable, not stranded.
+  const report = await ctrl.tick();
+  assert.ok(
+    report.launched.includes("acct2") || report.launched.includes("acct3"),
+    `expected a RECOVERING launch, got ${JSON.stringify(report.launched)}`,
+  );
+  await settle(50);
+  assert.ok(launched.length >= 1, "RECOVERING warmup must actually run");
 });
 
 test("warmup timeout force-terminates and counts a failure", async () => {

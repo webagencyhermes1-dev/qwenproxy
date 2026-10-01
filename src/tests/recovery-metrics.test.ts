@@ -8,27 +8,29 @@ import {
   addAccount,
   removeAccount,
   invalidateAccountsCache,
-  type QwenAccount,
 } from "../core/accounts.ts";
 import {
   clearAccountCooldown,
   clearAllAccountCooldowns,
   getHeadersReadyAccountIds,
+  markAccountHeadersReady,
   unmarkAccountHeadersReady,
 } from "../core/account-manager.ts";
 import { getDatabase } from "../core/database.ts";
 import { resetAccountConcurrencyForTests } from "../core/account-concurrency.ts";
 import {
-  ensurePoolReadiness,
-  getReadinessDiagnostics,
-  registerReadinessGuardDeps,
-  recoveredValidationBucket,
-  resetReadinessCountersForTests,
-  runReadinessValidationForTests,
-  stopReadinessGuardSweep,
-} from "../core/readiness-guard.ts";
-import { config } from "../core/config.ts";
+  getAccountOwnership,
+  initAccountOwnership,
+  resetAccountOwnershipForTests,
+} from "../runtime/account/instance.ts";
+import type { OwnershipFence } from "../runtime/contracts.ts";
+import {
+  ReadinessController,
+  type WarmupOutcome,
+} from "../runtime/readiness/readiness-controller.ts";
 import { app } from "../api/server.ts";
+
+const SYSTEM_FENCE: OwnershipFence = { leaseId: "system", ownerToken: "system" };
 
 function seedAccount(id: string): () => void {
   addAccount(`${id}@example.com`, "secret", id);
@@ -46,9 +48,9 @@ function seedAccount(id: string): () => void {
 
 /**
  * Hermetic slate: the .env.test database carries real Qwen accounts that would
- * otherwise get warmed as standbys and skew strict counter assertions. Drop
- * them and wipe the in-memory headers-ready/cooldown state (mirrors the
- * server-lifecycle.test.ts accounts-table precedent).
+ * otherwise skew strict assertions. Drop them and wipe the in-memory
+ * headers-ready/cooldown state (mirrors the server-lifecycle.test.ts
+ * accounts-table precedent).
  */
 function cleanSlate(): void {
   try {
@@ -61,148 +63,143 @@ function cleanSlate(): void {
   for (const id of getHeadersReadyAccountIds()) unmarkAccountHeadersReady(id);
 }
 
-function registerDeps(opts: { initDelayMs?: number } = {}): {
-  release: () => void;
-} {
-  registerReadinessGuardDeps({
-    getAccountCredentials: (id) =>
-      ({ id, email: `${id}@example.com`, username: id, password: "secret" }) as QwenAccount,
-    initPlaywrightForAccount: async () => {
-      const delayed = opts.initDelayMs ?? 0;
-      if (delayed > 0) {
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, delayed);
-          timer.unref?.();
-        });
-      }
-    },
-    disableNativeTools: async () => {},
-    warmQwenChatPool: async () => {},
-  });
-  return {
-    release: () => {
-      registerReadinessGuardDeps(null as never);
-    },
+function bindPool(ids: string[]): void {
+  initAccountOwnership(
+    ids.map((accountId) => ({
+      accountId,
+      disabled: false,
+      cooldownUntil: 0,
+      cooldownReason: null,
+    })),
+  );
+}
+
+/** Production-shaped warmup: claim WARMING, capture headers, report outcome. */
+function makeExecutor(calls: string[]): (id: string) => Promise<WarmupOutcome> {
+  return async (id: string) => {
+    calls.push(id);
+    const ownership = getAccountOwnership();
+    if (ownership.getAccountStatus(id) === "RECOVERING") {
+      ownership.transition(id, "STANDBY", SYSTEM_FENCE, "recovery-requeue");
+    }
+    const claimed = ownership.transition(id, "WARMING", SYSTEM_FENCE, "warmup-start");
+    if (!claimed.transitioned) return "failed";
+    markAccountHeadersReady(id);
+    return getAccountOwnership().getAccountStatus(id) === "READY" ? "ready" : "failed";
   };
 }
 
-test("recovery counters: pool check and warmups are recorded", async () => {
-  stopReadinessGuardSweep();
+function settle(ms = 50): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+test("recovery: controller tick warms the standby exactly once", async () => {
   resetAccountConcurrencyForTests();
-  resetReadinessCountersForTests();
+  resetAccountOwnershipForTests();
   cleanSlate();
   const cleanup = seedAccount("rg-metrics-warm");
-  const priorModels = config.qwen.chatPoolModels;
-  config.qwen.chatPoolModels = ["qwen3.6-plus"];
-  const { release } = registerDeps();
+  bindPool(["rg-metrics-warm"]);
+  const calls: string[] = [];
+  const controller = new ReadinessController(
+    getAccountOwnership(),
+    {
+      targetReady: 1,
+      warmupConcurrency: 1,
+      warmupTimeoutMs: 5000,
+      maxWarmupFailures: 3,
+      backoffBaseMs: 1,
+      backoffMaxMs: 2,
+    },
+    { warmWarmup: makeExecutor(calls), jitter: () => 0 },
+  );
   try {
-    await ensurePoolReadiness();
-    const diag = getReadinessDiagnostics();
-    assert.ok(diag.poolChecksRun >= 1, "pool check must be counted");
-    assert.equal(diag.accountsWarmed, 1, "the single standby must be warmed once");
-    assert.ok(diag.lastPoolCheckAt != null, "last pool check timestamp must be set");
-    assert.equal(diag.readyAccounts, 1, "warmed account is now ready");
+    const report = await controller.tick();
+    assert.deepEqual(report.launched, ["rg-metrics-warm"]);
+    await settle();
+    assert.deepEqual(calls, ["rg-metrics-warm"], "standby must be warmed exactly once");
+    assert.equal(
+      getAccountOwnership().getAccountStatus("rg-metrics-warm"),
+      "READY",
+    );
+    controller.stop();
   } finally {
-    release();
-    config.qwen.chatPoolModels = priorModels;
     cleanup();
     cleanSlate();
-    resetReadinessCountersForTests();
+    resetAccountConcurrencyForTests();
+    resetAccountOwnershipForTests();
   }
 });
 
-test("recovery counters: thundering herd is counted as coalesced", async () => {
-  stopReadinessGuardSweep();
+test("recovery: concurrent ticks coalesce, never duplicate warmups", async () => {
   resetAccountConcurrencyForTests();
-  resetReadinessCountersForTests();
+  resetAccountOwnershipForTests();
   cleanSlate();
   const cleanup = seedAccount("rg-metrics-herd");
-  const priorModels = config.qwen.chatPoolModels;
-  config.qwen.chatPoolModels = ["qwen3.6-plus"];
-  const { release } = registerDeps({ initDelayMs: 60 });
+  bindPool(["rg-metrics-herd"]);
+  const calls: string[] = [];
+  const controller = new ReadinessController(
+    getAccountOwnership(),
+    {
+      targetReady: 1,
+      warmupConcurrency: 1,
+      warmupTimeoutMs: 5000,
+      maxWarmupFailures: 3,
+      backoffBaseMs: 1,
+      backoffMaxMs: 2,
+    },
+    {
+      warmWarmup: async (id: string) => {
+        calls.push(id);
+        await settle(60);
+        return makeExecutor([])(id);
+      },
+      jitter: () => 0,
+    },
+  );
   try {
-    await Promise.all([
-      ensurePoolReadiness(),
-      ensurePoolReadiness(),
-      ensurePoolReadiness(),
-      ensurePoolReadiness(),
-      ensurePoolReadiness(),
+    const reports = await Promise.all([
+      controller.tick(),
+      controller.tick(),
+      controller.tick(),
+      controller.tick(),
+      controller.tick(),
     ]);
-    const diag = getReadinessDiagnostics();
-    // 4 of the 5 triggers arrived while the check was running.
+    const launched = reports.flatMap((r) => r.launched);
     assert.ok(
-      diag.coalescedTriggers >= 4,
-      `expected at least 4 coalesced triggers, got ${diag.coalescedTriggers}`,
+      launched.length <= 2,
+      `expected coalesced passes, got ${launched.length} launches`,
     );
-    // One check + one trailing re-check, never one check per trigger.
-    assert.ok(
-      diag.poolChecksRun <= 2,
-      `expected <= 2 pool checks, got ${diag.poolChecksRun}`,
-    );
-    assert.equal(diag.accountsWarmed, 1, "herd must warm the standby exactly once");
+    await settle(100);
+    assert.deepEqual(calls, ["rg-metrics-herd"], "herd must warm the standby exactly once");
+    controller.stop();
   } finally {
-    release();
-    config.qwen.chatPoolModels = priorModels;
     cleanup();
     cleanSlate();
-    resetReadinessCountersForTests();
+    resetAccountConcurrencyForTests();
+    resetAccountOwnershipForTests();
   }
 });
 
-test("recovery counters: validation sweep runs and revalidates the matching bucket", async () => {
-  stopReadinessGuardSweep();
+test("health/recovery endpoint surfaces controller diagnostics", async () => {
   resetAccountConcurrencyForTests();
-  resetReadinessCountersForTests();
-  cleanSlate();
-  const priorModels = config.qwen.chatPoolModels;
-  config.qwen.chatPoolModels = ["qwen3.6-plus"];
-  const { release } = registerDeps();
-
-  // Pick an account id whose validation bucket matches the CURRENT sweep bucket
-  // so this sweep deterministically revalidates it (no sweep-boundary flake).
-  const sweepBucket = Math.floor(Date.now() / 60_000) % 3;
-  let recoveredId: string | null = null;
-  for (let i = 0; i < 32; i++) {
-    const candidate = `rg-metrics-recover-${String(i).padStart(2, "0")}`;
-    if (recoveredValidationBucket(candidate) === sweepBucket) {
-      recoveredId = candidate;
-      break;
-    }
-  }
-  assert.ok(recoveredId, "must find an id matching the current validation bucket");
-  const cleanup = seedAccount(recoveredId!);
-  try {
-    await runReadinessValidationForTests();
-    const diag = getReadinessDiagnostics();
-    assert.equal(diag.validationSweepsRun, 1, "validation sweep must be counted");
-    assert.equal(diag.accountsRevalidated, 1, "bucket-matched recovered account must revalidate");
-  } finally {
-    release();
-    config.qwen.chatPoolModels = priorModels;
-    cleanup();
-    cleanSlate();
-    resetReadinessCountersForTests();
-  }
-});
-
-test("health/recovery endpoint surfaces readiness diagnostics", async () => {
-  stopReadinessGuardSweep();
-  resetAccountConcurrencyForTests();
-  resetReadinessCountersForTests();
+  resetAccountOwnershipForTests();
   cleanSlate();
   const res = await app.fetch(new Request("http://localhost/health/recovery"));
   assert.equal(res.status, 200);
   const body = (await res.json()) as {
-    readiness: Record<string, number>;
+    readiness: { inFlight: string[]; targetReady: number; readyCount: number; deficit: number };
     leases: unknown[];
+    queuedLeaseCount: number;
     pool: { ready: number };
     timestamp: number;
   };
   assert.ok(body.readiness, "readiness diagnostics must be present");
-  assert.equal(typeof body.readiness.poolChecksRun, "number");
-  assert.equal(typeof body.readiness.coalescedTriggers, "number");
+  assert.ok(Array.isArray(body.readiness.inFlight));
+  assert.equal(typeof body.readiness.deficit, "number");
+  assert.equal(body.queuedLeaseCount, 0, "no request queue exists (fail-fast admission)");
   assert.ok(Array.isArray(body.leases));
   assert.ok(body.timestamp > 0);
   cleanSlate();
-  resetReadinessCountersForTests();
+  resetAccountConcurrencyForTests();
+  resetAccountOwnershipForTests();
 });

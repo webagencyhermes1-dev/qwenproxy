@@ -1,5 +1,11 @@
 import type { Context } from "hono";
+import { z } from "zod";
 import type { OpenAIRequest, Message } from "../../utils/types.ts";
+import {
+  ContextLengthExceededError,
+  PayloadTooLargeError,
+  ValidationError,
+} from "../../core/errors.ts";
 import type { QwenFileEntry } from "../upload.ts";
 import { processImagesForQwen } from "../upload.ts";
 import { logger, isToolcallDebugEnabled } from "../../core/logger.js";
@@ -54,8 +60,67 @@ function parseActiveToolNames(c: Context): Set<string> | undefined {
   return names.length > 0 ? new Set(names) : undefined;
 }
 
+/**
+ * Structural bounds for chat/completions bodies. Permissive by design (shape,
+ * not semantics): model stays optional (suffix mapping tolerates absence),
+ * but array cardinalities are capped so a single request cannot OOM the
+ * prompt build or the browser replay.
+ */
+const ChatBodySchema = z.object({
+  model: z.string().min(1).max(200).optional(),
+  messages: z.array(z.any()).max(500),
+  stream: z.boolean().optional(),
+  tools: z.array(z.any()).max(100).optional(),
+  tool_choice: z.any().optional(),
+  response_format: z.any().optional(),
+  session_id: z.string().max(200).optional(),
+  conversation_id: z.string().max(200).optional(),
+  reasoning_effort: z.any().optional(),
+  reasoningEffort: z.any().optional(),
+  user: z.any().optional(),
+}).passthrough();
+
 export async function parseRequestBody(c: Context): Promise<ParsedRequest> {
-  const body: OpenAIRequest = await c.req.json();
+  // Fail fast on declared size before buffering the body into memory.
+  const declaredLength = Number(c.req.header("content-length") || 0);
+  if (
+    Number.isFinite(declaredLength) &&
+    declaredLength > config.server.jsonBodyLimitBytes
+  ) {
+    throw new PayloadTooLargeError(
+      `Request body too large (${declaredLength} bytes declared; limit ${config.server.jsonBodyLimitBytes}). Reduce history or attachments and retry.`,
+    );
+  }
+  const raw: unknown = await c.req.json();
+  const parsed = ChatBodySchema.safeParse(raw);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const where = issue ? ` '${issue.path.join(".") || "(root)"}'` : "";
+    throw new ValidationError(
+      `Invalid chat/completions body${where}: ${issue?.message ?? "schema mismatch"}`,
+    );
+  }
+  const body = parsed.data as OpenAIRequest;
+  if (typeof body.model !== "string" || body.model.trim().length === 0) {
+    throw new ValidationError("Invalid chat/completions body 'model': model is required");
+  }
+  // Post-parse byte count: Content-Length can lie (chunked encoding).
+  const bodyBytes = Buffer.byteLength(JSON.stringify(body));
+  if (bodyBytes > config.server.jsonBodyLimitBytes) {
+    throw new PayloadTooLargeError(
+      `Request body too large (${bodyBytes} bytes parsed; limit ${config.server.jsonBodyLimitBytes}). Reduce history or attachments and retry.`,
+    );
+  }
+  // Local prompt budget enforced before any browser work is spent.
+  if (config.qwen.maxPromptBytes > 0) {
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    const promptBytes = Buffer.byteLength(JSON.stringify(messages));
+    if (promptBytes > config.qwen.maxPromptBytes) {
+      throw new ContextLengthExceededError(
+        `Input is too large for QwenProxy (${promptBytes} UTF-8 bytes; limit ${config.qwen.maxPromptBytes}). Reduce or summarize the conversation before retrying.`,
+      );
+    }
+  }
   logIncomingChatRequest(c, body);
   const isStream = body.stream ?? false;
   const conversationKey =

@@ -5,10 +5,6 @@ import { AccountResourceManager } from "./resource-manager.ts";
 
 let manager: AccountResourceManager | null = null;
 
-export function isLeaseAuthorityEnabled(): boolean {
-  return process.env["QWEN_RUNTIME_LEASE_AUTHORITY"] === "true";
-}
-
 export function initAccountOwnership(
   accounts: readonly PersistedAccountState[],
 ): AccountResourceManager {
@@ -18,9 +14,19 @@ export function initAccountOwnership(
       next.registerAccount(account.accountId, account);
     }
   }
+  setAccountOwnership(next);
+  return next;
+}
+
+/**
+ * Bind an externally constructed manager (production `constructRuntime`
+ * builds its own with pool options, then hands it over here). Binds the
+ * gateway atomically with the instance so the two can never disagree about
+ * which authority is active.
+ */
+export function setAccountOwnership(next: AccountResourceManager): void {
   manager = next;
   bindGateway(next);
-  return next;
 }
 
 export function getAccountOwnership(): AccountResourceManager {
@@ -28,6 +34,16 @@ export function getAccountOwnership(): AccountResourceManager {
     throw new Error("Account ownership has not been initialized");
   }
   return manager;
+}
+
+/**
+ * True once an AccountResourceManager is bound (production server startup via
+ * constructRuntime → setAccountOwnership, or tests that bind explicitly).
+ * Readiness queries use the ownership state machine when bound and fall back
+ * to the legacy in-memory set otherwise (hermetic mock tests never bind).
+ */
+export function isAccountOwnershipBound(): boolean {
+  return manager !== null;
 }
 
 export function resetAccountOwnershipForTests(): void {

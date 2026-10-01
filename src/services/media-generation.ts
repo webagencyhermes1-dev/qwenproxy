@@ -5,7 +5,7 @@ import { qwenUrl } from "./qwen-url.ts";
 
 import { config } from "../core/config.ts";
 import {
-  getNextAvailableAccount,
+  pickNextHotCandidate,
   markAccountRateLimited,
   clearAccountCooldown,
 } from "../core/account-manager.ts";
@@ -1121,7 +1121,7 @@ export async function generateImage(params: {
   for (let attempt = 0; attempt < MAX_ACCOUNT_ATTEMPTS; attempt++) {
     const account = requestedAccountId
       ? { id: requestedAccountId, email: requestedAccountId }
-      : getNextAvailableAccount(triedAccounts);
+      : pickNextHotCandidate(triedAccounts);
 
     if (!account) {
       // A previous attempt already failed and no other account is available —
@@ -1327,7 +1327,7 @@ export async function generateVideo(params: {
   for (let attempt = 0; attempt < MAX_ACCOUNT_ATTEMPTS; attempt++) {
     const account = requestedAccountId
       ? { id: requestedAccountId, email: requestedAccountId }
-      : getNextAvailableAccount(triedAccounts);
+      : pickNextHotCandidate(triedAccounts);
 
     if (!account) {
       // A previous attempt already failed and no other account is available —

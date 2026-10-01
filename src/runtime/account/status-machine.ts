@@ -13,7 +13,11 @@ const TRANSITIONS: Readonly<Record<AccountStatus, readonly AccountStatus[]>> = {
   RESERVED: ["GENERATING", "READY", "RECOVERING", "DRAINING", "FAILED", "DISABLED"],
   GENERATING: ["DRAINING", "RECOVERING", "READY", "FAILED", "DISABLED"],
   DRAINING: ["READY", "RECOVERING", "DISABLED"],
-  RECOVERING: ["READY", "COOLDOWN", "FAILED", "DISABLED"],
+  // RECOVERING → STANDBY ("recovery-requeue"): recovery observation is
+  // complete and the account is back in the warmable pool. Without this edge
+  // a context-dead account strands in RECOVERING until restart — nothing else
+  // moves it (the controller only launches STANDBY/RECOVERING candidates).
+  RECOVERING: ["STANDBY", "READY", "COOLDOWN", "FAILED", "DISABLED"],
   COOLDOWN: ["STANDBY", "DISABLED"],
   FAILED: ["COOLDOWN", "STANDBY", "DISABLED"],
 };

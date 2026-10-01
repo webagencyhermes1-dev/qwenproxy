@@ -80,6 +80,20 @@ function buildCandidates(
   return candidates;
 }
 
+/**
+ * Stateless READY-only candidate peek (preferred-first, tried excluded).
+ * Read-only: the atomic claim still happens in `acquireGenerationAccount`,
+ * which re-validates, so the peek→claim window cannot claim a non-READY
+ * account. Used for rotation resolution and advisories; never for claiming.
+ */
+export function peekReadyAccountIds(
+  triedAccountIds?: ReadonlySet<string>,
+  preferredAccountId?: string,
+): string[] {
+  if (ownership === null) return [];
+  return buildCandidates(ownership, preferredAccountId, triedAccountIds);
+}
+
 export function acquireGenerationAccount(
   request: AcquireGenerationAccountRequest,
 ): AcquireGenerationAccountResult {

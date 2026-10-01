@@ -54,7 +54,7 @@ const envSchema = z
     // own context while serving. Accounts in cooldown (rate-limited) sit idle,
     // drop out of the warm set and get evicted.
     PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("25"),
-    PLAYWRIGHT_PREPARE_ALL_ON_STARTUP: z.string().default("false"),
+
     // Bounds how many per-account Chromium contexts may be launching and
     // capturing headers at the same time. Every account starts its own
     // persistent-context browser process; a burst of cold requests that all
@@ -186,8 +186,13 @@ const envSchema = z
     QWEN_PERSONALIZATION_VERIFY_GET: z.string().default("true"),
     QWEN_BROWSER_ONLY_FETCH: z.string().default("true"),
     QWEN_MAP_OPENAI_MODELS: z.string().default("true"),
-    QWEN_MAX_PROMPT_BYTES: z.string().default("0"),
+    // Local prompt byte budget enforced before the request reaches the
+    // browser replay. 0 disables the check (explicit opt-out, not default).
+    QWEN_MAX_PROMPT_BYTES: z.string().default("200000"),
     QWEN_MAX_PERSONALIZATION_BYTES: z.string().default("200000"),
+    // Max inbound JSON body accepted on chat/completions (Content-Length
+    // pre-check + post-parse byte count). Requests above it get 413.
+    JSON_BODY_LIMIT_BYTES: z.string().default("4194304"),
     CONTEXT_METER_ENABLED: z.string().default("true"),
     CONTEXT_METER_WINDOW_TOKENS: z.string().default("0"),
     CONTEXT_METER_REPORT_USAGE: z.string().default("true"),
@@ -206,6 +211,8 @@ const envSchema = z
     // does not enforce a token/request quota; these exist for SDK/tool parsing.
     RATE_LIMIT_REQUESTS: z.string().default("5000"),
     RATE_LIMIT_TOKENS: z.string().default("200000"),
+    // Enforced per-key request rate (token bucket on /v1/*). 0 disables.
+    RATE_LIMIT_PER_MINUTE: z.string().default("0"),
     // Tiered context compression for failover replay. When the sticky account
     // is unavailable and the conversation must be replayed onto a new account,
     // the full prompt (potentially 2M+ chars) is compressed to a budget using
@@ -232,7 +239,13 @@ export const config = {
     rateLimit: {
       requests: parseInt(env.RATE_LIMIT_REQUESTS),
       tokens: parseInt(env.RATE_LIMIT_TOKENS),
+      perMinute: Math.max(0, parseInt(env.RATE_LIMIT_PER_MINUTE)),
     },
+    /** Max inbound JSON body bytes (chat/completions pre-check). */
+    jsonBodyLimitBytes: Math.max(
+      65536,
+      parseInt(env.JSON_BODY_LIMIT_BYTES),
+    ),
   },
   logging: {
     chatRequests: env.CHAT_REQUEST_LOG === "true",
@@ -257,7 +270,6 @@ export const config = {
     hostResolverRules: env.QWEN_HOST_RESOLVER_RULES !== "false",
     chatOriginIp: env.QWEN_CHAT_ORIGIN_IP,
     storageStateTtlMs: Math.max(0, parseInt(env.PLAYWRIGHT_STORAGE_STATE_TTL_MS)),
-    prepareAllOnStartup: env.PLAYWRIGHT_PREPARE_ALL_ON_STARTUP !== "false",
   },
   captcha: {
     enabled: env.CAPTCHA_SOLVER_ENABLED === "true",

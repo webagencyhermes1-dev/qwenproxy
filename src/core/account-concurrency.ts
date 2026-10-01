@@ -9,10 +9,11 @@
 
 import { config } from "./config.ts";
 import { logger } from "./logger.ts";
+import { metrics } from "./metrics.ts";
 import { getStream } from "./stream-registry.ts";
 import {
   getAccountOwnership,
-  isLeaseAuthorityEnabled,
+  isAccountOwnershipBound,
   toLegacyAccountLease,
 } from "../runtime/account/instance.ts";
 
@@ -48,6 +49,13 @@ interface ActiveLeaseInfo {
   completionId?: string;
   /** Parallel-escape lease (own chat): excluded from the unemitted check. */
   parallelEscape?: boolean;
+  /**
+   * Ownership-authority backing (bound mode). The authoritative lease lives
+   * in AccountResourceManager; this entry is tracking only (supersede,
+   * snapshots, stale sweep). Release must go through the fenced manager.
+   */
+  ownerToken?: string;
+  external?: boolean;
 }
 
 interface QueueEntry {
@@ -133,6 +141,7 @@ function createLease(
     parallelEscape,
   };
   slot.activeLeases.push(info);
+  metrics.increment("lease.churn", 1, { account: accountId, event: "acquired" });
   logger.debug("[concurrency] lease acquired", {
     accountId,
     leaseId,
@@ -150,6 +159,7 @@ function createLease(
       released = true;
       const idx = slot.activeLeases.findIndex((l) => l.leaseId === leaseId);
       if (idx !== -1) slot.activeLeases.splice(idx, 1);
+      metrics.increment("lease.churn", 1, { account: accountId, event: "released" });
       const heldMs = Date.now() - info.acquiredAt;
       logger.debug("[concurrency] lease released", {
         accountId,
@@ -221,6 +231,20 @@ function sweepStaleLeases(accountId: string): number {
     const heldMs = now - lease.acquiredAt;
     if (heldMs > maxDuration) {
       slot.activeLeases.splice(i, 1);
+      metrics.increment("lease.churn", 1, { account: accountId, event: "swept" });
+      if (lease.external && lease.ownerToken && isAccountOwnershipBound()) {
+        // Return the account to the pool through the fenced manager.
+        try {
+          getAccountOwnership().release({
+            leaseId: lease.leaseId,
+            ownerToken: lease.ownerToken,
+            outcome: "cancelled",
+            reason: "stale-sweep",
+          });
+        } catch {
+          // Fenced/stale releases are safe no-ops inside the manager.
+        }
+      }
       swept++;
       console.warn(
         `⚠️  [Server] Stale lease force-released | account=${accountId} | label=${lease.label} | held ${Math.round(heldMs / 1000)}s (limit: ${Math.round(maxDuration / 1000)}s) | leaseId=${lease.leaseId}`,
@@ -253,8 +277,8 @@ export function tryAcquireAccountLease(
   leaseAbortController?: AbortController,
   parallelEscape?: boolean,
 ): AccountLease | null {
-  if (isLeaseAuthorityEnabled()) {
-    return tryAcquireFromOwnershipAuthority(accountId, label);
+  if (isAccountOwnershipBound()) {
+    return tryAcquireBound(accountId, { label, leaseAbortController, parallelEscape });
   }
   const slot = getSlot(accountId);
   sweepStaleLeases(accountId);
@@ -277,8 +301,8 @@ export function acquireAccountLease(
   accountId: string,
   options?: AcquireAccountLeaseOptions,
 ): Promise<AccountLease> {
-  if (isLeaseAuthorityEnabled()) {
-    return acquireFromOwnershipAuthority(accountId, options);
+  if (isAccountOwnershipBound()) {
+    return acquireBound(accountId, options);
   }
   const signal = options?.signal ?? null;
   const label = options?.label ?? "unlabeled";
@@ -399,26 +423,64 @@ export function acquireAccountLease(
 }
 
 /**
- * Thin pass-through to the ownership authority used while
- * QWEN_RUNTIME_LEASE_AUTHORITY is enabled. Returns the legacy AccountLease
- * shape with release() bound to the fenced manager release, so no caller
- * changes. The old slot machinery stays in place for the flag-off path.
+ * Ownership-backed acquisition (bound mode). The claim is atomic and
+ * non-blocking: at capacity the caller gets an immediate `account_busy`
+ * failure (fail-fast rotation upstream) instead of queueing behind a
+ * minutes-long generation. Every granted lease is registered in the tracking
+ * registry so latest-wins supersede, snapshots and the stale sweep keep
+ * working exactly as on the slot path.
  */
-function tryAcquireFromOwnershipAuthority(
+function claimBound(
   accountId: string,
-  label?: string,
+  label: string,
+  leaseAbortController?: AbortController,
+  parallelEscape?: boolean,
 ): AccountLease | null {
-  const generationId = label ?? accountId;
-  const result = getAccountOwnership().acquire({
-    generationId,
+  const ownership = getAccountOwnership();
+  // A NORMAL request never queues behind an auxiliary (parallel-escape)
+  // lease: the disposable title yields immediately (mirrors the slot path).
+  const tracked = getSlot(accountId).activeLeases;
+  if (tracked.length > 0 && tracked.every((l) => l.parallelEscape)) {
+    for (const lease of [...tracked]) {
+      lease.abortController?.abort();
+      releaseTrackedLease(accountId, lease.leaseId);
+    }
+  }
+  const result = ownership.acquire({
+    generationId: label,
     candidates: [accountId],
     deadline: Date.now() + config.concurrency.leaseMaxDurationMs,
-    requirements: { purpose: "generation", generationId },
+    requirements: { purpose: "generation", generationId: label },
   });
-  return result.ok ? toLegacyAccountLease(result.lease) : null;
+  if (!result.ok) return null;
+  return registerBoundLease(accountId, result.lease, {
+    label,
+    leaseAbortController,
+    parallelEscape,
+  });
 }
 
-function acquireFromOwnershipAuthority(
+function tryAcquireBound(
+  accountId: string,
+  options?: {
+    label?: string;
+    leaseAbortController?: AbortController;
+    parallelEscape?: boolean;
+  },
+): AccountLease | null {
+  try {
+    return claimBound(
+      accountId,
+      options?.label ?? "try-acquire",
+      options?.leaseAbortController,
+      options?.parallelEscape,
+    );
+  } catch {
+    return null;
+  }
+}
+
+function acquireBound(
   accountId: string,
   options?: AcquireAccountLeaseOptions,
 ): Promise<AccountLease> {
@@ -427,25 +489,112 @@ function acquireFromOwnershipAuthority(
       new Error("Aborted before acquiring account lease"),
     );
   }
-  try {
-    const generationId = options?.label ?? accountId;
-    const result = getAccountOwnership().acquire({
-      generationId,
-      candidates: [accountId],
-      deadline: Date.now() + config.concurrency.leaseMaxDurationMs,
-      requirements: { purpose: "generation", generationId },
-    });
-    if (!result.ok) {
-      const err = new Error(
-        `Account ${accountId} unavailable under lease authority: ${result.failureCode}`,
-      ) as Error & { code?: string };
-      err.code = "account_busy";
-      return Promise.reject(err);
-    }
-    return Promise.resolve(toLegacyAccountLease(result.lease));
-  } catch (err) {
-    return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+  const lease = claimBound(
+    accountId,
+    options?.label ?? "unlabeled",
+    options?.leaseAbortController,
+  );
+  if (!lease) {
+    const err = new Error(
+      `Account ${accountId} busy: no free slot under lease authority (fail-fast, no queue)`,
+    ) as Error & { code?: string };
+    err.code = "account_busy";
+    return Promise.reject(err);
   }
+  return Promise.resolve(lease);
+}
+
+/** Register an ownership lease in the tracking registry. */
+function registerBoundLease(
+  accountId: string,
+  lease: { leaseId: string; ownerToken: string },
+  options?: {
+    label?: string;
+    leaseAbortController?: AbortController;
+    parallelEscape?: boolean;
+  },
+): AccountLease {
+  const slot = getSlot(accountId);
+  const label = options?.label ?? "unlabeled";
+  const info: ActiveLeaseInfo = {
+    leaseId: lease.leaseId,
+    acquiredAt: Date.now(),
+    label,
+    abortController: options?.leaseAbortController,
+    parallelEscape: options?.parallelEscape,
+    ownerToken: lease.ownerToken,
+    external: true,
+  };
+  slot.activeLeases.push(info);
+  metrics.increment("lease.churn", 1, { account: accountId, event: "acquired" });
+  logger.debug("[concurrency] bound lease tracked", {
+    accountId,
+    leaseId: lease.leaseId,
+    label,
+    activeLeases: slot.activeLeases.length,
+  });
+
+  let released = false;
+  return {
+    accountId,
+    leaseId: lease.leaseId,
+    release() {
+      if (released) return;
+      released = true;
+      releaseTrackedLease(accountId, lease.leaseId);
+    },
+  };
+}
+
+function releaseTrackedLease(accountId: string, leaseId: string): void {
+  const slot = slots.get(accountId);
+  if (!slot) return;
+  const idx = slot.activeLeases.findIndex((l) => l.leaseId === leaseId);
+  if (idx === -1) return;
+  const [info] = slot.activeLeases.splice(idx, 1);
+  metrics.increment("lease.churn", 1, { account: accountId, event: "released" });
+  if (info?.external && info.ownerToken) {
+    try {
+      getAccountOwnership().release({
+        leaseId,
+        ownerToken: info.ownerToken,
+        outcome: "completed",
+      });
+    } catch {
+      // Fenced/stale releases are safe no-ops inside the manager.
+    }
+  }
+  if (slot.activeLeases.length === 0 && slot.queue.length === 0) {
+    slots.delete(accountId);
+  }
+}
+
+/**
+ * Track a lease claimed outside this module (gateway claims in
+ * routes/chat/account.ts) so latest-wins supersede, snapshots and the stale
+ * sweep observe it. Returns a release function that untracks AND releases
+ * through the fenced manager.
+ */
+export function trackExternalLease(
+  accountId: string,
+  lease: { leaseId: string; ownerToken: string },
+  options?: {
+    label?: string;
+    leaseAbortController?: AbortController;
+    parallelEscape?: boolean;
+  },
+): AccountLease {
+  if (!isAccountOwnershipBound()) {
+    return toLegacyAccountLease({
+      leaseId: lease.leaseId,
+      ownerToken: lease.ownerToken,
+      accountId,
+      generationId: options?.label ?? "",
+      acquiredAt: Date.now(),
+      deadline: 0,
+    });
+  }
+  return registerBoundLease(accountId, lease, options);
 }
 
 /**
@@ -494,6 +643,21 @@ export function abortLeaseByLabel(
 
   const heldMs = Date.now() - lease.acquiredAt;
   slot.activeLeases.splice(idx, 1);
+  metrics.increment("lease.churn", 1, { account: accountId, event: "released" });
+  if (lease.external && lease.ownerToken && isAccountOwnershipBound()) {
+    // Ownership-backed lease: free it through the fenced manager so the
+    // account returns to READY instead of leaking RESERVED.
+    try {
+      getAccountOwnership().release({
+        leaseId: lease.leaseId,
+        ownerToken: lease.ownerToken,
+        outcome: "cancelled",
+        reason: "session-supersede",
+      });
+    } catch {
+      // Fenced/stale releases are safe no-ops inside the manager.
+    }
+  }
 
   if (logger.isLevelEnabled("info")) {
     console.log(
@@ -586,8 +750,18 @@ export function markLeaseCompletion(
  */
 export function isAccountBusy(accountId: string): boolean {
   const slot = slots.get(accountId);
-  if (!slot) return false;
-  return slot.activeLeases.length >= config.concurrency.maxStreamsPerAccount;
+  const tracked =
+    (slot?.activeLeases.length ?? 0) >= config.concurrency.maxStreamsPerAccount;
+  if (tracked) return true;
+  if (isAccountOwnershipBound()) {
+    // Direct gateway claims bypass the registry: consult the authority.
+    try {
+      return getAccountOwnership().getOwnership(accountId).lease !== null;
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 /**
@@ -598,8 +772,16 @@ export function isAccountBusy(accountId: string): boolean {
  */
 export function hasActiveAccountLease(accountId: string): boolean {
   const slot = slots.get(accountId);
-  if (!slot) return false;
-  return slot.activeLeases.length > 0;
+  if (slot && slot.activeLeases.length > 0) return true;
+  if (isAccountOwnershipBound()) {
+    // Direct gateway claims bypass the registry: consult the authority.
+    try {
+      return getAccountOwnership().getOwnership(accountId).lease !== null;
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 /**
@@ -725,8 +907,27 @@ export function resetAccountConcurrencyForTests(): void {
       cleanupEntry(entry);
       entry.reject(new Error("Reset for tests"));
     }
+    // Ownership-backed entries: release through the fenced manager so a bound
+    // test pool returns to a clean state (guarded: most suites never bind).
+    if (isAccountOwnershipBound()) {
+      for (const entry of slot.activeLeases) {
+        if (entry.external && entry.ownerToken) {
+          try {
+            getAccountOwnership().release({
+              leaseId: entry.leaseId,
+              ownerToken: entry.ownerToken,
+              outcome: "cancelled",
+              reason: "test-reset",
+            });
+          } catch {
+            // Best-effort.
+          }
+        }
+      }
+    }
   }
   slots.clear();
   temporaryBusyUntil.clear();
   leaseCounter = 0;
 }
+

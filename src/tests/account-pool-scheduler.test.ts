@@ -8,11 +8,12 @@ import {
 import {
   buildSchedulerCandidates,
   clearAccountCooldown,
-  getNextAccount,
-  getNextAvailableAccount,
+  pickNextHotCandidate,
   getPoolStats,
+  markAccountHeadersReady,
   markAccountRateLimited,
   resetAccountManagerForTests,
+  unmarkAccountHeadersReady,
 } from "../core/account-manager.ts";
 import {
   pickSchedulerCandidate,
@@ -112,10 +113,15 @@ test("Scheduler: disabled accounts are always excluded", async () => {
     ],
     () => {
       setAccountDisabled("sched-d1", true);
-      for (let i = 0; i < 6; i++) {
-        const next = getNextAvailableAccount();
-        assert.ok(next, "expected an account");
-        assert.strictEqual(next!.id, "sched-d2");
+      markAccountHeadersReady("sched-d2");
+      try {
+        for (let i = 0; i < 6; i++) {
+          const next = pickNextHotCandidate();
+          assert.ok(next, "expected an account");
+          assert.strictEqual(next!.id, "sched-d2");
+        }
+      } finally {
+        unmarkAccountHeadersReady("sched-d2");
       }
       const stats = getPoolStats();
       assert.strictEqual(stats.disabled, 1);
@@ -135,10 +141,15 @@ test("Scheduler: broken and auth-error accounts are excluded", async () => {
     () => {
       markAccountBroken("sched-b1");
       markAccountAuthError("sched-b2");
-      for (let i = 0; i < 6; i++) {
-        const next = getNextAvailableAccount();
-        assert.ok(next);
-        assert.strictEqual(next!.id, "sched-b3");
+      markAccountHeadersReady("sched-b3");
+      try {
+        for (let i = 0; i < 6; i++) {
+          const next = pickNextHotCandidate();
+          assert.ok(next);
+          assert.strictEqual(next!.id, "sched-b3");
+        }
+      } finally {
+        unmarkAccountHeadersReady("sched-b3");
       }
       const stats = getPoolStats();
       assert.strictEqual(stats.broken, 1);
@@ -155,24 +166,30 @@ test("Scheduler: cooldown accounts excluded, eligible again after expiry", async
       { id: "sched-c2", email: "c2@test.com" },
     ],
     async () => {
-      markAccountRateLimited("sched-c1", 30_000, "RateLimited", {
-        silent: true,
-      });
-      let next = getNextAvailableAccount();
-      assert.ok(next);
-      assert.strictEqual(next!.id, "sched-c2");
+      markAccountHeadersReady("sched-c1");
+      markAccountHeadersReady("sched-c2");
+      try {
+        markAccountRateLimited("sched-c1", 30_000, "RateLimited", {
+          silent: true,
+        });
+        let next = pickNextHotCandidate();
+        assert.ok(next);
+        assert.strictEqual(next!.id, "sched-c2");
 
-      // Short cooldown expires and the account becomes eligible again.
-      markAccountRateLimited("sched-c2", 120, "RateLimitTemporary", {
-        silent: true,
-      });
-      next = getNextAvailableAccount(new Set(["sched-c1"]));
-      assert.ok(next);
-      // c2 on cooldown and c1 tried/excluded-by-cooldown: nothing untried.
-      await new Promise((r) => setTimeout(r, 250));
-      next = getNextAvailableAccount(new Set(["sched-c1"]));
-      assert.ok(next);
-      assert.strictEqual(next!.id, "sched-c2");
+        // Short cooldown expires and the account becomes eligible again.
+        markAccountRateLimited("sched-c2", 120, "RateLimitTemporary", {
+          silent: true,
+        });
+        // c2 cooling and c1 tried: no HOT candidate (null, not a cold pick).
+        assert.strictEqual(pickNextHotCandidate(new Set(["sched-c1"])), null);
+        await new Promise((r) => setTimeout(r, 250));
+        next = pickNextHotCandidate(new Set(["sched-c1"]));
+        assert.ok(next);
+        assert.strictEqual(next!.id, "sched-c2");
+      } finally {
+        unmarkAccountHeadersReady("sched-c1");
+        unmarkAccountHeadersReady("sched-c2");
+      }
     },
   );
 });
@@ -202,21 +219,28 @@ test("Scheduler: saturated accounts avoided when capacity exists elsewhere", asy
       { id: "sched-s2", email: "s2@test.com" },
     ],
     () => {
-      // .env.test sets maxStreamsPerAccount=1: one lease saturates s1.
-      const lease = tryAcquireAccountLease("sched-s1", "sat-label");
-      assert.ok(lease, "expected to acquire the single slot");
+      markAccountHeadersReady("sched-s1");
+      markAccountHeadersReady("sched-s2");
       try {
-        for (let i = 0; i < 4; i++) {
-          const next = getNextAvailableAccount();
-          assert.ok(next);
-          assert.strictEqual(next!.id, "sched-s2");
+        // .env.test sets maxStreamsPerAccount=1: one lease saturates s1.
+        const lease = tryAcquireAccountLease("sched-s1", "sat-label");
+        assert.ok(lease, "expected to acquire the single slot");
+        try {
+          for (let i = 0; i < 4; i++) {
+            const next = pickNextHotCandidate();
+            assert.ok(next);
+            assert.strictEqual(next!.id, "sched-s2");
+          }
+        } finally {
+          lease!.release();
         }
+        // After release both are eligible again.
+        const next = pickNextHotCandidate();
+        assert.ok(next);
       } finally {
-        lease!.release();
+        unmarkAccountHeadersReady("sched-s1");
+        unmarkAccountHeadersReady("sched-s2");
       }
-      // After release both are eligible again.
-      const next = getNextAvailableAccount();
-      assert.ok(next);
     },
   );
 });
@@ -230,20 +254,24 @@ test("Scheduler: healthy accounts preferred, load spread across 50 accounts", as
     // Degrade one account's health well below the pool.
     for (let i = 0; i < 5; i++) recordAccountFailure("sched-50-0", "quota");
     flushAccountHealth();
-
-    const seen = new Map<string, number>();
-    for (let i = 0; i < 60; i++) {
-      const next = getNextAccount();
-      assert.ok(next, "expected an account from a 50-account pool");
-      seen.set(next!.id, (seen.get(next!.id) ?? 0) + 1);
+    for (const row of rows) markAccountHeadersReady(row.id);
+    try {
+      const seen = new Map<string, number>();
+      for (let i = 0; i < 60; i++) {
+        const next = pickNextHotCandidate();
+        assert.ok(next, "expected an account from a 50-account pool");
+        seen.set(next!.id, (seen.get(next!.id) ?? 0) + 1);
+      }
+      // The degraded account must not dominate selection.
+      assert.ok((seen.get("sched-50-0") ?? 0) <= 2);
+      // Load spreads instead of hammering one account.
+      assert.ok(
+        seen.size >= 10,
+        `expected wide distribution, got ${seen.size} distinct`,
+      );
+    } finally {
+      for (const row of rows) unmarkAccountHeadersReady(row.id);
     }
-    // The degraded account must not dominate selection.
-    assert.ok((seen.get("sched-50-0") ?? 0) <= 2);
-    // Load spreads instead of hammering one account.
-    assert.ok(
-      seen.size >= 10,
-      `expected wide distribution, got ${seen.size} distinct`,
-    );
     const stats = getPoolStats();
     assert.strictEqual(stats.total, 50);
   });

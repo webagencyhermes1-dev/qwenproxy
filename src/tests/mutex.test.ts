@@ -83,6 +83,28 @@ test("Mutex: stale lock is force-released on the next acquire", async () => {
   assert.strictEqual(m.isIdle(), true);
 });
 
+test("Mutex: stale release while the new owner holds the lock is a no-op (ABA)", async () => {
+  const m = new Mutex("t-aba");
+  const staleOwner = await m.acquire(1000, "stale-owner");
+  assert.strictEqual(m.state().locked, true);
+
+  // Wait past MUTEX_MAX_HOLD_MS (60ms in this suite) without releasing.
+  await tick(80);
+
+  // A new owner takes over the stale lock via force-release.
+  const newOwner = await m.acquire(500, "new-owner");
+  assert.strictEqual(m.state().heldBy, "new-owner");
+
+  // The stale owner's late release must NOT disturb the new owner's lock.
+  staleOwner();
+  assert.strictEqual(m.state().locked, true);
+  assert.strictEqual(m.state().heldBy, "new-owner");
+
+  // The new owner can still release normally.
+  newOwner();
+  assert.strictEqual(m.isIdle(), true);
+});
+
 test("Mutex: state reports holder and queue length", async () => {
   const m = new Mutex("t-state");
   const r1 = await m.acquire(1000, "a");

@@ -10,6 +10,7 @@ import { sendOpenAIError } from "../api/error-helpers.js";
 import { buildQwenRequestHeaders } from "../services/qwen-headers.ts";
 import { qwenUrl } from "../services/qwen-url.ts";
 import { config } from "../core/config.ts";
+import { fetchUserMedia } from "../utils/egress.ts";
 
 // Cache the heavy ali-oss module so we import it once, not on every upload.
 let cachedOSSModule: any = null;
@@ -288,7 +289,9 @@ async function downloadRemoteMedia(url: string): Promise<{
   filename: string;
   mime: string;
 }> {
-  const response = await fetch(url, {
+  const response = await fetchUserMedia(url, {
+    // Largest per-type cap (video 100MB); per-type checks below stay as defense in depth.
+    maxBytes: 100 * 1024 * 1024,
     headers: {
       "User-Agent": config.auth.userAgent,
       Accept: "image/*,*/*;q=0.8",

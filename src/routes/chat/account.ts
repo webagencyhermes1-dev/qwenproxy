@@ -1,12 +1,13 @@
 import { v4 as uuidv4 } from "uuid";
 import {
-	getAccountCooldownInfo,
-	getNextHotAccount,
-	isAccountHeadersReady,
-	markAccountRateLimited,
-	noteRequestPathNotHotExecution,
-	syncCooldownsFromDb,
-} from "../../core/account-manager.ts";
+ 	getAccountCooldownInfo,
+ 	getNextHotAccount,
+ 	isAccountHeadersReady,
+ 	markAccountRateLimited,
+ 	noteRequestPathNotHotExecution,
+ 	pickNextHotCandidate,
+ 	syncCooldownsFromDb,
+ } from "../../core/account-manager.ts";
 import { markAccountSuccessful, markAccountFailed, getAccountsByPriority } from "../../core/account-priority.ts";
 import { recordWafHardBlock, noteWafRecovery } from "../../core/waf-isolation.ts";
 import {
@@ -62,6 +63,7 @@ export function healthKindForFailure(
 }
 import { loadAccounts, type QwenAccount } from "../../core/accounts.ts";
 import { config, type ChatMode } from "../../core/config.ts";
+import { metrics } from "../../core/metrics.ts";
 import { ClientAbortedError, UpstreamRateLimit, ValidationError } from "../../core/errors.ts";
 import {
   assertPromptWithinLimits,
@@ -83,6 +85,7 @@ import {
 	isAccountTemporarilyBusy,
 	markAccountTemporarilyBusy,
 	markLeaseCompletion,
+	trackExternalLease,
 	tryAcquireAccountLease,
 	type AccountLease,
 } from "../../core/account-concurrency.ts";
@@ -95,14 +98,13 @@ import {
 import { computeInputContextBudget, CONTEXT_TOKEN_SAFETY_MARGIN } from "../../utils/context-budget.ts";
 import {
   getModelContextWindow,
-  getModelCapabilities,
   getModelMaxInput,
   getModelMaxInputThinking,
   getModelMaxCot,
 } from "../../core/model-registry.ts";
 import { getRollingSummary } from "../../services/context/summary.ts";
 import { getVectorStore } from "../../services/context/vectorStore.ts";
-import { isPlaywrightInitialized, refreshHeaders } from "../../services/playwright.ts";
+import { refreshHeaders } from "../../services/playwright.ts";
 import {
 	clearAllSessionsForAccount,
 	createQwenStream,
@@ -136,19 +138,10 @@ import {
  	isTerminalLocalError,
  	shouldRetryInvalidInputOnSameAccount,
  } from "./retry-policy.ts";
-import {
-	getAccountOwnership,
-	isLeaseAuthorityEnabled,
-	toLegacyAccountLease,
-} from "../../runtime/account/instance.ts";
+import { getAccountOwnership, toLegacyAccountLease } from "../../runtime/account/instance.ts";
 import { acquireGenerationAccount } from "../../runtime/gateway.ts";
-import {
-	prepareContext,
-	type ModelCapabilitySource,
-} from "../../runtime/context/context-service.ts";
 import { TypedRuntimeError } from "../../domain/errors.ts";
 import type { AccountLease as DomainAccountLease } from "../../domain/types.ts";
-import type { Message as DomainMessage } from "../../domain/session.ts";
 
 /** How many alternate accounts a single request may try after a WAF challenge.
  * Scales with pool size (capped by maxAccountSwitches) so large pools can
@@ -524,8 +517,10 @@ function createNoHotAccountCapacityError(): Error & {
 	retryAfterMs: number;
 	code: string;
 } {
-	void import("../../core/readiness-guard.ts")
-		.then((m) => m.triggerReadinessCheck("no-hot-account"))
+	// Wake the readiness controller out-of-band: the next reconcile tick is
+	// up to 30s away, but the client was just told to retry in 3s.
+	void import("../../runtime/construct.ts")
+		.then((m) => m.requestReadinessTick("no-hot-account"))
 		.catch(() => {});
 	const err = new Error(
 		`No warmed accounts are available right now. The pool controller is preparing accounts in the background; retry in about ${Math.ceil(NO_HOT_ACCOUNT_RETRY_AFTER_MS / 1000)}s.`,
@@ -603,7 +598,7 @@ function getNextFreeAccountForParallel(
 	// within executable accounts (the tryAcquireAccountLease fail-fast will
 	// report account_busy and the loop gives up rather than blocking on a busy
 	// pool). Never degrade to a WARM/COLD account.
-	return getNextHotAccount(triedAccountIds);
+	return pickNextHotCandidate(triedAccountIds);
 }
 
 
@@ -700,108 +695,12 @@ export function buildCompressedFailoverPrompt(args: {
 	);
 	return prompt;
 }
-
 /**
- * Model limits for the bounded compaction pipeline, resolved from the model
- * registry (upstream-synced, with a conservative default for unknown models).
- */
-function registryCapabilitySource(): ModelCapabilitySource {
-	return {
-		getContextWindowTokens(modelId: string): number {
-			return getModelContextWindow(modelId);
-		},
-		getMaxOutputTokens(modelId: string): number {
-			return getModelCapabilities(modelId).maxOutputTokens;
-		},
-		getMaxInputTokens(modelId: string): number {
-			return getModelMaxInput(modelId);
-		},
-	};
-}
-
-/** Map the request-layer message history onto the domain message shape. */
-function toDomainFailoverMessages(
-	messages: readonly Message[],
-): readonly DomainMessage[] {
-	return messages.map((message, index) => {
-		const role: DomainMessage["role"] =
-			message.role === "system" ||
-			message.role === "user" ||
-			message.role === "assistant" ||
-			message.role === "tool"
-				? message.role
-				: "user";
-		return {
-			messageId: `failover_msg_${index}`,
-			sessionId: "failover",
-			role,
-			content: message.content ?? "",
-			sequenceNumber: index,
-			parentMessageId: index > 0 ? `failover_msg_${index - 1}` : null,
-			branchId: "failover",
-			createdAt: 0,
-			toolCalls: message.tool_calls?.map((call) => ({
-				callId: call.id,
-				name: call.function.name,
-				arguments: call.function.arguments,
-				status: "completed",
-			})),
-			toolCallId: message.tool_call_id,
-		};
-	});
-}
-
-/**
- * THE bounded failover prompt under the lease authority: the monotonic,
- * group-atomic ContextService pipeline replaces the char-tiered assembler
- * whose budget loop could recompute the same candidate forever. A budget
- * failure fails CLOSED with a typed context code instead of looping or
- * sending the oversized original — the known non-convergence bug.
- */
-export function prepareCompressedFailoverPrompt(args: {
-	messages?: Message[];
-	systemPrompt?: string;
-	toolInstructions?: string;
-	tools?: FunctionToolDefinition[];
-	fallbackQuery?: string;
-	stickyKey?: string | null;
-	contextModelId?: string;
-	capabilities?: ModelCapabilitySource;
-}): string {
-	const source =
-		args.messages && args.messages.length > 0
-			? args.messages
-			: [{ role: "user", content: args.fallbackQuery ?? "" } as Message];
-	const systemPrompt = [args.systemPrompt ?? "", args.toolInstructions ?? ""]
-		.filter(Boolean)
-		.join("\n\n");
-
-	const result = prepareContext({
-		messages: toDomainFailoverMessages(source),
-		systemPrompt,
-		toolDefinitions: (args.tools ?? []).map((tool) => ({
-			name: tool.function.name,
-			description: tool.function.description,
-			parameters: tool.function.parameters ?? { type: "object" },
-			strict: tool.function.strict,
-		})),
-		modelId: args.contextModelId ?? "default",
-		capabilities: args.capabilities ?? registryCapabilitySource(),
-		legacyCharBudget: TIERED_DEFAULT_BUDGET,
-		rollingSummary: getRollingSummary().get(args.stickyKey ?? ""),
-	});
-
-	if (!result.ok) {
-		throw TypedRuntimeError.fromCode(result.errorCode, result.reason, {
-			compactionPasses: result.attempts.length,
-		});
-	}
-	return result.prepared.renderedPrompt;
-}
-
-/**
- * Failover prompt for the active authority: bounded monotonic compaction when
- * the lease authority is enabled, the legacy tiered assembler otherwise.
+ * Single failover compressor (DO NOT REINTRODUCE A SECOND ONE): the tiered assembler (T1 recent-verbatim + T2
+ * BM25 retrieval + T3 rolling summary, model-aware budget, fail-closed with a
+ * typed ContextLengthExceededError). Personalization-aware (system and tools
+ * ride the personalization channel instead of the prompt when set) and
+ * covered by the context-budget hotfix suite.
  */
 function failoverPromptForAuthority(args: {
 	systemPrompt?: string;
@@ -814,26 +713,15 @@ function failoverPromptForAuthority(args: {
 	reason: string;
 	contextModelId?: string;
 }): string {
-	if (!isLeaseAuthorityEnabled()) {
-		return buildCompressedFailoverPrompt({
-			systemPrompt: args.systemPrompt,
-			toolInstructions: args.toolInstructions,
-			tools: args.tools,
-			messages: args.messages,
-			fallbackQuery: args.fallbackQuery,
-			stickyKey: args.stickyKey,
-			usePersonalization: args.usePersonalization,
-			reason: args.reason,
-		});
-	}
-	return prepareCompressedFailoverPrompt({
-		messages: args.messages,
+	return buildCompressedFailoverPrompt({
 		systemPrompt: args.systemPrompt,
 		toolInstructions: args.toolInstructions,
 		tools: args.tools,
+		messages: args.messages,
 		fallbackQuery: args.fallbackQuery,
 		stickyKey: args.stickyKey,
-		contextModelId: args.contextModelId,
+		usePersonalization: args.usePersonalization,
+		reason: args.reason,
 	});
 }
 
@@ -904,10 +792,12 @@ export async function acquireUpstreamStream(
 		excludeSet.add(stickyThreadAccountId);
 	}
 
-	// QWEN_RUNTIME_LEASE_AUTHORITY: the ownership authority performs the atomic
-	// select+claim for the initial account (runtime/gateway.ts). Legacy path
-	// keeps resolveInitialAccount; behavior is unchanged while the flag is off.
-	const useGateway = isLeaseAuthorityEnabled() && !isAuthMockEnabled();
+	// The lease authority (Gateway / AccountResourceManager) is the SOLE author
+	// of account selection. The legacy round-robin selector
+	// (resolveInitialAccount) must never run, so non-HOT accounts can never be
+	// selected or queued. The auth-mock bypass is preserved so hermetic tests
+	// keep exercising the legacy selector without a bound ownership manager.
+	const useGateway = !isAuthMockEnabled();
 	let configuredAccounts: SelectedAccount[];
 	let account: SelectedAccount | null;
 	let ownershipLease: DomainAccountLease | null = null;
@@ -1009,7 +899,7 @@ export async function acquireUpstreamStream(
 		const accountEmail = maskEmail(account.email);
 
 		if (triedAccountIds.has(accountId)) {
-			account = getNextHotAccount(triedAccountIds);
+			account = pickNextHotCandidate(triedAccountIds);
 			continue;
 		}
 		triedAccountIds.add(accountId);
@@ -1030,7 +920,7 @@ export async function acquireUpstreamStream(
 			console.log(
 				`⏭️  [Chat] Skipping account ${accountEmail} (${accountId}) temporarily busy (chat in progress)`,
 			);
-			const nextCandidate = getNextHotAccount(triedAccountIds);
+			const nextCandidate = pickNextHotCandidate(triedAccountIds);
 			if (nextCandidate && !getAccountCooldownInfo(nextCandidate.id)) {
 				account = nextCandidate;
 				continue;
@@ -1052,7 +942,7 @@ export async function acquireUpstreamStream(
 			console.log(
 				`⏭️  [Chat] Skipping account ${accountEmail} (${accountId}) busy; rotating to a free account`,
 			);
-			const nextCandidate = getNextHotAccount(triedAccountIds);
+			const nextCandidate = pickNextHotCandidate(triedAccountIds);
 			if (nextCandidate && !getAccountCooldownInfo(nextCandidate.id)) {
 				account = nextCandidate;
 				continue;
@@ -1071,7 +961,7 @@ export async function acquireUpstreamStream(
 					`⚠️  [Chat] Sticky account is on cooldown; recreating upstream chat on another account with compressed context.`,
 				);
 			}
-			account = getNextHotAccount(triedAccountIds);
+			account = pickNextHotCandidate(triedAccountIds);
 			continue;
 		}
 
@@ -1212,6 +1102,11 @@ export async function acquireUpstreamStream(
 					uiSessionId: result.uiSessionId,
 					targetResponseId: "",
 					headers: result.headers,
+				});
+				metrics.increment("chat.completions.total", 1, {
+					account: result.accountId,
+					model: params.model,
+					outcome: "success",
 				});
 
 				if (triedAccountIds.size > 1 || antiBotRotations > 0) {
@@ -1361,7 +1256,7 @@ export async function acquireUpstreamStream(
 				break;
 			}
 
-			const nextAfterChallenge = getNextHotAccount(triedAccountIds);
+			const nextAfterChallenge = pickNextHotCandidate(triedAccountIds);
 			if (!nextAfterChallenge || triedAccountIds.has(nextAfterChallenge.id)) {
 				console.warn(
 					`[Retry Failed] | reason=anti_bot | account=${accountEmail} | no other account available`,
@@ -1399,11 +1294,16 @@ export async function acquireUpstreamStream(
 			});
 		}
 
-		account = getNextHotAccount(triedAccountIds);
+		account = pickNextHotCandidate(triedAccountIds);
 	}
 
 	// All accounts exhausted.
 	removeStream(completionId);
+	metrics.increment("chat.completions.total", 1, {
+		account: "none",
+		model: params.model,
+		outcome: "error",
+	});
 
 	if (!lastError && configuredAccounts.length > 0) {
 		const cooldownInfos = configuredAccounts
@@ -1756,8 +1656,19 @@ async function tryCreateStreamWithRetry(
 
 			if (params.ownershipLease) {
 				// The ownership authority already claimed this account
-				// atomically; reuse that lease instead of claiming a slot.
-				accountLease = toLegacyAccountLease(params.ownershipLease);
+				// atomically. Track it in the concurrency registry (session
+				// label + abort controller) so latest-wins supersede,
+				// snapshots and the stale sweep observe it exactly like a
+				// slot lease; release still goes through the fenced manager.
+				accountLease = trackExternalLease(
+					currentAccountId,
+					params.ownershipLease,
+					{
+						label: sessionLabel,
+						leaseAbortController: leaseAbort,
+						parallelEscape: params.parallelEscape,
+					},
+				);
 			} else if (params.parallelEscape) {
 				// Parallel request racing an unemitted stream: do NOT queue on this
 				// account's slot (the main may hold it for minutes while thinking).
@@ -2120,10 +2031,7 @@ async function tryCreateStreamWithRetry(
 		} catch {
 			// Health bookkeeping is best-effort; the stream already succeeded.
 		}
-		void import("../../core/readiness-guard.ts")
-			.then((m) => m.triggerReadinessCheck("request-success"))
-			.catch(() => {});
-			if (accountLease) {
+		if (accountLease) {
 				markLeaseCompletion(
 					currentAccountId,
 					accountLease.leaseId,
@@ -2502,7 +2410,7 @@ async function tryCreateStreamWithRetry(
 		) {
 			const nextAccount = params.parallelEscape
 				? getNextFreeAccountForParallel(accounts, triedAccounts, currentAccountId)
-				: getNextHotAccount(triedAccounts);
+				: pickNextHotCandidate(triedAccounts);
 		if (nextAccount && nextAccount.id !== currentAccountId) {
 			console.warn(
 				`🔄 [Chat] Switching account after ${policy.reason} | ${currentAccountEmail} -> ${maskEmail(nextAccount.email)}`,

@@ -23,6 +23,8 @@ export interface ReadinessOptions {
 export interface ReadinessDeps {
   warmWarmup: (accountId: string) => Promise<WarmupOutcome>;
   terminateWarmup?: (accountId: string) => Promise<void> | void;
+  /** Observability sink for settled warmups (metrics, audit). Never throws into the controller. */
+  onOutcome?: (accountId: string, outcome: WarmupOutcome, timedOut: boolean) => void;
   jitter?: () => number;
   now?: () => number;
 }
@@ -118,6 +120,8 @@ export class ReadinessController {
   }
 
   private runPass(): TickReport {
+    // Heal lapsed cooldowns first so requeued accounts are candidates below.
+    this.ownership.reapExpiredCooldowns();
     const snapshot = this.ownership.getPoolSnapshot();
     const target = this.targetReady ?? snapshot.target ?? 0;
     const ready: number = snapshot.ready ?? 0;
@@ -132,8 +136,13 @@ export class ReadinessController {
     );
     if (slots > 0) {
       const now = this.now();
-      const candidates: readonly string[] =
-        this.ownership.listAccountsByStatus("STANDBY") ?? [];
+      // STANDBY (never warmed / requeued) plus RECOVERING (context death,
+      // fenced stale owners) — both are warmable, unless cooling down.
+      // Exhaustion/backoff below still gates each account individually.
+      const candidates: readonly string[] = [
+        ...(this.ownership.listAccountsByStatus("STANDBY") ?? []),
+        ...(this.ownership.listAccountsByStatus("RECOVERING") ?? []),
+      ].filter((id) => !this.ownership.isCoolingDown(id));
       for (const accountId of candidates) {
         if (launched.length >= slots) break;
         if (this.inFlight.has(accountId)) {
@@ -190,6 +199,11 @@ export class ReadinessController {
     record.settled = true;
     if (record.timer) clearTimeout(record.timer);
     this.inFlight.delete(accountId);
+    try {
+      this.deps.onOutcome?.(accountId, success ? "ready" : "failed", timedOut);
+    } catch {
+      // Observability must never break the warmup state machine.
+    }
     if (timedOut && this.deps.terminateWarmup) {
       void Promise.resolve(this.deps.terminateWarmup(accountId)).catch(
         () => {},

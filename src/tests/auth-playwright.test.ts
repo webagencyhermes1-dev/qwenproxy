@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { getDatabase } from "../core/database.ts";
 import { invalidateAccountsCache } from "../core/accounts.ts";
+import { clearAllHeadersReadyAccounts } from "../core/account-manager.ts";
 
 const originalMockAuth = process.env.TEST_MOCK_QWEN_AUTH;
 const originalQwenAccounts = process.env.QWEN_ACCOUNTS;
@@ -589,6 +590,7 @@ test("playwright header capture marks the account headers-ready for the rotation
 });
 
 test("auth-playwright: falls back to first configured account when no account id is provided", async () => {
+  clearAllHeadersReadyAccounts();
   const existing = snapshotAccounts();
   delete process.env.TEST_MOCK_QWEN_AUTH;
   delete process.env.QWEN_ACCOUNTS;

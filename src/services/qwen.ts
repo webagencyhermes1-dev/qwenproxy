@@ -15,6 +15,7 @@ import { buildQwenRequestHeaders } from "./qwen-headers.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { config, type ChatMode } from "../core/config.ts";
 import { logger } from "../core/logger.ts";
+import { metrics } from "../core/metrics.ts";
 import { estimateTokenCount } from "../utils/context-truncation.ts";
 import type {
   PersonalizationEstimationInfo,
@@ -319,7 +320,13 @@ function addIdleTimeoutToStream(
       onTimeout?.();
       // Best-effort cleanup of the upstream source.
       try {
-        void stream.cancel(message).catch(() => {});
+        void stream.cancel(message).catch((error: unknown) => {
+          logger.warn("[Qwen] stream cancel suppressed", {
+            label,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          metrics.increment("stream.cancel.errors");
+        });
       } catch {}
       // Error the WRAPPED stream so the bridge's pending read() rejects
       // immediately. Without this, a page/fetch that ignores abort keeps the
@@ -331,7 +338,13 @@ function addIdleTimeoutToStream(
       } catch {}
       // Belt-and-braces: settle a pending read on the wrapper's own reader.
       try {
-        void reader?.cancel(message).catch(() => {});
+        void reader?.cancel(message).catch((error: unknown) => {
+          logger.warn("[Qwen] reader cancel suppressed", {
+            label,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          metrics.increment("stream.cancel.errors");
+        });
       } catch {}
     }, timeoutMs);
   };
@@ -1539,7 +1552,12 @@ async function createQwenBrowserResponse(
     });
   } catch (error) {
     captchaWatcher?.stop();
-    await cancel().catch(() => {});
+    await cancel().catch((cancelError: unknown) => {
+      logger.warn("[Qwen] stream cancel suppressed", {
+        error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+      });
+      metrics.increment("stream.cancel.errors");
+    });
     throw error;
   } finally {
     captchaWatcher?.stop();
@@ -2465,7 +2483,14 @@ async function readResponsePreview(
       bytesRead += chunk.byteLength;
     }
   } finally {
-    await reader.cancel().catch(() => undefined);
+    await reader.cancel().catch((cancelError: unknown) => {
+      logger.warn("[Qwen] reader cancel suppressed", {
+        error:
+          cancelError instanceof Error ? cancelError.message : String(cancelError),
+      });
+      metrics.increment("stream.cancel.errors");
+      return undefined;
+    });
   }
 
   return Buffer.concat(chunks).toString("utf8");

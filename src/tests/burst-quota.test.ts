@@ -6,7 +6,7 @@ process.env.TEST_MOCK_QWEN_AUTH = "true";
 import { StickyMap, STICKY_TTL_MS } from "../services/session/stickyMap.ts";
 import { generateStickyKey } from "../services/session/key.ts";
 import { HealthTracker } from "../services/account/health.ts";
-import { selectAccountForNewSession } from "../services/account/selection.ts";
+import { suggestAccountForNewSession } from "../services/account/advisory.ts";
 import {
   markAccountHeadersReady,
   unmarkAccountHeadersReady,
@@ -45,7 +45,7 @@ test("burst 429 does not rebind; quota 429 does", () => {
     for (let i = 0; i < 5; i++) health.record429("acc-a", "quota", 3600_000);
     const h2 = health.getHealth("acc-a");
     assert.ok(h2.lastQuotaExhaustedAt !== null);
-    const next = selectAccountForNewSession({
+    const next = suggestAccountForNewSession({
       stickyMap: sticky,
       healthTracker: health,
       availableAccounts: ["acc-a", "acc-b"],
@@ -59,3 +59,4 @@ test("burst 429 does not rebind; quota 429 does", () => {
     sticky.clearForTests();
   }
 });
+

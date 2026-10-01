@@ -43,6 +43,15 @@ jobs:
           CI: true
           TEST_MOCK_QWEN_AUTH: true
 
+      # Test-count contract: fails on any failure AND on suite shrinkage
+      # (silently deleted tests). Runs once (node 22) to avoid tripling CI time.
+      - name: Test-count contract
+        if: matrix.node == 22
+        run: npm run test:contract
+        env:
+          CI: true
+          TEST_MOCK_QWEN_AUTH: true
+
   docker:
     name: Docker Build
     runs-on: ubuntu-latest

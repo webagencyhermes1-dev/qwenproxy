@@ -34,6 +34,22 @@ const DB_JSON_BAK_PATH = path.join(DB_DIR, "accounts.json.bak");
 
 let db: Database.Database | null = null;
 
+/**
+ * Phase-3.2 durability: strict synchronous mode is opt-in via env.
+ * Strict string compare — only the literal "true" enables FULL.
+ */
+export function isStrictDurabilityEnabled(): boolean {
+  return process.env.STRICT_DURABILITY === "true";
+}
+
+/**
+ * Synchronous mode selected at open time. FULL when strict durability is
+ * enabled, otherwise NORMAL (existing default, unchanged).
+ */
+export function getSynchronousMode(): "FULL" | "NORMAL" {
+  return isStrictDurabilityEnabled() ? "FULL" : "NORMAL";
+}
+
 export function getDatabase(): Database.Database {
   if (db) return db;
 
@@ -107,7 +123,11 @@ export function getDatabase(): Database.Database {
   // Enable WAL mode for better concurrent read performance (ideal for VPS)
   db.pragma("journal_mode = WAL");
   db.pragma("busy_timeout = 5000");
-  db.pragma("synchronous = NORMAL");
+  const synchronousMode = getSynchronousMode();
+  db.pragma(`synchronous = ${synchronousMode}`);
+  console.log(
+    `[Database] synchronous=${synchronousMode} (STRICT_DURABILITY=${isStrictDurabilityEnabled() ? "true" : "false"})`,
+  );
   db.pragma("cache_size = -64000"); // 64MB cache
   db.pragma("foreign_keys = ON");
 
@@ -303,4 +323,53 @@ export function closeDatabase(): void {
     db.close();
     db = null;
   }
+}
+
+/**
+ * Phase-3.2 durability: online backup of the open database to `destPath`.
+ *
+ * Prefers the better-sqlite3 `.backup()` API (available in better-sqlite3
+ * ^13.0.3 — see `backup(destinationFile)` in @types/better-sqlite3) which
+ * produces a consistent snapshot even under WAL. Falls back to a file copy
+ * (after a best-effort WAL checkpoint) when `.backup()` is unavailable.
+ *
+ * Uses the currently-open handle when present; otherwise copies the database
+ * file at DB_PATH. Never changes existing caller behavior.
+ */
+export async function backupDatabase(destPath: string): Promise<void> {
+  const target = path.resolve(destPath);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+
+  const active = db;
+  const withBackup = active as unknown as {
+    backup?: unknown;
+  } | null;
+  if (
+    active &&
+    withBackup &&
+    typeof withBackup.backup === "function"
+  ) {
+    await (
+      active as unknown as {
+        backup: (dest: string) => Promise<unknown>;
+      }
+    ).backup(target);
+    return;
+  }
+
+  // Fallback: checkpoint (best-effort) then file copy.
+  if (active) {
+    try {
+      active.pragma("wal_checkpoint(TRUNCATE)");
+    } catch {
+      /* best-effort */
+    }
+  }
+  if (fs.existsSync(DB_PATH)) {
+    fs.copyFileSync(DB_PATH, target);
+    return;
+  }
+  throw new Error(
+    `[Database] Cannot backup: no open handle and no database file at ${DB_PATH}`,
+  );
 }

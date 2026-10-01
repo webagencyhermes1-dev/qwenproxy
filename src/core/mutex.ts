@@ -14,12 +14,22 @@ export class Mutex {
   private locked = false;
   private lockedAt = 0;
   private lockedByKey = "";
+  /** Monotonic generation: every acquire bumps it so a stale owner's
+   * late release() is a no-op (classic ABA / stale-release fix). */
+  private generation = 0;
+  private currentToken: string | null = null;
 
   constructor(
     public readonly name: string = "unnamed",
     private readonly maxHoldMs: number = MAX_HOLD_MS,
   ) {}
 
+  /**
+   * Acquire the mutex. Resolves with a release handle whose `release` function
+   * is a no-op if the lock has already changed hands (fenced via a generation
+   * token). This prevents the ABA bug where a stale owner's late `release()`
+   * corrupts a new owner's lock.
+   */
   async acquire(
     timeoutMs = 300_000,
     key = "",
@@ -36,6 +46,10 @@ export class Mutex {
       logger.warn(
         `[Mutex:${this.name}] Force-releasing stale lock | heldBy=${this.lockedByKey} | heldFor=${heldFor}ms | limit=${holdLimitMs}ms`,
       );
+      // Bump the generation so the old token becomes invalid — a stale
+      // owner's later release() cannot touch the new owner's lock.
+      this.generation++;
+      this.currentToken = null;
       this.locked = false;
       this.lockedAt = 0;
       this.lockedByKey = "";
@@ -45,7 +59,10 @@ export class Mutex {
       this.locked = true;
       this.lockedAt = Date.now();
       this.lockedByKey = key;
-      return this.createRelease();
+      this.generation++;
+      this.currentToken = `${this.generation}`;
+      const token = this.currentToken;
+      return this.createRelease(token);
     }
 
     const enqueuedAt = Date.now();
@@ -59,7 +76,10 @@ export class Mutex {
         clearTimeout(timer);
         this.lockedByKey = logKey;
         this.lockedAt = Date.now();
-        resolve(this.createRelease());
+        this.generation++;
+        this.currentToken = `${this.generation}`;
+        const expectedToken = this.currentToken;
+        resolve(this.createRelease(expectedToken));
       };
       const timer = setTimeout(() => {
         const index = this.queue.findIndex((e) => e.waiter === waiter);
@@ -88,16 +108,25 @@ export class Mutex {
     }
   }
 
-  private createRelease(): () => void {
+  private createRelease(expectedToken: string): () => void {
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      this.release();
+      this.release(expectedToken);
     };
   }
 
-  private release(): void {
+  private release(expectedToken: string): void {
+    // ABA guard: a stale owner (whose token no longer matches because the
+    // lock changed hands — including via a force-release that bumped the
+    // generation) must NOT mutate the current owner's lock.
+    if (this.currentToken !== expectedToken) {
+      logger.debug(
+        `[Mutex:${this.name}] stale release ignored | currentGen=${this.generation} expectedToken=${expectedToken}`,
+      );
+      return;
+    }
     const next = this.queue.shift();
     if (next) {
       const waitTime = Date.now() - next.enqueuedAt;
@@ -111,6 +140,7 @@ export class Mutex {
     this.locked = false;
     this.lockedAt = 0;
     this.lockedByKey = "";
+    this.currentToken = null;
   }
 
   /** Returns true if the mutex is not locked and has no waiting queue. */
@@ -119,12 +149,13 @@ export class Mutex {
   }
 
   /** Returns diagnostic info about the current lock state. */
-  state(): { locked: boolean; heldBy: string; heldForMs: number; queueLength: number } {
+  state(): { locked: boolean; heldBy: string; heldForMs: number; queueLength: number; generation: number } {
     return {
       locked: this.locked,
       heldBy: this.lockedByKey,
       heldForMs: this.locked ? Date.now() - this.lockedAt : 0,
       queueLength: this.queue.length,
+      generation: this.generation,
     };
   }
 }

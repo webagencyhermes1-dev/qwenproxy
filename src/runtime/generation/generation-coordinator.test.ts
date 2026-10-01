@@ -174,6 +174,14 @@ class FakeOwnership implements IAccountOwnership {
 
   setDraining(_accountId: string, _draining: boolean): void {}
 
+  setCooldownUntil(): void {}
+  isCoolingDown(): boolean {
+    return false;
+  }
+  reapExpiredCooldowns(): number {
+    return 0;
+  }
+
   async recoverAccount(_accountId: string, _reason: string): Promise<void> {}
 }
 

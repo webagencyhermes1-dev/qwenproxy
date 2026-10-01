@@ -77,10 +77,8 @@ export function recordWafHardBlock(accountId: string): WafBlockResult {
   const cooldownMs = Math.min(cap, base * Math.pow(ESCALATION_FACTOR, exponent));
 
   if (cooldownMs > 0) {
+    // markAccountRateLimited requests a controller tick itself.
     markAccountRateLimited(accountId, cooldownMs, "WafChallenge");
-    void import("./readiness-guard.ts")
-      .then((m) => m.triggerReadinessCheck("waf-quarantine"))
-      .catch(() => {});
   }
   try {
     recordAccountFailure(accountId, "waf");

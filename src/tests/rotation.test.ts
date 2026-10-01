@@ -3,12 +3,14 @@ import assert from "node:assert";
 import { getDatabase } from "../core/database.ts";
 import { invalidateAccountsCache } from "../core/accounts.ts";
 import {
-  getNextAccount,
-  getNextAvailableAccount,
+  clearAccountCooldown,
+  markAccountHeadersReady,
   markAccountRateLimited,
+  pickNextHotCandidate,
+  unmarkAccountHeadersReady,
 } from "../core/account-manager.ts";
 
-test("Account Rotation: Round-Robin rotation cycle", async () => {
+test("Account Rotation: HOT-only rotation cycle", async () => {
   const originalEnv = process.env.QWEN_ACCOUNTS;
   delete process.env.QWEN_ACCOUNTS;
 
@@ -25,21 +27,21 @@ test("Account Rotation: Round-Robin rotation cycle", async () => {
     insert.run("acc2", "account2@test.com", "password2");
     insert.run("acc3", "account3@test.com", "password3");
     invalidateAccountsCache();
+    markAccountHeadersReady("acc1");
+    markAccountHeadersReady("acc2");
+    markAccountHeadersReady("acc3");
 
-    const first = getNextAccount();
-    const second = getNextAccount();
-    const third = getNextAccount();
-    const fourth = getNextAccount();
+    const seen = new Set<string>();
+    for (let i = 0; i < 6; i++) {
+      const next = pickNextHotCandidate();
+      assert.ok(next, "a HOT pool must always yield a candidate");
+      seen.add(next!.id);
+    }
+    assert.strictEqual(seen.size, 3, "rotation must cycle through all HOT accounts");
 
-    assert.ok(first);
-    assert.ok(second);
-    assert.ok(third);
-    assert.ok(fourth);
-
-    assert.strictEqual(first!.email, "account1@test.com");
-    assert.strictEqual(second!.email, "account2@test.com");
-    assert.strictEqual(third!.email, "account3@test.com");
-    assert.strictEqual(fourth!.email, "account1@test.com");
+    unmarkAccountHeadersReady("acc1");
+    unmarkAccountHeadersReady("acc2");
+    unmarkAccountHeadersReady("acc3");
   } finally {
     db.prepare("DELETE FROM accounts").run();
     const insert = db.prepare(
@@ -55,7 +57,7 @@ test("Account Rotation: Round-Robin rotation cycle", async () => {
   }
 });
 
-test("Account Rotation: returns account with shortest cooldown when all accounts are on cooldown", async () => {
+test("Account Rotation: all-on-cooldown yields null (caller maps to 429+retryAfter)", async () => {
   const originalEnv = process.env.QWEN_ACCOUNTS;
   delete process.env.QWEN_ACCOUNTS;
 
@@ -72,23 +74,25 @@ test("Account Rotation: returns account with shortest cooldown when all accounts
     insert.run("cool-acc-2", "cool2@test.com", "password2");
     invalidateAccountsCache();
 
+    markAccountHeadersReady("cool-acc-1");
+    markAccountHeadersReady("cool-acc-2");
     markAccountRateLimited("cool-acc-1", 60_000, "RateLimited");
     markAccountRateLimited("cool-acc-2", 30_000, "RateLimited");
 
-    // When all accounts are on cooldown, returns the one with the shortest remaining cooldown.
-    const next = getNextAccount();
-    assert.ok(
-      next !== null,
-      "should return an account even when all are on cooldown",
-    );
-    assert.strictEqual(next!.id, "cool-acc-2"); // 30s cooldown is shorter
+    // No HOT account is usable: the picker returns null and the request layer
+    // maps the exhausted pool to 429 + retryAfter (no cold execution).
+    assert.strictEqual(pickNextHotCandidate(), null);
+    assert.strictEqual(pickNextHotCandidate(new Set(["cool-acc-1"])), null);
 
-    const nextAvail = getNextAvailableAccount("cool-acc-1");
-    assert.ok(
-      nextAvail !== null,
-      "should return an account even when remaining are on cooldown",
-    );
-    assert.strictEqual(nextAvail!.id, "cool-acc-2");
+    // Once a cooldown clears, the account is selectable again.
+    clearAccountCooldown("cool-acc-2");
+    const next = pickNextHotCandidate(new Set(["cool-acc-1"]));
+    assert.ok(next);
+    assert.strictEqual(next!.id, "cool-acc-2");
+
+    clearAccountCooldown("cool-acc-1");
+    unmarkAccountHeadersReady("cool-acc-1");
+    unmarkAccountHeadersReady("cool-acc-2");
   } finally {
     db.prepare("DELETE FROM accounts").run();
     const insert = db.prepare(

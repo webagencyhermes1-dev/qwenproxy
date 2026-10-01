@@ -142,4 +142,14 @@ export interface IAccountOwnership {
   recoverAccount(accountId: string, reason: string): Promise<void>;
   registerAccount(accountId: string, persisted: PersistedAccountState): void;
   setDraining(accountId: string, draining: boolean): void;
+  /**
+   * Cooldown authority (single truth for quota/rate-limit windows).
+   * `setCooldownUntil` records the window and moves lease-free servable
+   * states to COOLDOWN; clearing (untilMs <= 0) returns COOLDOWN to STANDBY.
+   * `reapExpiredCooldowns` requeues lapsed COOLDOWN accounts so the pool
+   * heals without waiting for a request to trigger the lazy path.
+   */
+  setCooldownUntil(accountId: string, untilMs: number, reason: string | null): void;
+  isCoolingDown(accountId: string): boolean;
+  reapExpiredCooldowns(nowMs?: number): number;
 }

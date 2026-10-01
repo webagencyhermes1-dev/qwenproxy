@@ -6,6 +6,7 @@
 
 import { config } from "../core/config.ts";
 import { ServerProcess } from "./server-process.ts";
+import { tuiAuthHeaders } from "./proxy-client.ts";
 
 export type ServerLifecycleState = "offline" | "warming" | "online" | "error";
 
@@ -91,9 +92,55 @@ export class ServerManager {
     this.logBuffer = [];
   }
 
+  private isBannerOrBoxLine(line: string): boolean {
+    const trimmed = line.trim();
+    if (!trimmed) return true;
+    // Pure box borders: +---+ , |...|, ---+, ─│┌┐└┘═║ etc.
+    if (/^[+\-|─│┌┐└┘├┤┬┴┼═║\s]+$/.test(trimmed)) return true;
+    const lower = trimmed.toLowerCase();
+    const bannerKeywords = [
+      "qwenproxy",
+      "openai & anthropic",
+      "openai & anthropic compatible api",
+      "endpoint",
+      "http://127.0.0.1",
+      "http://localhost",
+      "/v1",
+      "accounts",
+      "warm",
+      "api key",
+      "not set",
+      "status",
+      "● online",
+      "○ offline",
+      "port",
+    ];
+    const looksLikeBox =
+      trimmed.startsWith("|") ||
+      trimmed.startsWith("+") ||
+      trimmed.startsWith("-") ||
+      trimmed.endsWith("|") ||
+      trimmed.endsWith("+");
+    if (looksLikeBox) {
+      if (bannerKeywords.some((k) => lower.includes(k))) return true;
+      // A box line with only pipes/dashes/spaces/●○ is not a real log.
+      if (/^[\s|+\-─│┌┐└┘═║●○()\/.:0-9a-z]*$/i.test(trimmed) && !lower.includes("[") && !lower.includes("req=") && !lower.includes("chat") && !lower.includes("server]")) {
+        // Be conservative: only drop if it has no log markers like [Chat], [Server], req=, etc.
+        // Banner detail rows like "|  Endpoint ..." have no brackets.
+        return true;
+      }
+    }
+    return false;
+  }
+
   private appendLog(level: "INFO" | "WARN" | "ERROR", text: string): void {
     if (!text) return;
-    const clean = text.trim();
+    // Split multi-line banner dumps and drop box/banner lines. If nothing
+    // real remains, skip the entry entirely.
+    const lines = String(text).split(/\r?\n/);
+    const realLines = lines.filter((l) => !this.isBannerOrBoxLine(l));
+    if (realLines.length === 0) return;
+    const clean = realLines.join("\n").trim();
     if (!clean || clean.length === 0) return;
 
     const last = this.logEntries[this.logEntries.length - 1];
@@ -137,6 +184,7 @@ export class ServerManager {
       const timeout = setTimeout(() => controller.abort(), 600);
       const resp = await fetch(`http://${cleanHost}:${port}/health`, {
         signal: controller.signal,
+        headers: tuiAuthHeaders(),
       });
       clearTimeout(timeout);
       if (resp.ok) {

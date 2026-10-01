@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { getRequestId } from "./request-context.ts";
 
 /**
  * Mask an email address for safe logging.
@@ -111,6 +112,18 @@ export interface LogEntry {
   data?: Record<string, unknown>;
 }
 
+export type LogFormat = "pretty" | "json";
+
+/**
+ * Log sink format. `pretty` (default) keeps the current colored console
+ * output; `json` emits one JSON object per line for log aggregation
+ * (stdout for debug/info, stderr for warn/error, same routing as pretty).
+ * Set via LOG_FORMAT=json. Redaction applies identically in both modes.
+ */
+export function resolveLogFormat(env = process.env.LOG_FORMAT): LogFormat {
+  return env === "json" ? "json" : "pretty";
+}
+
 export class Logger {
   private minLevel: LogLevel;
   private context?: string;
@@ -148,6 +161,17 @@ export class Logger {
     // cookies/JWTs) and the structured data.
     const safeMessage = redactLogMessage(entry.message);
     const safeData = entry.data ? redactLogValue(entry.data) : undefined;
+
+    if (resolveLogFormat() === "json") {
+      return JSON.stringify({
+        timestamp: entry.timestamp.toISOString(),
+        level: entry.level,
+        ...(entry.context ? { context: entry.context } : {}),
+        ...(getRequestId() ? { requestId: getRequestId() } : {}),
+        message: safeMessage,
+        ...(safeData !== undefined ? { data: safeData } : {}),
+      });
+    }
 
     let output = `${coloredLevel}${contextPart} ${safeMessage}`;
 

@@ -5,7 +5,7 @@ process.env.TEST_MOCK_QWEN_AUTH = "true";
 
 import { StickyMap } from "../services/session/stickyMap.ts";
 import { HealthTracker } from "../services/account/health.ts";
-import { selectAccountForNewSession } from "../services/account/selection.ts";
+import { suggestAccountForNewSession } from "../services/account/advisory.ts";
 import {
   markAccountHeadersReady,
   unmarkAccountHeadersReady,
@@ -30,7 +30,7 @@ test("selection: highest-scoring account selected", () => {
     // Degrade mid with burst 429s.
     health.record429("acc-mid", "burst", 5_000);
     health.record429("acc-mid", "burst", 5_000);
-    const picked = selectAccountForNewSession({
+    const picked = suggestAccountForNewSession({
       stickyMap: sticky,
       healthTracker: health,
       availableAccounts: ["acc-good", "acc-mid"],
@@ -52,7 +52,7 @@ test("selection: quota-exhausted accounts skipped", () => {
     for (let i = 0; i < 3; i++) health.recordSuccess("acc-a", 500);
     for (let i = 0; i < 3; i++) health.recordSuccess("acc-b", 500);
     for (let i = 0; i < 5; i++) health.record429("acc-a", "quota", 3600_000);
-    const picked = selectAccountForNewSession({
+    const picked = suggestAccountForNewSession({
       stickyMap: sticky,
       healthTracker: health,
       availableAccounts: ["acc-a", "acc-b"],
@@ -74,7 +74,7 @@ test("selection: exclusion list honored", () => {
       health.recordSuccess("acc-a", 500);
       health.recordSuccess("acc-b", 500);
     }
-    const picked = selectAccountForNewSession({
+    const picked = suggestAccountForNewSession({
       stickyMap: sticky,
       healthTracker: health,
       availableAccounts: ["acc-a", "acc-b"],
@@ -91,7 +91,7 @@ test("selection: exclusion list honored", () => {
 test("selection: empty pool returns null", () => {
   const { sticky, health } = setup();
   try {
-    const picked = selectAccountForNewSession({
+    const picked = suggestAccountForNewSession({
       stickyMap: sticky,
       healthTracker: health,
       availableAccounts: [],
@@ -108,7 +108,7 @@ test("selection: deterministic tiebreak (LRU then id)", () => {
     markAccountHeadersReady("acc-a");
     markAccountHeadersReady("acc-b");
     // No history: both score 1.0, lastUsed 0 -> lexicographic.
-    const picked = selectAccountForNewSession({
+    const picked = suggestAccountForNewSession({
       stickyMap: sticky,
       healthTracker: health,
       availableAccounts: ["acc-b", "acc-a"],
@@ -120,3 +120,4 @@ test("selection: deterministic tiebreak (LRU then id)", () => {
     sticky.clearForTests();
   }
 });
+

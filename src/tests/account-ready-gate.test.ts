@@ -3,15 +3,13 @@ import assert from "node:assert/strict";
 import { getDatabase } from "../core/database.ts";
 import { invalidateAccountsCache } from "../core/accounts.ts";
 import {
-  getNextAccount,
-  getNextAvailableAccount,
   isAccountHeadersReady,
   markAccountHeadersReady,
+  pickNextHotCandidate,
   unmarkAccountHeadersReady,
 } from "../core/account-manager.ts";
 import {
   clearTemporaryBusy,
-  markAccountTemporarilyBusy,
 } from "../core/account-concurrency.ts";
 
 const TEST_ACCOUNTS = ["ready-a", "ready-b", "ready-c"];
@@ -47,32 +45,28 @@ test.afterEach(() => {
   invalidateAccountsCache();
 });
 
-test("account-ready-gate: all accounts rotate while none has captured headers (cold startup)", () => {
+test("account-ready-gate: cold pool yields null (caller emits bounded capacity error)", () => {
   seedAccounts(TEST_ACCOUNTS);
   for (const id of TEST_ACCOUNTS) {
     assert.equal(isAccountHeadersReady(id), false);
   }
-  // No account ready → every account is a valid candidate (the gate must
-  // never deadlock a cold pool). Round-robin still cycles through them.
-  const picked = new Set<string>();
-  for (let i = 0; i < TEST_ACCOUNTS.length * 2; i++) {
-    const account = getNextAccount();
-    assert.ok(account && TEST_ACCOUNTS.includes(account.id));
-    picked.add(account.id);
-  }
-  assert.equal(picked.size, TEST_ACCOUNTS.length, "all accounts must rotate");
+  // No HOT account exists: the picker returns null instead of executing on a
+  // cold account. The request layer maps null to a single retryable capacity
+  // error; the readiness controller warms a replacement in the background.
+  assert.strictEqual(pickNextHotCandidate(), null);
+  assert.strictEqual(pickNextHotCandidate(new Set(["ready-a"])), null);
 });
 
 test("account-ready-gate: once one account is ready, rotation only picks it", () => {
   seedAccounts(TEST_ACCOUNTS);
   markAccountHeadersReady("ready-b");
 
-  const first = getNextAccount();
+  const first = pickNextHotCandidate();
   assert.equal(first?.id, "ready-b", "the only ready account must be picked");
 
   // Even when asked to avoid a specific not-ready account, the picker must
   // skip the OTHER not-ready accounts and land on the ready one.
-  const next = getNextAvailableAccount("ready-a");
+  const next = pickNextHotCandidate("ready-a");
   assert.equal(next?.id, "ready-b", "ready account must be preferred over cold ones");
 });
 
@@ -81,15 +75,14 @@ test("account-ready-gate: unmark removes the account from the rotation pool", ()
   markAccountHeadersReady("ready-b");
   unmarkAccountHeadersReady("ready-b");
 
-  // No ready account remains → cold-start degradation takes over again.
-  const first = getNextAccount();
-  assert.ok(first && TEST_ACCOUNTS.includes(first.id));
+  // No ready account remains: back to null (capacity error), never a cold pick.
+  assert.strictEqual(pickNextHotCandidate(), null);
 });
 
-test("account-ready-gate: single-account pools stay lossless even when headers are not captured yet", () => {
+test("account-ready-gate: single cold account yields null until warmed", () => {
   seedAccounts(["ready-solo"]);
-  const first = getNextAccount();
-  assert.equal(first?.id, "ready-solo");
-  const next = getNextAvailableAccount("some-other-id");
-  assert.equal(next?.id, "ready-solo");
+  assert.strictEqual(pickNextHotCandidate(), null);
+  assert.strictEqual(pickNextHotCandidate("some-other-id"), null);
+  markAccountHeadersReady("ready-solo");
+  assert.equal(pickNextHotCandidate()?.id, "ready-solo");
 });

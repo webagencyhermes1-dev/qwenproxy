@@ -38,6 +38,11 @@ export class Metrics extends EventEmitter {
       ["streams.active", "gauge", "Active SSE streams"],
       ["streams.errors", "counter", "Stream errors"],
 
+      // Suppressed-error visibility (Phase 2: previously silent catch{} paths)
+      ["browser.close.suppressed_errors", "counter", "Suppressed browser close/cleanup errors"],
+      ["sticky.persist.suppressed_errors", "counter", "Suppressed sticky persistence errors"],
+      ["stream.cancel.errors", "counter", "Stream cancel failures"],
+
       // CAPTCHA / anti-bot metrics
       ["captcha.challenges.detected", "counter", "Detected CAPTCHA challenges"],
       ["captcha.solves.succeeded", "counter", "Successful CAPTCHA solves"],
@@ -123,6 +128,26 @@ export class Metrics extends EventEmitter {
       ["watchdog.recovery.triggered", "counter", "Recovery attempts triggered"],
       ["watchdog.recovery.success", "counter", "Successful recoveries"],
       ["watchdog.recovery.failed", "counter", "Failed recoveries"],
+
+      // Phase 3.1 observability
+      [
+        "chat.completions.total",
+        "counter",
+        "Total chat completion requests by account, model and outcome",
+      ],
+      [
+        "warmup.failures",
+        "counter",
+        "Account warmup failures by account and reason",
+      ],
+      ["pool.ready", "gauge", "Number of READY accounts in the pool"],
+      ["pool.deficit", "gauge", "Pool READY deficit vs target (target - ready)"],
+      ["pool.warming", "gauge", "Number of WARMING accounts in the pool"],
+      [
+        "lease.churn",
+        "counter",
+        "Lease lifecycle events by account (acquired|released|swept)",
+      ],
     ];
 
     for (const [name, type, help] of defaults) {

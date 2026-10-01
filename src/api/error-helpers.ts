@@ -6,6 +6,7 @@ import {
   AuthError,
   ForbiddenError,
   NotFoundError,
+  PayloadTooLargeError,
   UpstreamRateLimit,
   UpstreamError,
   UpstreamTimeout,
@@ -16,7 +17,7 @@ import {
 import { classifyError } from "./error-classifier.js";
 
 const VALID_STATUSES: ReadonlySet<number> = new Set([
-  400, 401, 403, 404, 429, 499, 500, 502, 503, 504,
+  400, 401, 403, 404, 413, 429, 499, 500, 502, 503, 504,
 ]);
 
 function isValidStatus(code: number): code is QwenProxyStatusCode {
@@ -36,6 +37,8 @@ function errorForStatus(
       return new ForbiddenError(message);
     case 404:
       return new NotFoundError(message);
+    case 413:
+      return new PayloadTooLargeError(message);
     case 429:
       return new UpstreamRateLimit(message);
     case 499:

@@ -26,8 +26,7 @@ const {
   clearAccountCooldown,
   getAccountCooldownInfo,
   syncCooldownsFromDb,
-  getNextAccount,
-  getNextAvailableAccount,
+  pickNextHotCandidate,
   getCooldownStatus,
 } = await import("../core/account-manager.ts");
 const { formatCooldownUntil } = await import("../core/logger.ts");
@@ -49,10 +48,9 @@ test("account-manager: cooldown until uses BR format without ms", () => {
 
 test("account-manager: empty database yields no next account", () => {
   // Fresh data-test DB with no accounts rows.
-  assert.strictEqual(getNextAccount(), null);
-  assert.strictEqual(getNextAvailableAccount(), null);
-  assert.strictEqual(getNextAvailableAccount("some-tried-id"), null);
-  assert.strictEqual(getNextAvailableAccount(new Set(["a"])), null);
+  assert.strictEqual(pickNextHotCandidate(), null);
+  assert.strictEqual(pickNextHotCandidate("some-tried-id"), null);
+  assert.strictEqual(pickNextHotCandidate(new Set(["a"])), null);
 });
 
 test("account-manager: cooldown set/info/clear lifecycle", () => {
