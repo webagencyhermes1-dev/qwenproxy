@@ -51,6 +51,8 @@ export async function getBasicHeaders(accountId?: string): Promise<{
   secChUaMobile: string;
   secChUaPlatform: string;
   version: string;
+  /** Authorization: Bearer <jwt> the web client attaches to every API call. */
+  authorization: string;
 }> {
   if (isAuthMockEnabled()) {
     return {
@@ -63,6 +65,7 @@ export async function getBasicHeaders(accountId?: string): Promise<{
       secChUaMobile: "?0",
       secChUaPlatform: "",
       version: "0.2.89",
+      authorization: "",
     };
   }
 
@@ -119,6 +122,7 @@ export async function getQwenHeaders(
         "bx-ua": basic.bxUa,
         "bx-umidtoken": basic.bxUmidtoken,
         version: basic.version,
+        authorization: basic.authorization,
       },
       chatSessionId: "",
       parentMessageId: null,
@@ -151,6 +155,10 @@ export async function getQwenHeaders(
       "sec-ch-ua-mobile": basic.secChUaMobile,
       "sec-ch-ua-platform": basic.secChUaPlatform,
       version: basic.version,
+      // The bearer upstream authenticates on; buildCapturedQwenHeaders pairs it
+      // with `source: web` exactly like the real client. Empty when the account
+      // has no usable token (getBasicHeaders already forced a recapture).
+      authorization: basic.authorization || "",
     },
     chatSessionId: "",
     parentMessageId: null,

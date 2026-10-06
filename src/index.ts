@@ -13,6 +13,7 @@ if (fs.existsSync(envPath)) {
 } else {
   dotenv.config({ quiet: true })
 }
+
 // Prevent benign asynchronous driver/browser teardown exceptions from crashing the server
 process.on('uncaughtException', async (error: unknown) => {
   const { isPlaywrightAlreadyClosedError } = await import('./services/playwright.ts');
@@ -42,8 +43,7 @@ process.on('unhandledRejection', async (reason: unknown) => {
     return;
   }
   console.error('❌ [Process] Unhandled Rejection:', reason);
-});
-import { startServer } from './api/server.js'
+})
 const isTui = process.argv.includes('--tui') || process.env.QWEN_TUI === 'true'
 
 // Auto-import Qwen-Forge accounts on startup (non-fatal if file is absent).
@@ -76,6 +76,7 @@ if (isTui) {
   await app.start()
 } else {
   await autoImportForgeAccounts()
+  const { startServer } = await import('./api/server.js')
   startServer().catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error)
     // Expected configuration errors are already formatted with an emoji and

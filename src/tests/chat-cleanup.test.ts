@@ -39,8 +39,12 @@ test("deleteAllQwenChats sends DELETE to the Qwen chats endpoint", async () => {
 
     const headers = seenHeaders as Record<string, string>;
     assert.strictEqual(headers.Referer, "https://chat.qwen.ai/settings/chats");
-    assert.strictEqual(headers.source, "web");
     assert.strictEqual(headers.version, "0.2.89");
+    // `source: web` may only travel together with the Authorization bearer —
+    // the bare source+version pair is rejected upstream with 401 Unauthorized.
+    // The auth mock carries no token, so the pair must be withheld here.
+    assert.strictEqual(headers.source, undefined);
+    assert.strictEqual(headers.authorization, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }

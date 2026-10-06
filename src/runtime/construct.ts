@@ -12,6 +12,7 @@ import {
   ReadinessController,
   type WarmupOutcome,
 } from "./readiness/readiness-controller.ts";
+import { reconcileBrokenAccounts } from "./readiness/broken-recovery.ts";
 import { RetryCoordinator } from "./retry/retry-coordinator.ts";
 import {
   createStream,
@@ -191,6 +192,27 @@ export async function constructRuntime(
       },
     },
   );
+  // Bounded BROKEN recovery (startup + every reconciliation tick): accounts
+  // escalated to BROKEN by init failures while a systemic cause was in effect
+  // are re-armed once they stop failing, so the persisted escalation can never
+  // strand them after the cause is fixed. Permanent-auth accounts and accounts
+  // still failing recently are skipped by the pass. Runs BEFORE the tick so a
+  // recovered (previously FAILED-parked) account is a warmup candidate now.
+  const runBrokenRecovery = (): void => {
+    try {
+      const report = reconcileBrokenAccounts({ accounts });
+      // A re-armed account is usually the one the controller parked as
+      // `exhausted` (`warmup-exhausted` -> FAILED): without dropping that
+      // record the state machine requeues it to STANDBY but `runPass` still
+      // skips it forever. Clear it so the fresh attempt budget is real.
+      for (const accountId of report.recovered) {
+        readiness.clearWarmupFailureState(accountId);
+      }
+    } catch {
+      // Recovery must never break the reconciliation loop.
+    }
+  };
+  runBrokenRecovery();
   void readiness.tick();
 
   const maintenance = new MaintenanceScheduler({
@@ -202,6 +224,7 @@ export async function constructRuntime(
 
   const tickTimer = setInterval(() => {
   setActiveReadiness(readiness);
+  runBrokenRecovery();
   void readiness.tick();
   }, config.pool.reconciliationIntervalMs);
   tickTimer.unref?.();

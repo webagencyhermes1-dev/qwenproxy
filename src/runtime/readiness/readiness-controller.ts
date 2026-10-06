@@ -100,6 +100,20 @@ export class ReadinessController {
     return [...this.inFlight.keys()];
   }
 
+  /**
+   * Drop the per-account warmup failure record (attempts, backoff, exhaustion).
+   *
+   * Used by the BROKEN recovery pass: an account re-armed after an init-failure
+   * escalation is usually the same one this controller parked as `exhausted`
+   * (`warmup-exhausted` -> FAILED). Requeueing it to STANDBY without clearing
+   * the record would leave it permanently `skipped` by `runPass`, so the pool
+   * would show a non-BROKEN account that still never warms. Grants a fresh,
+   * bounded attempt budget (`maxWarmupFailures`).
+   */
+  clearWarmupFailureState(accountId: string): void {
+    this.states.delete(accountId);
+  }
+
   private emptyReport(): TickReport {
     return {
       launched: [],
@@ -223,6 +237,12 @@ export class ReadinessController {
     if (state.failures >= this.maxWarmupFailures) {
       state.exhausted = true;
       this.states.set(accountId, state);
+      // Operator signal: this account is out of warmup attempts and is parked
+      // as terminal by recoverAccount("warmup-exhausted"). Silently exhausting
+      // left a pool that looked like it was still trying while nothing moved.
+      console.warn(
+        `❌ [Readiness] Warmup exhausted for ${accountId} after ${state.failures} attempt(s); marking the account terminal (recovery reason "warmup-exhausted")`,
+      );
       void Promise.resolve(
         this.ownership.recoverAccount(accountId, "warmup-exhausted"),
       ).catch(() => {});

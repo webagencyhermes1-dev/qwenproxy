@@ -18,6 +18,7 @@ import { responsesApp } from "../routes/responses/index.js";
 import { completionsLegacy } from "../routes/completions.js";
 import { anthropicApp } from "../routes/anthropic/index.ts";
 import { sendOpenAIError } from "./error-helpers.js";
+import { withDeadline, FailFastTimeoutError } from "./fail-fast.js";
 import { AuthError, NotFoundError } from "../core/errors.js";
 import type { QwenAccount } from "../core/accounts.js";
 import { isAuthMockEnabled } from "../services/auth-playwright.js";
@@ -113,7 +114,7 @@ app.use("*", async (c, next) => {
   );
   c.header(
     "Access-Control-Expose-Headers",
-    "X-Request-Id, X-Response-Time, openai-version, openai-processing-ms, x-ratelimit-limit-requests, x-ratelimit-remaining-requests, x-ratelimit-reset-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens, x-ratelimit-reset-tokens",
+    "X-Request-Id, X-Response-Time, X-Models-Source, openai-version, openai-processing-ms, x-ratelimit-limit-requests, x-ratelimit-remaining-requests, x-ratelimit-reset-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens, x-ratelimit-reset-tokens",
   );
   if (c.req.method === "OPTIONS") {
     // Hono does not merge c.header() values into a manually constructed
@@ -127,7 +128,7 @@ app.use("*", async (c, next) => {
         "Access-Control-Allow-Headers":
           "Authorization, Content-Type, X-Request-Id, x-api-key, OpenAI-Organization, OpenAI-Project, X-Client-Request-Id",
         "Access-Control-Expose-Headers":
-          "X-Request-Id, X-Response-Time, openai-version, openai-processing-ms, x-ratelimit-limit-requests, x-ratelimit-remaining-requests, x-ratelimit-reset-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens, x-ratelimit-reset-tokens",
+          "X-Request-Id, X-Response-Time, X-Models-Source, openai-version, openai-processing-ms, x-ratelimit-limit-requests, x-ratelimit-remaining-requests, x-ratelimit-reset-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens, x-ratelimit-reset-tokens",
       },
     });
   }
@@ -532,14 +533,21 @@ app.get("/diagnostics/tokens", async (c) => {
   const accountId = c.req.query("accountId");
 
   try {
-    const diagnostics = await getTokenDiagnostics(accountId);
+    // Bound the CDP cookie/header reads: a wedged browser context must not
+    // hang a diagnostics request behind an unbounded await.
+    const diagnostics = await withDeadline(
+      "token diagnostics",
+      5_000,
+      () => getTokenDiagnostics(accountId),
+    );
     return c.json(diagnostics);
   } catch (err) {
+    const status = err instanceof FailFastTimeoutError ? 503 : 500;
     return c.json(
       {
         error: err instanceof Error ? err.message : String(err),
       },
-      500,
+      status,
     );
   }
 });
@@ -653,7 +661,7 @@ async function warmConfiguredChatPools(
   );
 }
 
-async function prepareQwenRuntime(params: {
+export async function prepareQwenRuntime(params: {
   accountId?: string;
   successMessage: string;
   failureMessage: string;
@@ -703,13 +711,29 @@ async function prepareQwenRuntime(params: {
   } catch (error) {
     console.warn(`❌ ${params.failureMessage}`, getErrorMessage(error));
     if (params.accountId) {
-      const { markAccountRateLimited } =
+      const { markAccountRateLimited, getAccountCooldownInfo } =
         await import("../core/account-manager.ts");
-      markAccountRateLimited(
-        params.accountId,
-        config.concurrency.initFailureCooldownMs,
-        "AuthInitFailed",
-      );
+      const { isPermanentInitFailure, PERMANENT_INIT_COOLDOWN_MS } =
+        await import("../services/playwright.ts");
+      const permanentFailure = isPermanentInitFailure(error);
+      const alreadyParkedPermanently =
+        !permanentFailure &&
+        (getAccountCooldownInfo(params.accountId)?.reason ?? "").startsWith(
+          "AuthPermanentFailure",
+        );
+      if (permanentFailure) {
+        markAccountRateLimited(
+          params.accountId,
+          PERMANENT_INIT_COOLDOWN_MS,
+          `AuthPermanentFailure: ${getErrorMessage(error)}`,
+        );
+      } else if (!alreadyParkedPermanently) {
+        markAccountRateLimited(
+          params.accountId,
+          config.concurrency.initFailureCooldownMs,
+          "AuthInitFailed",
+        );
+      }
       // Pool 2.0: repeated init failures escalate WARMING → BROKEN.
       try {
         noteAccountInitFailure(params.accountId);

@@ -454,8 +454,17 @@ export class AccountResourceManager implements IAccountOwnership {
   async recoverAccount(accountId: string, reason: string): Promise<void> {
     const record = this.accounts.get(accountId);
     if (!record) return;
-    if (canTransitionAccount(record.status, "RECOVERING")) {
-      this.applyTransition(record, "RECOVERING", `recovery:${reason}`);
+    // Warmup exhaustion is terminal for this run: the account burned every
+    // attempt without ever reaching READY, and RECOVERING is exactly the state
+    // the controller re-launches from — routing it there produced the endless
+    // warmup → exhaustion → recovery → warmup loop. Park it in FAILED instead,
+    // which getPoolSnapshot().failed already reports and which FAILED →
+    // COOLDOWN/STANDBY can still revive after an operator fix. Every other
+    // reason still means "observed problem, worth another warmup".
+    const target: AccountStatus =
+      reason === "warmup-exhausted" ? "FAILED" : "RECOVERING";
+    if (canTransitionAccount(record.status, target)) {
+      this.applyTransition(record, target, `recovery:${reason}`);
     }
   }
 

@@ -86,6 +86,12 @@ import { markAccountAuthError } from "../core/account-state.ts";
 import { updateQwenWebVersion, getQwenWebVersion } from "./qwen-headers.ts";
 import { getAccountProfilePath, getProfilesDir } from "../core/paths.ts";
 import {
+  ensureBrowserProcessHygiene,
+  killBrowserProcessTree,
+  killBrowserProcessesForProfile,
+  killChildBrowserProcessesSync,
+} from "../core/browser-process-cleanup.ts";
+import {
   operationRegistry,
   browserOwnershipEnabled,
 } from "../runtime/browser/operation-registry.ts";
@@ -185,11 +191,37 @@ let initSlotWaiters: Array<() => void> = [];
  * been closed", "Session closed"). A global slot (not per-account: initializing
  * accounts are independent) queues surplus inits until a slot frees.
  */
-export async function withPlaywrightInitSlot<T>(fn: () => Promise<T>): Promise<T> {
+export async function withPlaywrightInitSlot<T>(
+  fn: () => Promise<T>,
+  deadlineMs?: number,
+): Promise<T> {
   const max = config.playwright.maxParallelInit;
   if (max <= 1) return fn();
+  // Bounded queue wait: the caller already holds its account mutex while it
+  // waits here, so an unbounded wait turns a burst of cold accounts into lock
+  // holds that outlive the pool's warmup window (the waiter then times out on
+  // `init:<acct>` and "recovers" an init that was merely queued).
+  const startAt = Date.now();
+  const slotDeadline = deadlineMs ?? startAt + config.timeouts.page;
   while (activeInitSlots >= max) {
-    await new Promise<void>((resolve) => initSlotWaiters.push(resolve));
+    const remaining = slotDeadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error(
+        `Playwright init slot wait exceeded ${Math.round((slotDeadline - startAt) / 1000)}s budget`,
+      );
+    }
+    await new Promise<void>((resolve) => {
+      initSlotWaiters.push(resolve);
+      // Self-wake so a lost hand-off cannot park this waiter forever, and drop
+      // our own queue entry on the deadline path so the next releasing init
+      // does not resolve a waiter that already left the queue.
+      const recheck = setTimeout(() => {
+        const index = initSlotWaiters.indexOf(resolve);
+        if (index >= 0) initSlotWaiters.splice(index, 1);
+        resolve();
+      }, Math.min(remaining, 1_000));
+      recheck.unref?.();
+    });
   }
   activeInitSlots++;
   try {
@@ -248,12 +280,39 @@ export async function withPlaywrightOpSlot<T>(
         })
       : undefined;
 
+  // Bounded queue wait. The semaphore is shared by every browser op, so an
+  // init parked here still holds its account mutex — an unbounded wait turns
+  // five long captures into a 150s lock hold for the other 15 accounts. The
+  // caller's deadline (or one page timeout when no identity was given) caps
+  // the wait; whoever expires first leaves the queue and reports why.
+  const slotDeadline = identity?.deadline ?? Date.now() + config.timeouts.page;
+
   try {
     while (pwOpActive >= PW_OP_SEMAPHORE_MAX) {
       if (op?.controller.signal.aborted) {
         throw new DOMException("The operation was aborted", "AbortError");
       }
-      await new Promise<void>((resolve) => pwOpWaiters.push(resolve));
+      const remaining = slotDeadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(
+          `Playwright op slot wait exceeded ${config.timeouts.page}ms budget for ${
+            identity?.kind ?? "browser op"
+          }${identity?.accountId ? ` (${identity.accountId})` : ""}`,
+        );
+      }
+      await new Promise<void>((resolve) => {
+        pwOpWaiters.push(resolve);
+        const recheck = setTimeout(() => {
+          // Self-wake so a stalled hand-off cannot park this op forever, and
+          // drop our own queue entry first: on the deadline path we leave the
+          // loop without ever being shifted, which would leave a resolved
+          // no-op in front of the queue for the next releasing op to pick up.
+          const idx = pwOpWaiters.indexOf(resolve);
+          if (idx >= 0) pwOpWaiters.splice(idx, 1);
+          resolve();
+        }, Math.min(remaining, 1_000));
+        recheck.unref?.();
+      });
     }
     pwOpActive++;
     pwOpHighWater = Math.max(pwOpHighWater, pwOpActive);
@@ -292,6 +351,123 @@ export function resetPlaywrightOpHighWaterForTests(): void {
 const ACCOUNT_MUTEX_MAX_HOLD_MS = 180_000;
 const accountMutexes = new Map<string, Mutex>();
 
+/**
+ * Hard wall-clock budget for ONE account init — queue wait, context launch,
+ * login, session validation and header capture together.
+ *
+ * Init holds `init:<acct>` for its whole duration, so every unbounded step
+ * inside it is a lock hold. Each step used to carry its own timeout (60s
+ * navigation twice, 90s capture, unbounded slot queues), which stacked up to
+ * 150s+ holds: waiters timed out with "held by init:<acct> for 149527ms",
+ * `terminateWarmup` then parked another 60s on `close:<acct>` and the account
+ * never finished warming. The budget deliberately sits BELOW the pool warmup
+ * window so the controller's timeout cannot race an init that is still
+ * healthy (the 90s warmup + 60s close double-hold above).
+ *
+ * Override with PLAYWRIGHT_INIT_TIMEOUT_MS when the pool window is raised.
+ */
+const PLAYWRIGHT_INIT_TIMEOUT_MS = ((): number => {
+  const parsed = parseInt(process.env.PLAYWRIGHT_INIT_TIMEOUT_MS ?? "", 10);
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  return Math.max(45_000, config.pool.warmupTimeoutMs - 15_000);
+})();
+
+/** Cooldown for an init failure no retry can fix (wrong password, activation pending). */
+export const PERMANENT_INIT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Cancellation handle for the browser work of ONE account. Recovery and the
+ * init deadline both use it: closing the context makes in-flight awaits fail,
+ * but a body parked between awaits (sleeping, queued on a slot) would keep
+ * going — the signal is what stops it at the next stage boundary.
+ */
+const accountCancelControllers = new Map<string, AbortController>();
+
+function cancelAccountBrowserWork(accountId: string, reason: string): void {
+  const controller = accountCancelControllers.get(accountId);
+  if (controller && !controller.signal.aborted) {
+    controller.abort(reason);
+  }
+}
+
+function describeAbortReason(signal: AbortSignal): string {
+  return typeof signal.reason === "string" ? signal.reason : "cancelled";
+}
+
+/**
+ * Stage gate for init: notice a cancellation (recovery took the mutex back, or
+ * the deadline teardown ran) and a spent budget BEFORE paying for the next
+ * browser step, so the abort costs one bounded await instead of a whole
+ * navigation.
+ */
+function assertInitProgress(
+  accountId: string,
+  signal: AbortSignal,
+  stage: string,
+  deadlineMs: number,
+): void {
+  if (signal.aborted) {
+    throw new Error(
+      `Playwright init cancelled for ${accountId} during ${stage}: ${describeAbortReason(signal)}`,
+    );
+  }
+  if (Date.now() >= deadlineMs) {
+    throw new Error(
+      `Playwright init deadline exceeded after ${PLAYWRIGHT_INIT_TIMEOUT_MS}ms for ${accountId} during ${stage}`,
+    );
+  }
+}
+
+/** Thrown by capture/classification paths whose failure no retry can fix. */
+export class PermanentAuthError extends Error {
+  readonly permanent = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "PermanentAuthError";
+  }
+}
+
+/**
+ * True when retrying the init cannot succeed: the credentials are missing, the
+ * login answer is a hard auth rejection, or the account itself is still
+ * awaiting activation. Everything else (WAF, timeouts, contention) stays
+ * retryable.
+ */
+export function isPermanentInitFailure(error: unknown): boolean {
+  if (error instanceof PermanentAuthError) return true;
+  const message = getErrorMessage(error);
+  return (
+    message.includes("AuthPermanentFailure") ||
+    message.includes("credentials unresolved") ||
+    message.includes("no credentials available for re-login") ||
+    message.includes("pending activation")
+  );
+}
+
+/**
+ * Park an account that can never initialize on its own: 24h cooldown, the
+ * AUTH_ERROR flag (survives any cooldown a caller may overwrite, and only a
+ * successful init clears it) and an auth failure in the health ledger.
+ * Mirrors what `loginToQwen` already does for its own permanent rejections.
+ */
+function markPermanentInitFailure(accountId: string, reason: string): void {
+  console.error(
+    `🛑 [Playwright] Permanent init failure | account=${accountId} | reason=${reason}`,
+  );
+  markAccountRateLimited(
+    accountId,
+    PERMANENT_INIT_COOLDOWN_MS,
+    `AuthPermanentFailure: ${reason}`,
+  );
+  try {
+    markAccountAuthError(accountId);
+    recordAccountFailure(accountId, "auth");
+  } catch {
+    // Best-effort: the cooldown is already set.
+  }
+}
+
+
 function getAccountMutex(accountId: string): Mutex {
   let mutex = accountMutexes.get(accountId);
   if (!mutex) {
@@ -306,30 +482,48 @@ async function recoverStuckAccountMutex(
   mutex: Mutex,
   key: string,
 ): Promise<void> {
-  // A waiter timing out means the holder may be a browser operation that no
-  // longer has a live promise (the logs showed locks held for hours). Closing
-  // the context makes the old operation fail; replacing the mutex lets the
-  // account be initialized again instead of remaining permanently wedged.
+  // A waiter timing out means the holder is either a browser op with no live
+  // promise behind it (locks held for hours in the 2026-08-22 log) or an init
+  // that overran its own budget. Recovering must do all three of these, in
+  // this order — logging alone (the old behavior) left the lock, the browser
+  // and the in-flight task exactly where they were.
   if (accountMutexes.get(accountId) !== mutex) return;
 
+  const holder = mutex.state();
   console.warn(
-    `[Playwright] Recovering stuck account mutex | account=${accountId} | key=${key}`,
+    `[Playwright] Recovering stuck account mutex | account=${accountId} | key=${key} | heldBy=${holder.heldBy || "unknown"} | heldFor=${holder.heldForMs}ms`,
   );
+
+  // 1) Cancel the holder's task first. An init that keeps driving the page
+  //    would re-wedge the account the instant we hand the lock over.
+  cancelAccountBrowserWork(
+    accountId,
+    `stuck mutex recovery (waiter=${key}, heldBy=${holder.heldBy || "unknown"})`,
+  );
+
+  // 2) Close the context so every await still in flight fails fast instead of
+  //    holding browser resources while the new owner starts.
   const context = accountContexts.get(accountId);
   if (context) {
-    await closePlaywrightContextBestEffort(accountId, context, { skipStorageSave: true });
+    await closePlaywrightContextBestEffort(accountId, context, {
+      skipStorageSave: true,
+    });
   }
   cleanupPlaywrightAccountState(accountId);
-  if (accountMutexes.get(accountId) === mutex) {
-    accountMutexes.delete(accountId);
-  }
 
-  // A normal request can recover the browser on the next attempt. Avoid
-  // recursively scheduling another reset when the reset/close path itself was
-  // the operation that timed out.
-  if (!key.startsWith("profile-reset:") && !key.startsWith("close:")) {
-    schedulePlaywrightProfileReset(accountId);
-  }
+  // 3) Reclaim the lock itself. Deleting the map entry (the old behavior)
+  //    orphaned a mutex whose waiter queue stayed stranded and whose holder
+  //    still believed it owned the lock. forceRelease bumps the generation —
+  //    the stuck holder's later release() becomes a fenced no-op — and wakes
+  //    the OLDEST waiter, so queued acquirers resume immediately instead of
+  //    burning their own 60s timeout on the same dead holder.
+  mutex.forceRelease(`stuck-holder recovery (waiter=${key})`);
+
+  // Re-warm through the readiness controller only: cleanupPlaywrightAccountState
+  // already requested a tick (and READY -> RECOVERING via unmark). The old
+  // schedulePlaywrightProfileReset() here spawned a private re-init that
+  // bypassed the controller's failure budget and warmup timeout — the
+  // un-accounted retry loop that kept relaunching browsers for dead accounts.
 }
 
 async function acquireAccountMutex(
@@ -626,6 +820,7 @@ const lastKeepAliveNavigation = new Map<string, number>();
 const profileResetQueue = new Map<string, Promise<void>>();
 let profileResetChain: Promise<void> = Promise.resolve();
 let closingAllPlaywright = false;
+const captureHeaderLogSeen = new Set<string>();
 
 type KillableProcess = {
   killed?: boolean;
@@ -646,12 +841,16 @@ const SESSION_PROBE_NAVIGATION_TIMEOUT_MS = 15_000;
 /** Grace period for the intercepted completion request after the send is triggered. */
 const HEADER_CAPTURE_TRIGGER_GRACE_MS = 15_000;
 /**
- * First-send grace is short: the page is cold and the bx SDK has not computed
- * its tokens yet, so a cold page almost never produces a request from the first
- * send. Fail it fast and let the retry loop reload + re-send against the warm
- * SDK instead of stalling the boot for the full 15s.
+ * First-send grace is short — but it still has to cover the two round trips a
+ * first send actually costs: the UI posts `/api/v2/chats/new` first and only
+ * then fires the completion request the capture is waiting for (measured end
+ * to end at ~3.2s average on a healthy page). At the previous 3s the first
+ * send was declared silent while its own request was still in flight, so the
+ * attempt count bought nothing and every capture started one attempt down.
+ * Fail it fast relative to the 15s re-send grace, and let the retry loop
+ * reload + re-send against the warm SDK instead of stalling the boot.
  */
-const FIRST_TRIGGER_GRACE_MS = 3_000;
+const FIRST_TRIGGER_GRACE_MS = 6_000;
 /**
  * Sends (the initial one plus re-triggers) header capture may spend on getting a
  * completion request that actually carries the bx headers. The in-page SDK can
@@ -659,11 +858,12 @@ const FIRST_TRIGGER_GRACE_MS = 3_000;
  * that first unlucky request costs five minutes of cooldown; a couple of extra
  * sends cover it while still failing a page that never produces them.
  *
- * The FIRST send fails fast (see FIRST_TRIGGER_GRACE_MS) because a cold page
- * has not computed its bx tokens yet, so attempt 2 is the realistic recovery
- * window. Two attempts bound the reload cost of a truly blocked page (WAF
- * interstitial) at ~2x15s input waits; three only bought a third reload that a
- * WAF-detected page no longer performs.
+ * The FIRST send is given the shorter window (see FIRST_TRIGGER_GRACE_MS):
+ * it pays the chats/new round trip before the completion request, so it needs
+ * more than the old 3s but less than the full re-send grace. Attempt 2 is the
+ * realistic recovery window; two attempts bound the reload cost of a truly
+ * blocked page (WAF interstitial) at ~2x15s input waits; three only bought a
+ * third reload that a WAF-detected page no longer performs.
  */
 const HEADER_CAPTURE_TRIGGER_ATTEMPTS = 2;
 /**
@@ -843,6 +1043,67 @@ export async function detectChatPageBlock(page: Page): Promise<ChatPageBlock> {
   const snapshot = await probeChatPageDom(page);
   if (!snapshot) return { kind: null, markers: [] };
   return detectChatPageBlockText(snapshot);
+}
+
+/** Phrases that on their own prove the account is still awaiting activation. */
+const ACTIVATION_STRONG_MARKERS = [
+  "pending activation",
+  "activate your account through the verification email",
+] as const;
+/** Generic phrases that only mean "activation screen" when BOTH are present. */
+const ACTIVATION_CONTEXT_MARKERS = ["resend email", "check again"] as const;
+
+export interface AccountActivationBlock {
+  reason: string;
+  markers: string[];
+}
+
+/**
+ * Classify a page snapshot as the "account pending activation" screen. Pure and
+ * unit-testable like detectChatPageBlockText above. The distinction matters:
+ * a WAF block cools the account down for a retry, while an unconfirmed signup
+ * mail can never be fixed by retrying — the account has to be parked as a
+ * permanent auth failure instead of burning init attempts until it is BROKEN.
+ */
+export function detectAccountActivationBlockText(input: {
+  title?: string;
+  bodyText?: string;
+  href?: string;
+}): AccountActivationBlock | null {
+  const haystack = [input.title, input.href, input.bodyText]
+    .filter((s): s is string => !!s)
+    .join("\n")
+    .toLowerCase();
+
+  const strong = ACTIVATION_STRONG_MARKERS.filter((marker) =>
+    haystack.includes(marker),
+  );
+  if (strong.length > 0) {
+    return {
+      reason: `page shows the account activation screen (${strong[0]})`,
+      markers: [...strong],
+    };
+  }
+
+  const contextHits = ACTIVATION_CONTEXT_MARKERS.filter((marker) =>
+    haystack.includes(marker),
+  );
+  if (contextHits.length === ACTIVATION_CONTEXT_MARKERS.length) {
+    return {
+      reason: `page shows the account activation screen (${contextHits.join(", ")})`,
+      markers: [...contextHits],
+    };
+  }
+  return null;
+}
+
+/** Wrap the pure activation classifier over a live page (one bounded probe). */
+export async function detectAccountActivationBlock(
+  page: Page,
+): Promise<AccountActivationBlock | null> {
+  const snapshot = await probeChatPageDom(page);
+  if (!snapshot) return null;
+  return detectAccountActivationBlockText(snapshot);
 }
 
 /**
@@ -1363,6 +1624,108 @@ function getHeaderCache(accountId: string): AccountHeaderCache {
 }
 
 /**
+ * The web client's access token (Authorization: Bearer <jwt>) is issued with a
+ * 15-minute expiry and lives in localStorage["token"]. Upstream authenticates
+ * on it: without it the Aliyun SM/WAF punishes the completion request
+ * (FAIL_SYS_USER_VALIDATE → _____tmd_____/punish) and JSON endpoints answer
+ * `{"code":"unauthorized"}`. The cookie `token` (30 days) is NOT accepted as a
+ * bearer — it only authenticates cookie-bearing requests.
+ */
+const AUTH_TOKEN_MIN_LIFETIME_MS = 30_000;
+/** localStorage is re-read at most this often (it is an IPC round trip). */
+const AUTH_STORAGE_READ_INTERVAL_MS = 10_000;
+/** Recaptures that exist only to obtain a fresh access token are throttled. */
+const AUTH_RECAPTURE_MIN_INTERVAL_MS = 60_000;
+
+interface AuthorizationMemo {
+  token: string;
+  expMs: number | null;
+  readAt: number;
+}
+
+const authorizationMemos = new Map<string, AuthorizationMemo>();
+const lastAuthRecaptureAt = new Map<string, number>();
+
+function decodeJwtExpMs(token: string): number | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3 || !parts[1]) return null;
+    const json = Buffer.from(
+      parts[1].replace(/-/g, "+").replace(/_/g, "/"),
+      "base64",
+    ).toString("utf8");
+    const exp = JSON.parse(json).exp;
+    return typeof exp === "number" && Number.isFinite(exp) ? exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+function asBearer(value: string): string {
+  return /^bearer\s+/i.test(value) ? value : `Bearer ${value}`;
+}
+
+async function readAuthorizationFromStorage(
+  page: Page,
+): Promise<AuthorizationMemo | null> {
+  try {
+    const raw = await page.evaluate(() => {
+      try {
+        return localStorage.getItem("token");
+      } catch {
+        return null;
+      }
+    });
+    if (!raw) return null;
+    return { token: raw, expMs: decodeJwtExpMs(raw), readAt: Date.now() };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Bearer the relayed request must carry: the app's own token from
+ * localStorage, else the last bearer the real browser sent during capture.
+ * Returns "" when neither is usable, which must force a recapture — never a
+ * request with no credentials (see getBasicHeaders).
+ */
+async function resolveAuthorization(
+  accountId: string,
+  page: Page,
+  cache: AccountHeaderCache,
+  forceRead = false,
+): Promise<string> {
+  const now = Date.now();
+  const usable = (token: string, expMs: number | null): boolean =>
+    Boolean(token) &&
+    (expMs === null || expMs - now > AUTH_TOKEN_MIN_LIFETIME_MS);
+
+  const memo = authorizationMemos.get(accountId);
+  const dueForRead =
+    forceRead ||
+    !memo ||
+    now - memo.readAt >= AUTH_STORAGE_READ_INTERVAL_MS ||
+    (memo.expMs !== null && memo.expMs - now <= AUTH_TOKEN_MIN_LIFETIME_MS);
+  if (dueForRead) {
+    const stored = await readAuthorizationFromStorage(page);
+    if (stored) authorizationMemos.set(accountId, stored);
+    else authorizationMemos.delete(accountId);
+  }
+
+  const current = authorizationMemos.get(accountId);
+  if (current && usable(current.token, current.expMs)) {
+    return asBearer(current.token);
+  }
+
+  const captured = String(cache.headers["authorization"] || "").trim();
+  if (captured) {
+    const bare = captured.replace(/^bearer\s+/i, "");
+    if (usable(bare, decodeJwtExpMs(bare))) return asBearer(captured);
+  }
+  return "";
+}
+
+/**
  * Headers the capture must produce before a request may reach Qwen. With
  * QWEN_SEND_BX_UA=false (default, matching the real client) only the
  * cookie/UA/bx-v trio is required; bx-ua/bx-umidtoken are captured but never
@@ -1445,6 +1808,13 @@ export async function getCookies(accountId: string): Promise<string> {
     `Cookie retrieval timed out for ${accountId}`,
   );
   const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+  if (!/(^|;\s*)token=/.test(cookieStr)) {
+    logger.warn("[Playwright] Cookie string missing token cookie", {
+      accountId,
+      cookieNames: cookies.map((c) => c.name),
+      cached: Boolean(cached),
+    });
+  }
   cookieCaches.set(accountId, { cookie: cookieStr, timestamp: now });
   return cookieStr;
 }
@@ -1459,6 +1829,7 @@ export async function getBasicHeaders(accountId: string): Promise<{
   secChUaMobile: string;
   secChUaPlatform: string;
   version: string;
+  authorization: string;
 }> {
   const page = accountPages.get(accountId);
   if (!page) {
@@ -1546,10 +1917,17 @@ export async function getBasicHeaders(accountId: string): Promise<{
     const cache = getHeaderCache(accountId);
     const hadUsableHeaders = hasRequiredQwenHeaders(cache.headers);
 
+    // Resolve the bearer the relayed request must carry. Both fast paths are
+    // closed without it: relaying cookie-only headers is what upstream punishes
+    // (see AUTH_TOKEN_MIN_LIFETIME_MS), so a missing token falls through to the
+    // recapture below instead of being served from a stale-but-"usable" cache.
+    let authorization = await resolveAuthorization(accountId, page, cache);
+
     // Fast path: if headers are still fresh, just refresh cookies lightly
     const headersAge = Date.now() - cache.lastRefresh;
     if (
       hadUsableHeaders &&
+      authorization &&
       headersAge < HEADER_CACHE_TTL * HEADER_REFRESH_THRESHOLD
     ) {
       await tryLightweightCookieRefresh(accountId, cache);
@@ -1558,13 +1936,13 @@ export async function getBasicHeaders(accountId: string): Promise<{
       const bxUmidtoken = cache.headers["bx-umidtoken"];
       const bxV = cache.headers["bx-v"] || "2.5.37";
       const cookie = await getCookies(accountId);
-      return { cookie, userAgent, bxV, bxUa, bxUmidtoken, ...clientHints };
+      return { cookie, userAgent, bxV, bxUa, bxUmidtoken, authorization, ...clientHints };
     }
 
     // Extended fast path: headers are stale but auth token is still valid.
     // Check if we can skip full recapture by verifying cookie validity.
     // This avoids expensive browser interaction when the 30-day token is fresh.
-    if (hadUsableHeaders && headersAge > HEADER_CACHE_TTL) {
+    if (hadUsableHeaders && authorization && headersAge > HEADER_CACHE_TTL) {
       // A single CDP cookies() snapshot feeds both validity checks and the
       // cookie string (previously 3 round-trips: 2 validators + lightweight
       // refresh).
@@ -1587,7 +1965,35 @@ export async function getBasicHeaders(accountId: string): Promise<{
         console.log(
           `🔄 [Playwright] Skipped header recapture for ${accountId} (token still valid, age: ${Math.round(headersAge / 60000)} min)`,
         );
-        return { cookie, userAgent, bxV, bxUa, bxUmidtoken, ...clientHints };
+        return { cookie, userAgent, bxV, bxUa, bxUmidtoken, authorization, ...clientHints };
+      }
+    }
+
+    // No usable access token: the fast paths above are all closed, and any
+    // request built from this cache would reach upstream with no credentials.
+    // A navigation is what makes the SPA mint a new one (localStorage["token"]),
+    // and the capture that follows stores the bearer the browser then sends.
+    if (!authorization && !cache.refreshInProgress) {
+      const lastForced = lastAuthRecaptureAt.get(accountId) ?? 0;
+      if (Date.now() - lastForced >= AUTH_RECAPTURE_MIN_INTERVAL_MS) {
+        lastAuthRecaptureAt.set(accountId, Date.now());
+        console.warn(
+          `🔐 [Playwright] No valid Qwen access token for ${accountId}; forcing header recapture`,
+        );
+        try {
+          await refreshHeadersInternal(accountId);
+        } catch (error) {
+          console.warn(
+            `❌ [Playwright] Access-token recapture failed for ${accountId}: ${getErrorMessage(error)}`,
+          );
+        }
+        const livePage = accountPages.get(accountId);
+        authorization = await resolveAuthorization(
+          accountId,
+          livePage && !livePage.isClosed() ? livePage : page,
+          cache,
+          true,
+        );
       }
     }
 
@@ -1639,6 +2045,23 @@ export async function getBasicHeaders(accountId: string): Promise<{
       );
     }
 
+    // Recaptures above (stale, missing anti-bot headers, or missing access
+    // token) may have produced a new bearer; re-read it before deciding.
+    if (!authorization) {
+      const livePage = accountPages.get(accountId);
+      authorization = await resolveAuthorization(
+        accountId,
+        livePage && !livePage.isClosed() ? livePage : page,
+        cache,
+        true,
+      );
+    }
+    if (!authorization) {
+      throw new Error(
+        `Qwen access token (authorization) is unavailable for account: ${accountId}`,
+      );
+    }
+
     markAccountHeadersReady(accountId);
     const bxUa = cache.headers["bx-ua"];
     const bxUmidtoken = cache.headers["bx-umidtoken"];
@@ -1653,6 +2076,7 @@ export async function getBasicHeaders(accountId: string): Promise<{
       bxV,
       bxUa,
       bxUmidtoken,
+      authorization,
       ...clientHints,
     };
   } finally {
@@ -1681,33 +2105,79 @@ export async function initPlaywrightForAccount(
   headless = true,
   browserType: BrowserType = "chromium",
 ): Promise<void> {
-  const account = await resolveAccountCredentials(rawAccount);
-  if (accountPages.has(account.id)) {
-    console.log(
-      `[Playwright] Already initialized for ${maskEmail(account.email)}`,
-    );
-    return;
+  let account: QwenAccount;
+  try {
+    account = await resolveAccountCredentials(rawAccount);
+  } catch (error) {
+    // Credentials that cannot be resolved are never fixed by a retry.
+    if (isPermanentInitFailure(error)) {
+      markPermanentInitFailure(rawAccount.id, getErrorMessage(error));
+    }
+    throw error;
   }
+
+  // One absolute deadline for the WHOLE init: queue wait, launch, login,
+  // session validation and header capture. Every step below is bounded by the
+  // time it leaves, the body is raced against the deadline, and the mutex is
+  // released in the finally on EVERY path (see PLAYWRIGHT_INIT_TIMEOUT_MS).
+  const deadlineMs = Date.now() + PLAYWRIGHT_INIT_TIMEOUT_MS;
 
   const release = await acquireAccountMutex(
     account.id,
     `init:${account.id.substring(0, 12)}`,
+    Math.max(1_000, deadlineMs - Date.now()),
   );
+  const cancel = new AbortController();
+  accountCancelControllers.set(account.id, cancel);
+  const remainingMs = (): number => Math.max(1, deadlineMs - Date.now());
   try {
-    // Double-check after acquiring lock
-    if (accountPages.has(account.id)) {
+    const live = accountPages.get(account.id);
+    if (live && !live.isClosed()) {
+      // Another path won the race while we queued; its context is live.
+      console.log(
+        `[Playwright] Already initialized for ${maskEmail(account.email)}`,
+      );
       return;
     }
+    if (live) {
+      // A closed page left in the map made init report "success" for an
+      // account whose context is gone, so the pool counted it as warmed.
+      console.warn(
+        `[Playwright] Dropping closed context before re-init | account=${account.id}`,
+      );
+      await dropDeadAccountContext(account.id);
+    }
 
-    await withPlaywrightInitSlot(async () => {
+    const work = withPlaywrightInitSlot(
+      async () => {
+    assertInitProgress(account.id, cancel.signal, "queued", deadlineMs);
+
     // If a context limit is configured, make room by closing idle contexts.
-    await evictIdlePlaywrightContextsToLimit().catch((error: unknown) => {
-      logger.warn("[Playwright] idle eviction cleanup suppressed", {
+    // Bounded: this takes OTHER accounts' mutexes (60s waits each) and must
+    // not spend the whole init budget before this account even launches.
+    await withTimeout(
+      evictIdlePlaywrightContextsToLimit().catch((error: unknown) => {
+        logger.warn("[Playwright] idle eviction cleanup suppressed", {
+          accountId: account.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        metrics.increment("browser.close.suppressed_errors");
+      }),
+      Math.min(remainingMs(), 20_000),
+      `Idle eviction timed out during init of ${account.id}`,
+    ).catch((error: unknown) => {
+      logger.warn("[Playwright] idle eviction bounded", {
         accountId: account.id,
         error: error instanceof Error ? error.message : String(error),
       });
-      metrics.increment("browser.close.suppressed_errors");
     });
+
+    // Hard cap: no launch without a free context slot. Waiting here is bounded
+    // by the init deadline (minus 1s so a denial is reported as an admission
+    // error instead of losing the race to the generic init-deadline timeout);
+    // at the ceiling this throws before a browser is spawned (see
+    // acquireContextAdmission).
+    await acquireContextAdmission(account.id, deadlineMs - 1_000);
 
     const profilePath = getAccountProfilePath(account.id);
     const fingerprint = getFingerprintProfile(account.id);
@@ -1732,6 +2202,8 @@ export async function initPlaywrightForAccount(
       },
       ignoreDefaultArgs: ["--enable-automation", "--enable-blink-features"],
       args: buildChromiumLaunchArgs(fingerprint.viewport),
+      // Never launch past the init budget (Playwright's own default is 30s).
+      timeout: Math.min(remainingMs(), 30_000),
     };
 
     let acctContext: BrowserContext;
@@ -1757,6 +2229,9 @@ export async function initPlaywrightForAccount(
     } catch {}
 
     try {
+      // From here on any throw must take the context with it: a half-initialized
+      // context left in the maps is what the next attempt used to "reuse".
+      assertInitProgress(account.id, cancel.signal, "launch", deadlineMs);
       // Comprehensive stealth scripts for anti-bot evasion
       await acctContext.addInitScript(getStealthScript(fingerprint));
       for (const hook of contextInitHooks) {
@@ -1818,7 +2293,19 @@ export async function initPlaywrightForAccount(
       );
 
       if (!hasAuthCookie && account.email && account.password) {
-        await loginToQwen(account.id, account.email, account.password);
+        assertInitProgress(account.id, cancel.signal, "login", deadlineMs);
+        // Bounded: loginToQwen runs up to 3 API+UI attempts with backoff and
+        // would happily spend the whole budget before header capture starts.
+        // On expiry we fail the init (the throw closes the context) instead of
+        // letting a background login keep navigating the page under capture.
+        await withTimeout(
+          loginToQwen(account.id, account.email, account.password),
+          Math.min(
+            remainingMs(),
+            Math.max(20_000, Math.floor(PLAYWRIGHT_INIT_TIMEOUT_MS * 0.4)),
+          ),
+          `Login timed out during init of ${account.id}`,
+        );
       }
 
       // Navigate to the stable chat page to validate the session and populate cookies.
@@ -1826,10 +2313,11 @@ export async function initPlaywrightForAccount(
       const maxValidationAttempts = 2;
       let validationError: Error | null = null;
       for (let vAttempt = 1; vAttempt <= maxValidationAttempts; vAttempt++) {
+        assertInitProgress(account.id, cancel.signal, "validation", deadlineMs);
         try {
           await acctPage.goto(qwenUrl("/"), {
             waitUntil: "domcontentloaded",
-            timeout: config.timeouts.navigation,
+            timeout: Math.min(config.timeouts.navigation, remainingMs()),
           });
           const loggedIn = await isPageLoggedIn(acctPage);
           if (!loggedIn) {
@@ -1837,7 +2325,14 @@ export async function initPlaywrightForAccount(
               console.warn(
                 `⚠️  [Playwright] Session expired for ${maskEmail(account.email)}, re-authenticating...`,
               );
-              const ok = await loginToQwen(account.id, account.email, account.password);
+              const ok = await withTimeout(
+                loginToQwen(account.id, account.email, account.password),
+                Math.min(
+                  remainingMs(),
+                  Math.max(15_000, Math.floor(PLAYWRIGHT_INIT_TIMEOUT_MS * 0.3)),
+                ),
+                `Re-login timed out during init of ${account.id}`,
+              );
               if (!ok) {
                 validationError = new Error(
                   `Session expired for ${maskEmail(account.email)} and re-authentication failed`,
@@ -1859,7 +2354,7 @@ export async function initPlaywrightForAccount(
             console.warn(
               `⚠️  [Playwright] Session validation attempt ${vAttempt}/${maxValidationAttempts} failed for ${maskEmail(account.email)}: ${err.message}, retrying...`,
             );
-            await sleep(3000);
+            await sleep(Math.min(3000, remainingMs()));
           }
         }
       }
@@ -1869,7 +2364,18 @@ export async function initPlaywrightForAccount(
         );
         throw validationError;
       }
-      await captureQwenHeaders(account.id);
+
+      // The capture gets whatever is left of the budget, never more than the
+      // configured header window: capture used to start a fresh 90s from now
+      // (after queueing for an op slot), which is how an init ended up holding
+      // its mutex well past the controller's own timeout.
+      assertInitProgress(account.id, cancel.signal, "capture", deadlineMs);
+      await captureQwenHeaders(
+        account.id,
+        undefined,
+        Math.min(config.timeouts.headers, remainingMs()),
+      );
+      assertInitProgress(account.id, cancel.signal, "post-capture", deadlineMs);
 
       // Header capture may leave the UI on a generated chat page. Return the
       // primary tab to the canonical chat home.
@@ -1879,7 +2385,7 @@ export async function initPlaywrightForAccount(
           if (currentUrl.origin !== qwenOrigin() || currentUrl.pathname !== "/") {
             await acctPage.goto(qwenUrl("/"), {
               waitUntil: "domcontentloaded",
-              timeout: config.timeouts.navigation,
+              timeout: Math.min(config.timeouts.navigation, remainingMs()),
             });
           }
         } catch {
@@ -1893,10 +2399,55 @@ export async function initPlaywrightForAccount(
       cleanupPlaywrightAccountState(account.id);
       throw error;
     }
-    });
+      },
+      deadlineMs,
+    );
+
+    try {
+      await withTimeout(
+        work,
+        remainingMs(),
+        `Playwright init deadline exceeded after ${PLAYWRIGHT_INIT_TIMEOUT_MS}ms for ${account.id}`,
+      );
+    } catch (error) {
+      const message = getErrorMessage(error);
+      if (message.includes("Playwright init deadline exceeded")) {
+        // Hard stop: the body is still running in the background. Cancel it and
+        // tear the context down so it cannot keep a browser alive, keep queuing
+        // on slots, or flip the account's state behind our back — the body's
+        // own catch then finds nothing left to clean up.
+        console.warn(
+          `⏱️  [Playwright] Init deadline hit | account=${account.id} | budget=${PLAYWRIGHT_INIT_TIMEOUT_MS}ms | cancelling and closing context`,
+        );
+        cancelAccountBrowserWork(account.id, "init deadline exceeded");
+        await dropDeadAccountContext(account.id);
+      }
+      if (isPermanentInitFailure(error)) {
+        markPermanentInitFailure(account.id, message);
+      }
+      throw error;
+    }
   } finally {
     release();
+    if (accountCancelControllers.get(account.id) === cancel) {
+      accountCancelControllers.delete(account.id);
+    }
   }
+}
+
+/**
+ * Close whatever context is registered for the account and forget its state.
+ * Idempotent: both the init body's catch and the deadline teardown may run it
+ * for the same failed init.
+ */
+async function dropDeadAccountContext(accountId: string): Promise<void> {
+  const context = accountContexts.get(accountId);
+  if (context) {
+    await closePlaywrightContextBestEffort(accountId, context, {
+      skipStorageSave: true,
+    }).catch(() => {});
+  }
+  cleanupPlaywrightAccountState(accountId);
 }
 
 // ─── Standby Validation ──────────────────────────────────────────────────────
@@ -1923,6 +2474,12 @@ export async function validateAccountLogin(
   );
   try {
     if (accountPages.has(account.id)) return true;
+    // Same hard cap as a full init: validation also spawns a browser, so it
+    // waits for a slot too (bounded — validation is a short maintenance step).
+    await acquireContextAdmission(
+      account.id,
+      Date.now() + Math.min(PLAYWRIGHT_INIT_TIMEOUT_MS, 30_000),
+    );
     const profilePath = getAccountProfilePath(account.id);
     const fingerprint = getFingerprintProfile(account.id);
     const { engine, channel } = resolveBrowserEngine(browserType);
@@ -2246,35 +2803,58 @@ async function loginViaApi(
       return { success: true };
     }
 
-    const hashedPassword = crypto
+    // Qwen's web client sends the password as a SHA256 hex digest, and the
+    // API now rejects plaintext with INVALID_CRED ("The email or password
+    // provided is incorrect"). Hash first; only fall back to plaintext for
+    // deployments that still accept it.
+    //
+    // NOTE: the evaluated function must stay a plain inline arrow — a nested
+    // named function inside page.evaluate gets wrapped by esbuild's keepNames
+    // (__name helper), which does not exist in the browser context and throws
+    // "ReferenceError: __name is not defined" at runtime.
+    const signinUrl = qwenUrl("/api/v2/auths/signin");
+    const passwordHash = crypto
       .createHash("sha256")
       .update(password)
       .digest("hex");
-    const signinUrl = qwenUrl("/api/v2/auths/signin");
 
-    const result = await page.evaluate(
-      async ({ email, password, signinUrl }) => {
-        try {
-          const response = await fetch(signinUrl, {
-            method: "POST",
-            signal: AbortSignal.timeout(10_000),
-            headers: {
-              accept: "application/json, text/plain, */*",
-              "content-type": "application/json",
-              source: "web",
-              timezone: new Date().toString().split(" (")[0],
-              "x-request-id": crypto.randomUUID(),
-            },
-            body: JSON.stringify({ email, password, login_type: "email" }),
-          });
-          const data = await response.json().catch(() => null);
-          return { ok: response.ok, status: response.status, data };
-        } catch (e: any) {
-          return { ok: false, error: e.message };
-        }
-      },
-      { email, password: hashedPassword, signinUrl },
-    );
+    const signInWith = (candidate: string) =>
+      page.evaluate(
+        async ({ email, password, signinUrl }) => {
+          try {
+            const response = await fetch(signinUrl, {
+              method: "POST",
+              signal: AbortSignal.timeout(10_000),
+              headers: {
+                accept: "application/json, text/plain, */*",
+                "content-type": "application/json",
+                source: "web",
+                timezone: new Date().toString().split(" (")[0],
+                "x-request-id": crypto.randomUUID(),
+              },
+              body: JSON.stringify({
+                email,
+                password,
+                login_type: "email",
+              }),
+            });
+            const data = await response.json().catch(() => null);
+            return { ok: response.ok, status: response.status, data };
+          } catch (e: any) {
+            return { ok: false, status: 0, data: null, error: e.message };
+          }
+        },
+        { email, password: candidate, signinUrl },
+      );
+
+    let result = await signInWith(passwordHash);
+    const resultCode = result.data?.data?.code ?? result.data?.code;
+    if (
+      result.data?.success === false &&
+      resultCode === "INVALID_CRED"
+    ) {
+      result = await signInWith(password);
+    }
 
     if (result.data) {
       if (result.data.success === true) {
@@ -2338,6 +2918,27 @@ async function loginViaUi(
       return { success: true };
     }
 
+    // The auth page now defaults to the OTP ("verification code") flow, which
+    // renders no password field and no submit button. Password login lives
+    // behind an explicit toggle, so switch modes first — otherwise the
+    // password wait below times out on every attempt.
+    const passwordSelector =
+      'input[type="password"], input[name="password"]';
+    const passwordVisibleInitially = await page
+      .locator(passwordSelector)
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (!passwordVisibleInitially) {
+      const passwordModeToggle = page
+        .locator('button:has-text("Log in with a password")')
+        .first();
+      if (await passwordModeToggle.isVisible().catch(() => false)) {
+        await passwordModeToggle.click({ timeout: 3_000 }).catch(() => {});
+        await sleep(500);
+      }
+    }
+
     // Wait for email input
     const emailSelector = [
       'input[type="email"]',
@@ -2363,8 +2964,6 @@ async function loginViaUi(
 
     // The password field may already be visible (single-step form) or only
     // appear after submitting the email (two-step flow).
-    const passwordSelector =
-      'input[type="password"], input[name="password"]';
     const passwordAlreadyVisible = await page
       .locator(passwordSelector)
       .first()
@@ -2450,6 +3049,62 @@ async function loginViaUi(
 // ─── Header Capture ───────────────────────────────────────────────────────────
 
 /**
+ * Qwen's age-confirmation gate renders as a centered antd modal
+ * (`.ant-modal-wrap.ant-modal-centered`, heading "Confirm your age to
+ * continue", birth-year select + "Continue") on top of the composer. Playwright
+ * still reports the chat input and the send button as VISIBLE behind it —
+ * visibility ignores occlusion — so header capture typed its probe message,
+ * focused/clicked the send button, and every pointer event landed on the modal
+ * overlay (`document.elementFromPoint` at the send button returns the modal
+ * wrap). The page therefore issued no `/api/v2/chats/new` and no completion
+ * request at all: the capture only ever saw its own grace timers expire
+ * ("Header capture produced no completion request … timed out") with no WAF,
+ * login or activation evidence anywhere. Accepting the gate (the year select
+ * ships pre-selected to an adult year) is what lets the send reach the app.
+ */
+export async function dismissAgeConfirmation(page: Page): Promise<boolean> {
+  if (!page || page.isClosed()) return false;
+  try {
+    const gate = page
+      .locator("div.ant-modal-wrap")
+      .filter({ hasText: /confirm your age/i })
+      .first();
+    if (!(await gate.isVisible().catch(() => false))) return false;
+    console.log(
+      `🔞 [Playwright] Age-confirmation gate detected; accepting it for header capture`,
+    );
+
+    const primary = gate
+      .locator('button:has-text("Continue"), button.ant-btn-primary')
+      .first();
+    if (await primary.isVisible().catch(() => false)) {
+      await primary.click({ timeout: 3_000 }).catch(() => {});
+    } else {
+      const close = gate.locator(".ant-modal-close").first();
+      await close.click({ timeout: 2_000 }).catch(() => {});
+    }
+    // antd fades the wrapper out after the click; poll until it is really gone
+    // so a slow fade is not reported as a failure (a false negative here is
+    // indistinguishable from the gate never being handled).
+    for (let i = 0; i < 20; i++) {
+      await sleep(150);
+      if (!(await gate.isVisible().catch(() => false))) {
+        console.log(
+          `🔞 [Playwright] Age-confirmation gate dismissed for header capture`,
+        );
+        return true;
+      }
+    }
+    console.warn(
+      `⏱️  [Playwright] Age-confirmation gate still open after accepting for header capture`,
+    );
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Capture a complete anti-fraud header set from a browser completion request.
  * The optional page and timeout make the capture path independently testable
  * without starting a real browser.
@@ -2460,9 +3115,24 @@ export async function captureQwenHeaders(
   timeoutMs = config.timeouts.headers,
   triggerGraceMs = HEADER_CAPTURE_TRIGGER_GRACE_MS,
 ): Promise<void> {
+  // One deadline for the WHOLE capture, including the wait for a shared op
+  // slot. The budget used to restart after that wait (the slot got the caller's
+  // deadline, the body a fresh timeoutMs), so a capture queued behind four
+  // others still believed it had a full 90s while holding the account mutex —
+  // the arithmetic behind the 150s `init:<acct>` holds.
+  const deadline = Date.now() + Math.max(1, timeoutMs);
   return withPlaywrightOpSlot(
-    () => captureQwenHeadersInner(accountId, pageOverride, timeoutMs, triggerGraceMs),
-    { accountId, deadline: Date.now() + timeoutMs, kind: "header-capture" },
+    () =>
+      captureQwenHeadersInner(
+        accountId,
+        pageOverride,
+        // Recomputed after the queue wait so the wait itself consumes the
+        // budget (clamped to 1ms: a spent budget then fails inside with the
+        // normal "capture timed out" diagnosis instead of a new error class).
+        Math.max(1, deadline - Date.now()),
+        triggerGraceMs,
+      ),
+    { accountId, deadline, kind: "header-capture" },
   );
 }
 
@@ -2577,11 +3247,12 @@ async function captureQwenHeadersInner(
       // the send that produced it must not arm a deadline against it.
       if (settled || headersCaptured) return;
       if (timeout) clearTimeout(timeout);
-      // The FIRST send types into a page whose bx SDK may not have computed its
-      // tokens yet — a cold page almost never produces a request from the first
-      // send, so waiting out the full 15s grace is pure stall. Fail it fast and
-      // let the retry loop reload + re-send (warm SDK) instead. Never exceed the
-      // caller-provided grace (tests inject tiny windows and expect them held).
+      // The FIRST send pays two round trips (chats/new, then the completion
+      // request itself) — measured ~3.2s end to end on a healthy page. The old
+      // 3s window fired while its own request was still in flight, so the
+      // attempt bought nothing. Cap it at FIRST_TRIGGER_GRACE_MS (6s) and at
+      // whatever the caller injected. Never exceed the caller-provided grace
+      // (tests inject tiny windows and expect them held).
       const firstSendGraceMs = Math.min(FIRST_TRIGGER_GRACE_MS, triggerGraceMs);
       timeout = setTimeout(
         () => {
@@ -2615,11 +3286,62 @@ async function captureQwenHeadersInner(
       }
 
       const reqHeaders = request.headers();
+      if (!captureHeaderLogSeen.has(accountId)) {
+        captureHeaderLogSeen.add(accountId);
+        const plain: Record<string, string> = {};
+        for (const [key, value] of Object.entries(reqHeaders)) {
+          plain[key] =
+            key === "cookie"
+              ? `${String(value).slice(0, 16)}...len=${String(value).length}`
+              : String(value).slice(0, 300);
+        }
+        logger.info("[Playwright] Capture request headers", {
+          accountId,
+          headers: plain,
+          authMeta: ((): Record<string, unknown> => {
+            const authHeader = String(reqHeaders["authorization"] || "");
+            const bare = authHeader.replace(/^bearer\s+/i, "");
+            const meta: Record<string, unknown> = {
+              len: authHeader.length,
+              bearer: /^bearer\s+/i.test(authHeader),
+            };
+            const parts = bare.split(".");
+            if (parts.length === 3) {
+              try {
+                const payload = JSON.parse(
+                  Buffer.from(
+                    parts[1].replace(/-/g, "+").replace(/_/g, "/"),
+                    "base64",
+                  ).toString("utf8"),
+                );
+                meta.jwt = {
+                  exp: payload.exp,
+                  iat: payload.iat,
+                  sub: payload.sub,
+                  inMin: payload.exp
+                    ? Math.round((payload.exp * 1000 - Date.now()) / 60000)
+                    : null,
+                };
+              } catch {
+                meta.jwt = "unparseable";
+              }
+            }
+            const cookieToken = String(reqHeaders["cookie"] || "")
+              .split(/;\s*/)
+              .find((entry) => entry.startsWith("token="));
+            meta.sameAsCookieToken = cookieToken
+              ? bare === cookieToken.slice("token=".length)
+              : false;
+            return meta;
+          })(),
+        });
+      }
       // Capture the REAL browser request headers — including version and the
       // client-hint fingerprint — so the Node paths reuse exactly what the live
       // browser sends (anti-hardcoded: no stale Chrome/version literals).
       const capturedHeaders: Record<string, string> = {
         cookie: reqHeaders["cookie"] || "",
+        authorization: reqHeaders["authorization"] || "",
         "bx-ua": reqHeaders["bx-ua"] || "",
         "bx-umidtoken": reqHeaders["bx-umidtoken"] || "",
         "bx-v": reqHeaders["bx-v"] || "2.5.37",
@@ -2710,7 +3432,12 @@ async function captureQwenHeadersInner(
           console.warn(
             `⚠️  [Playwright] Session expired during header capture for ${accountId}; re-authenticating...`,
           );
-          const ok = await loginToQwen(accountId, creds.email, creds.password);
+          // Direct call to the inner login: this capture ALREADY holds one of
+          // the five shared browser-op slots, and loginToQwen would queue for a
+          // second one. Five captures each re-logining at once leave all slots
+          // held by waiters on each other — the whole semaphore stalls until
+          // every deadline fires (the "slot wait exceeded" cascade).
+          const ok = await loginToQwenInner(accountId, creds.email, creds.password);
           if (!ok) {
             settle(
               new Error(
@@ -2776,6 +3503,28 @@ async function captureQwenHeadersInner(
           );
           return;
         }
+        // Not WAF and not hydration: the account itself may be unusable yet
+        // ("pending activation" until the signup mail is confirmed — seen in
+        // logs/playwright_misses). That never recovers by re-sending, so it is
+        // reported as a PERMANENT auth failure instead of consuming the retry
+        // budget and cooling the account as if it were a timeout.
+        const activation = await detectAccountActivationBlock(page);
+        if (activation) {
+          await dumpPlaywrightMiss(accountId, page, {
+            reason: "account pending activation",
+            attempt,
+            markers: activation.markers,
+          });
+          console.warn(
+            `🛑 [Playwright] Account not activated for ${accountId} (attempt ${attempt}): ${activation.reason}`,
+          );
+          settle(
+            new PermanentAuthError(
+              `Header capture failed for ${accountId}: account pending activation — ${activation.reason}`,
+            ),
+          );
+          return;
+        }
         await dumpPlaywrightMiss(accountId, page, {
           reason: "chat input never appeared",
           attempt,
@@ -2788,6 +3537,11 @@ async function captureQwenHeadersInner(
         wakeTrigger();
         return;
       }
+      if (settled || page.isClosed()) return;
+      // The age gate mounts together with the composer, so this is the first
+      // point where it can be seen; dismissing it here keeps the typing below
+      // focused in a page that is not covered by an overlay.
+      await dismissAgeConfirmation(page);
       if (settled || page.isClosed()) return;
       const inputActionTimeoutMs = Math.max(
         1,
@@ -2817,6 +3571,10 @@ async function captureQwenHeadersInner(
       }
       if (settled || page.isClosed()) return;
       await sleep(2000);
+      if (settled || page.isClosed()) return;
+      // Re-check: a gate that mounted after the composer finished rendering
+      // would otherwise swallow the send below without any visible symptom.
+      await dismissAgeConfirmation(page);
       if (settled || page.isClosed()) return;
 
       const sendSelectors = SEND_BUTTON_SELECTORS;
@@ -2914,6 +3672,31 @@ async function captureQwenHeadersInner(
 
       // Distinguish between "requests fired but lacked bx headers" and "no
       // request fired at all" so the caller gets an actionable diagnosis.
+      // The silent case has one more possibility worth ruling out first: an
+      // account awaiting signup confirmation still renders the chat input (so
+      // the input-miss detector never fires) but the app ignores the send, so
+      // no completion request is ever produced — exactly the signature in
+      // logs/playwright_misses. Report that as a PERMANENT auth failure instead
+      // of a retryable capture timeout.
+      if (!headersCaptured && !sawIncompleteHeaders) {
+        const activation = await detectAccountActivationBlock(page);
+        if (activation) {
+          await dumpPlaywrightMiss(accountId, page, {
+            reason: "account pending activation",
+            attempt: HEADER_CAPTURE_TRIGGER_ATTEMPTS,
+            markers: activation.markers,
+          });
+          console.warn(
+            `🛑 [Playwright] Account not activated for ${accountId}: ${activation.reason}`,
+          );
+          settle(
+            new PermanentAuthError(
+              `Header capture failed for ${accountId}: account pending activation — ${activation.reason}`,
+            ),
+          );
+          return;
+        }
+      }
       settle(
         sawIncompleteHeaders
           ? incompleteHeadersError()
@@ -3479,6 +4262,120 @@ function priorityOrderForEviction(accountIds: string[]): string[] {
   );
 }
 
+// ─── Context admission (hard cap) ─────────────────────────────────────────────
+
+/**
+ * PLAYWRIGHT_MAX_ACTIVE_CONTEXTS is enforced at LAUNCH time, not only by idle
+ * eviction: eviction closes contexts that happen to be idle, so when every
+ * open context is busy it frees nothing and the next launch would silently
+ * exceed the cap. An account therefore takes a slot here first — counting live
+ * pages plus in-flight reservations — and only launches when one is free.
+ * Waiters are bounded by the caller's init deadline and fail with a clear
+ * error instead of stacking unbounded Chromium launches.
+ */
+const contextAdmissions = new Map<string, number>();
+const contextAdmissionWaiters = new Set<() => void>();
+
+function wakeContextAdmissionWaiters(): void {
+  for (const wake of Array.from(contextAdmissionWaiters)) wake();
+}
+
+/** Free a slot (any close/cleanup path) and let queued launches retry. */
+function releaseContextAdmission(accountId: string): void {
+  contextAdmissions.delete(accountId);
+  wakeContextAdmissionWaiters();
+}
+
+/**
+ * Drop reservations that can no longer become a live context: a registered
+ * page owns the slot now (the reservation is redundant), the init budget that
+ * created it ran out, or the account mutex went idle without a page — the
+ * launch failed between admission and `accountPages.set`, so the slot is freed
+ * without every failure path having to remember the release.
+ */
+function reapDeadContextAdmissions(): void {
+  const now = Date.now();
+  for (const [accountId, reservedAt] of contextAdmissions) {
+    if (accountPages.has(accountId)) {
+      contextAdmissions.delete(accountId);
+      continue;
+    }
+    if (now - reservedAt > PLAYWRIGHT_INIT_TIMEOUT_MS) {
+      contextAdmissions.delete(accountId);
+      continue;
+    }
+    if (accountMutexes.get(accountId)?.isIdle()) {
+      contextAdmissions.delete(accountId);
+    }
+  }
+}
+
+/** Slots in use: contexts that are live plus launches that are about to be. */
+function liveContextCount(): number {
+  reapDeadContextAdmissions();
+  const ids = new Set<string>(accountPages.keys());
+  for (const accountId of contextAdmissions.keys()) ids.add(accountId);
+  return ids.size;
+}
+
+/**
+ * Wait for a context slot. Throws once the deadline passes while still at the
+ * ceiling, so callers fail fast (and the pool retries later) instead of
+ * launching past the cap.
+ */
+async function acquireContextAdmission(
+  accountId: string,
+  deadlineMs: number,
+): Promise<void> {
+  // Once per process, before the first launch of the run: reclaim browsers a
+  // previous run left behind and arm the exit-time killer (see
+  // browser-process-cleanup.ts). Warmup passes through here, so hygiene always
+  // completes before any context of this run is launched.
+  await ensureBrowserProcessHygiene();
+
+  const max = config.playwright.maxActiveContexts;
+  if (max <= 0) return; // 0 = uncapped (idle TTL sweep only)
+  if (accountPages.has(accountId)) return;
+
+  const startedAt = Date.now();
+  let lastEvictionAttempt = 0;
+  for (;;) {
+    if (liveContextCount() < max) {
+      contextAdmissions.set(accountId, Date.now());
+      return;
+    }
+
+    const now = Date.now();
+    if (now >= deadlineMs) {
+      throw new Error(
+        `Context admission denied for ${accountId}: ${liveContextCount()} active contexts at the PLAYWRIGHT_MAX_ACTIVE_CONTEXTS=${max} ceiling (waited ${now - startedAt}ms)`,
+      );
+    }
+
+    // Actively try to free a slot by closing idle contexts (the same bounded
+    // machinery the launch path uses) instead of only waiting for a close.
+    if (now - lastEvictionAttempt >= 2_000) {
+      lastEvictionAttempt = now;
+      void withTimeout(
+        evictIdlePlaywrightContextsToLimit().catch(() => 0),
+        Math.min(20_000, Math.max(1_000, deadlineMs - now)),
+        `Admission eviction timed out for ${accountId}`,
+      ).catch(() => {});
+    }
+
+    await new Promise<void>((resolve) => {
+      // NOT unref'd on purpose: a queued launch is real pending work and must
+      // keep the event loop alive until it gets a slot or the deadline fires.
+      // The waiter entry is removed by whichever comes first (wake or timer).
+      setTimeout(() => {
+        contextAdmissionWaiters.delete(resolve);
+        resolve();
+      }, Math.min(1_000, Math.max(50, deadlineMs - now)));
+      contextAdmissionWaiters.add(resolve);
+    });
+  }
+}
+
 export async function closeIdlePlaywrightAccounts(
   idleMs: number,
 ): Promise<number> {
@@ -3490,50 +4387,66 @@ export async function closeIdlePlaywrightAccounts(
     return 0;
   }
 
-  const hotTarget = config.pool.targetReady;
-  const hotCount = Array.from(accountPages.keys()).filter((id) =>
-    isAccountHeadersReady(id),
-  ).length;
-  const hotProtected = hotCount <= hotTarget;
-
-  const candidates = priorityOrderForEviction(
-    getIdlePlaywrightAccountIds(idleMs).filter((accountId) => {
-      if (hotProtected && isAccountHeadersReady(accountId)) return false;
-      return true;
-    }),
-  ).map((accountId) => ({
-    accountId,
-    lastActivity: lastAccountActivity.get(accountId) ?? 0,
-  }));
+  // HOT (headers-ready) contexts are the pool's warm working set: keep as many
+  // as the effective target allows. They are never allowed to hold the count
+  // above the hard cap, so a second pass drops the protection when pass one
+  // could not get under the ceiling (same policy as
+  // evictIdlePlaywrightContextsToLimit).
+  const hotTarget =
+    maxActiveContexts > 0
+      ? Math.min(config.pool.targetReady, maxActiveContexts)
+      : config.pool.targetReady;
 
   let closed = 0;
-  for (const candidate of candidates) {
-    if (maxActiveContexts > 0 && accountPages.size <= maxActiveContexts) {
-      break;
-    }
+  for (const protectHot of [true, false]) {
+    if (maxActiveContexts > 0 && accountPages.size <= maxActiveContexts) break;
+    // With no cap this is a pure TTL sweep: no ceiling to enforce, so the
+    // hot-protection pass is the only one that runs.
+    if (maxActiveContexts <= 0 && !protectHot) break;
 
-    // Re-checked per account: closing the previous one is awaited, and a
-    // request can have claimed this account in the meantime.
-    if (isAccountServingStream(candidate.accountId)) continue;
+    const hotCount = Array.from(accountPages.keys()).filter((id) =>
+      isAccountHeadersReady(id),
+    ).length;
+    const hotProtected = protectHot && hotCount <= hotTarget;
 
-    const mutex = accountMutexes.get(candidate.accountId);
-    if (!mutex?.isIdle()) continue;
+    const candidates = priorityOrderForEviction(
+      getIdlePlaywrightAccountIds(idleMs).filter((accountId) => {
+        if (hotProtected && isAccountHeadersReady(accountId)) return false;
+        return true;
+      }),
+    ).map((accountId) => ({
+      accountId,
+      lastActivity: lastAccountActivity.get(accountId) ?? 0,
+    }));
 
-    const release = await acquireAccountMutex(
-      candidate.accountId,
-      `idle-close:${candidate.accountId.substring(0, 12)}`,
-    ).catch(() => null);
-    if (!release) continue;
-    try {
+    for (const candidate of candidates) {
+      if (maxActiveContexts > 0 && accountPages.size <= maxActiveContexts) {
+        break;
+      }
+
+      // Re-checked per account: closing the previous one is awaited, and a
+      // request can have claimed this account in the meantime.
       if (isAccountServingStream(candidate.accountId)) continue;
-      await closePlaywrightForAccountLocked(candidate.accountId);
-      closed++;
-    } catch (error) {
-      console.warn(
-        `[Playwright] Failed to close idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
-      );
-    } finally {
-      release();
+
+      const mutex = accountMutexes.get(candidate.accountId);
+      if (!mutex?.isIdle()) continue;
+
+      const release = await acquireAccountMutex(
+        candidate.accountId,
+        `idle-close:${candidate.accountId.substring(0, 12)}`,
+      ).catch(() => null);
+      if (!release) continue;
+      try {
+        if (isAccountServingStream(candidate.accountId)) continue;
+        await closePlaywrightForAccountLocked(candidate.accountId);
+        closed++;
+      } catch (error) {
+        console.warn(
+          `[Playwright] Failed to close idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
+        );
+      } finally {
+        release();
+      }
     }
   }
   return closed;
@@ -3549,46 +4462,57 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
   if (max <= 0) return 0;
   if (accountPages.size <= max) return 0;
 
-  const hotTarget = config.pool.targetReady;
-  const hotCount = Array.from(accountPages.keys()).filter((id) =>
-    isAccountHeadersReady(id),
-  ).length;
-  const hotProtected = hotCount <= hotTarget;
-
-  const candidates = priorityOrderForEviction(
-    Array.from(accountPages.keys()).filter((accountId) => {
-      if (hotProtected && isAccountHeadersReady(accountId)) return false;
-      const mutex = accountMutexes.get(accountId);
-      return mutex?.isIdle() && !isAccountServingStream(accountId);
-    }),
-  ).map((accountId) => ({
-    accountId,
-    mutex: accountMutexes.get(accountId),
-    lastActivity: lastAccountActivity.get(accountId) ?? 0,
-  }));
-
+  // Two passes. Pass 1 protects the HOT (headers-ready) working set: while it
+  // is at or below the effective target it is what keeps the pool warm, so
+  // cold contexts go first. Pass 2 drops that protection if the count is still
+  // above the ceiling — the cap is a hard limit and HOT contexts must never be
+  // what breaks it (before, `hotProtected` could block every candidate and the
+  // eviction silently closed nothing).
+  const hotTarget = Math.min(config.pool.targetReady, max);
   let closed = 0;
-  for (const candidate of candidates) {
-    if (accountPages.size <= max) break;
-    if (isAccountServingStream(candidate.accountId)) continue;
-    const mutex = accountMutexes.get(candidate.accountId);
-    if (!mutex?.isIdle()) continue;
 
-    const release = await acquireAccountMutex(
-      candidate.accountId,
-      `idle-evict:${candidate.accountId.substring(0, 12)}`,
-    ).catch(() => null);
-    if (!release) continue;
-    try {
+  for (const protectHot of [true, false]) {
+    if (accountPages.size <= max) break;
+
+    const hotCount = Array.from(accountPages.keys()).filter((id) =>
+      isAccountHeadersReady(id),
+    ).length;
+    const hotProtected = protectHot && hotCount <= hotTarget;
+
+    const candidates = priorityOrderForEviction(
+      Array.from(accountPages.keys()).filter((accountId) => {
+        if (hotProtected && isAccountHeadersReady(accountId)) return false;
+        const mutex = accountMutexes.get(accountId);
+        return mutex?.isIdle() && !isAccountServingStream(accountId);
+      }),
+    ).map((accountId) => ({
+      accountId,
+      mutex: accountMutexes.get(accountId),
+      lastActivity: lastAccountActivity.get(accountId) ?? 0,
+    }));
+
+    for (const candidate of candidates) {
+      if (accountPages.size <= max) break;
       if (isAccountServingStream(candidate.accountId)) continue;
-      await closePlaywrightForAccountLocked(candidate.accountId);
-      closed++;
-    } catch (error) {
-      console.warn(
-        `[Playwright] Failed to evict idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
-      );
-    } finally {
-      release();
+      const mutex = accountMutexes.get(candidate.accountId);
+      if (!mutex?.isIdle()) continue;
+
+      const release = await acquireAccountMutex(
+        candidate.accountId,
+        `idle-evict:${candidate.accountId.substring(0, 12)}`,
+      ).catch(() => null);
+      if (!release) continue;
+      try {
+        if (isAccountServingStream(candidate.accountId)) continue;
+        await closePlaywrightForAccountLocked(candidate.accountId);
+        closed++;
+      } catch (error) {
+        console.warn(
+          `[Playwright] Failed to evict idle context for ${candidate.accountId}: ${getErrorMessage(error)}`,
+        );
+      } finally {
+        release();
+      }
     }
   }
 
@@ -3685,6 +4609,9 @@ function cleanupPlaywrightAccountState(accountId: string): void {
   cookieCaches.delete(accountId);
   lastAccountActivity.delete(accountId);
   lastKeepAliveNavigation.delete(accountId);
+  // The context (and any in-flight reservation) is gone: free the hard-cap
+  // slot so a queued launch waiting in acquireContextAdmission can proceed.
+  releaseContextAdmission(accountId);
   clearFingerprintCache(accountId);
   // The account's context died/closed — its captured headers are stale or the
   // page is gone, so it must not be selected by the rotation gate until a
@@ -3702,6 +4629,33 @@ async function closePlaywrightContextBestEffort(
   context: BrowserContext,
   options?: { skipStorageSave?: boolean },
 ): Promise<void> {
+  // Overall bound for the WHOLE close (storage save + unroute + page closes +
+  // context.close): each step had its own limit but nothing bounded the
+  // sequence, so one wedged step kept closeAllPlaywright hanging while the
+  // browser held its RSS. On timeout the close escalates to a process kill
+  // instead of being abandoned with the browser still resident.
+  const overallMs = config.playwright.contextCloseTimeoutMs + 5_000;
+  try {
+    await withTimeout(
+      closePlaywrightContextBestEffortInner(accountId, context, options),
+      overallMs,
+      `Bounded close of Playwright context for ${accountId} exceeded ${overallMs}ms`,
+    );
+  } catch (error) {
+    if (isPlaywrightAlreadyClosedError(error)) return;
+    console.warn(
+      `[Playwright] Failed to close context for ${accountId}: ${getErrorMessage(error)}`,
+    );
+    metrics.increment("browser.close.escalated");
+    await escalateContextCloseToProcessKill(accountId, context);
+  }
+}
+
+async function closePlaywrightContextBestEffortInner(
+  accountId: string,
+  context: BrowserContext,
+  options?: { skipStorageSave?: boolean },
+): Promise<void> {
   if (!options?.skipStorageSave) {
     try {
       if (await hasValidAuthCookie(context)) {
@@ -3710,47 +4664,70 @@ async function closePlaywrightContextBestEffort(
     } catch {}
   }
 
-  try {
-    const pages = context.pages();
-    for (const page of pages) {
-      if (!page.isClosed()) {
-        await (page as any).unrouteAll?.({ behavior: "ignoreErrors" }).catch((error: unknown) => {
-          logger.warn("[Playwright] unrouteAll suppressed", {
-            accountId,
-            error: error instanceof Error ? error.message : String(error),
-          });
-          metrics.increment("browser.close.suppressed_errors");
+  const pages = context.pages();
+  for (const page of pages) {
+    if (!page.isClosed()) {
+      await (page as any).unrouteAll?.({ behavior: "ignoreErrors" }).catch((error: unknown) => {
+        logger.warn("[Playwright] unrouteAll suppressed", {
+          accountId,
+          error: error instanceof Error ? error.message : String(error),
         });
-      }
-    }
-    await Promise.all(
-      pages.map((page) =>
-        withTimeout(
-          page.close({ runBeforeUnload: false }),
-          2_000,
-          `Timed out closing page for ${accountId}`,
-        ).catch((error: unknown) => {
-          logger.warn("[Playwright] page close suppressed", {
-            accountId,
-            error: error instanceof Error ? error.message : String(error),
-          });
-          metrics.increment("browser.close.suppressed_errors");
-        }),
-      ),
-    );
-
-    await withTimeout(
-      context.close(),
-      config.playwright.contextCloseTimeoutMs,
-      `Timed out closing Playwright context for ${accountId}`,
-    );
-  } catch (error) {
-    if (!isPlaywrightAlreadyClosedError(error)) {
-      console.warn(
-        `[Playwright] Failed to close context for ${accountId}: ${getErrorMessage(error)}`,
-      );
+        metrics.increment("browser.close.suppressed_errors");
+      });
     }
   }
+  await Promise.all(
+    pages.map((page) =>
+      withTimeout(
+        page.close({ runBeforeUnload: false }),
+        2_000,
+        `Timed out closing page for ${accountId}`,
+      ).catch((error: unknown) => {
+        logger.warn("[Playwright] page close suppressed", {
+          accountId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        metrics.increment("browser.close.suppressed_errors");
+      }),
+    ),
+  );
+
+  await withTimeout(
+    context.close(),
+    config.playwright.contextCloseTimeoutMs,
+    `Timed out closing Playwright context for ${accountId}`,
+  );
+}
+
+/**
+ * The context could not be closed cleanly: fall back to killing the browser
+ * processes of this account's profile so a hung `context.close()` can never
+ * leave a Chromium resident (it would otherwise keep ~400 MB until the next
+ * startup reap).
+ */
+async function escalateContextCloseToProcessKill(
+  accountId: string,
+  context: BrowserContext,
+): Promise<void> {
+  let killed = 0;
+  try {
+    const browserProcess = getBrowserProcess(context) as
+      | (KillableProcess & { pid?: number })
+      | null;
+    if (browserProcess?.pid && killBrowserProcessTree(browserProcess.pid)) {
+      killed++;
+    } else {
+      browserProcess?.kill("SIGKILL");
+    }
+  } catch {}
+  try {
+    killed += await killBrowserProcessesForProfile(
+      getAccountProfilePath(accountId),
+    );
+  } catch {}
+  console.warn(
+    `[Playwright] Escalated close for ${accountId}: ${killed} browser process(es) killed`,
+  );
 }
 
 async function closePlaywrightForAccountLocked(
@@ -3851,6 +4828,16 @@ export async function closeAllPlaywright(): Promise<void> {
         metrics.increment("browser.close.suppressed_errors");
       });
       sharedBrowser = null;
+    }
+    // Last line of defence for shutdown: any browser child this process still
+    // owns (a close that escalated, a renderer Playwright does not track) is
+    // killed here so the process can exit without leaving RSS behind. The
+    // exit-hook killer covers process.exit()/crash paths as well.
+    const stragglers = killChildBrowserProcessesSync();
+    if (stragglers > 0) {
+      console.warn(
+        `[Playwright] Shutdown killed ${stragglers} remaining browser process(es)`,
+      );
     }
   } finally {
     closingAllPlaywright = false;

@@ -579,6 +579,7 @@ export function buildCapturedQwenHeaders(
     secChUaMobile: headers["sec-ch-ua-mobile"] || undefined,
     secChUaPlatform: headers["sec-ch-ua-platform"] || undefined,
     version: headers["version"] || undefined,
+    authorization: headers["authorization"] || undefined,
     chatSessionId: options.chatSessionId,
     extra: {
       ...(options.referer ? { Referer: options.referer } : {}),
@@ -841,6 +842,7 @@ function getBrowserFetchHeaders(
 ): Record<string, string> {
   const browserAllowedHeaders = new Set([
     "accept",
+    "authorization",
     "content-type",
     "bx-ua",
     "bx-umidtoken",
@@ -863,6 +865,7 @@ interface BrowserTextResponse {
   status: number;
   contentType: string;
   raw: string;
+  diag?: Record<string, unknown>;
 }
 
 export async function requestQwenTextInBrowser(
@@ -909,8 +912,15 @@ export async function requestQwenTextInBrowser(
     browserHeaders["Content-Type"] = "application/json";
   }
 
-  const evaluateRequest = (page: Page) =>
-    page.evaluate(
+  /**
+   * Rejection diagnostics. Deliberately ONE read-only follow-up probe
+   * (GET /api/v1/auths/) plus the stored token metadata: replaying the failing
+   * POST with header variants is what the WAF counts as bot traffic and turns
+   * a 401 into a full challenge (_____tmd_____/punish), which is how the
+   * diagnosis itself used to poison the session.
+   */
+  const evaluateRequest = async (page: Page): Promise<BrowserTextResponse> => {
+    const result = await page.evaluate(
       async ({ url, method, headers, body, referrer }: {
         url: string;
         method: "GET" | "POST" | "DELETE";
@@ -925,11 +935,60 @@ export async function requestQwenTextInBrowser(
           body,
           ...(referrer ? { referrer } : {}),
         });
-        return {
+        const raw = await response.text();
+        const out: BrowserTextResponse = {
           status: response.status,
           contentType: response.headers.get("content-type") || "",
-          raw: await response.text(),
+          raw,
         };
+        const rejected =
+          response.status === 401 ||
+          response.status === 403 ||
+          /"code"\s*:\s*"unauthorized"|"code"\s*:\s*"Unauthorized"|401 Unauthorized/i.test(
+            raw,
+          );
+        if (rejected) {
+          const diag: Record<string, unknown> = {
+            href: location.href,
+            origin: location.origin,
+          };
+          try {
+            const probe = await fetch("/api/v1/auths/", {
+              method: "GET",
+              credentials: "include",
+            });
+            diag.authsStatus = probe.status;
+            diag.authsBody = (await probe.text()).slice(0, 200);
+          } catch (probeError) {
+            diag.authsErr = String(probeError);
+          }
+          try {
+            const stored = localStorage.getItem("token");
+            if (!stored) {
+              diag.storedToken = null;
+            } else {
+              const part = stored.split(".")[1];
+              // Runs in the page, not Node: no Buffer there.
+              const parsed = part
+                ? JSON.parse(
+                    atob(part.replace(/-/g, "+").replace(/_/g, "/")),
+                  )
+                : null;
+              diag.storedToken = {
+                len: stored.length,
+                exp: parsed?.exp ?? null,
+                inMin:
+                  typeof parsed?.exp === "number"
+                    ? Math.round((parsed.exp * 1000 - Date.now()) / 60000)
+                    : null,
+              };
+            }
+          } catch (tokenError) {
+            diag.storedTokenErr = String(tokenError);
+          }
+          out.diag = diag;
+        }
+        return out;
       },
       {
         url,
@@ -939,6 +998,21 @@ export async function requestQwenTextInBrowser(
         referrer: options.referrer,
       },
     );
+    if (result.diag) {
+      logger.warn("[Qwen] Upstream rejected request", {
+        accountId,
+        path,
+        method,
+        status: result.status,
+        authorizationSent: Boolean(browserHeaders["authorization"]),
+        sourceSent: Boolean(browserHeaders["source"]),
+        headerKeys: Object.keys(browserHeaders),
+        raw: result.raw.slice(0, 300),
+        diag: result.diag,
+      });
+    }
+    return result;
+  };
   const recoverOnTimeout = !options.noMutexRecovery;
   // Settings and personalization requests run as same-origin in-browser fetch
   // with appropriate Referer, keeping the page on the stable chat UI without

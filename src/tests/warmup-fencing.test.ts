@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { ReadinessController } from "../runtime/readiness/readiness-controller.ts";
 import type { IAccountOwnership } from "../runtime/contracts.ts";
+import type { AccountStatus } from "../domain/types.ts";
 
 const wait = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -24,10 +25,13 @@ function makeOwnership(): {
       cooldown: 0,
       failed: 0,
     }),
-    listAccountsByStatus: () => ["acc1"],
+    listAccountsByStatus: (status: AccountStatus) =>
+      status === "STANDBY" ? ["acc1"] : [],
     recoverAccount: async (accountId: string, reason: string) => {
       recoverCalls.push({ accountId, reason });
     },
+    reapExpiredCooldowns: () => 0,
+    isCoolingDown: () => false,
   } as unknown as IAccountOwnership;
   return { ownership, recoverCalls };
 }

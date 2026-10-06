@@ -42,17 +42,7 @@ export class Mutex {
     // stuck browser op releases the account back to the pool faster.
     const holdLimitMs = this.maxHoldMs;
     if (this.locked && Date.now() - this.lockedAt > holdLimitMs) {
-      const heldFor = Date.now() - this.lockedAt;
-      logger.warn(
-        `[Mutex:${this.name}] Force-releasing stale lock | heldBy=${this.lockedByKey} | heldFor=${heldFor}ms | limit=${holdLimitMs}ms`,
-      );
-      // Bump the generation so the old token becomes invalid — a stale
-      // owner's later release() cannot touch the new owner's lock.
-      this.generation++;
-      this.currentToken = null;
-      this.locked = false;
-      this.lockedAt = 0;
-      this.lockedByKey = "";
+      this.forceRelease(`hold-limit ${holdLimitMs}ms`);
     }
 
     if (!this.locked) {
@@ -97,6 +87,47 @@ export class Mutex {
       }, timeoutMs);
       this.queue.push({ waiter, enqueuedAt, key: logKey });
     });
+  }
+
+  /**
+   * Force-release the lock no matter who holds it.
+   *
+   * Used by stuck-holder recovery (a holder that no longer has a live promise
+   * behind it — a wedged browser op, an init whose context died). Unlike a
+   * plain `release()`, this:
+   *
+   *  - bumps the generation, so the previous owner's late `release()` becomes
+   *    a fenced no-op instead of corrupting the next owner's lock;
+   *  - hands the lock to the OLDEST waiter (or unlocks), so queued acquirers
+   *    are served immediately instead of timing out one at a time.
+   *
+   * Returns what was reclaimed so callers can log/report it.
+   */
+  forceRelease(
+    reason = "forced",
+  ): { released: boolean; heldBy: string; heldMs: number; handedTo: string | null } {
+    if (!this.locked) {
+      return { released: false, heldBy: "", heldMs: 0, handedTo: null };
+    }
+    const heldBy = this.lockedByKey;
+    const heldMs = Date.now() - this.lockedAt;
+    logger.warn(
+      `[Mutex:${this.name}] Force-releasing lock | heldBy=${heldBy || "unknown"} | heldFor=${heldMs}ms | reason=${reason}`,
+    );
+    // Invalidate the current owner's token BEFORE handing the lock over.
+    this.generation++;
+    this.currentToken = null;
+
+    const next = this.queue.shift();
+    if (next) {
+      // `locked` is still true here; waiter() re-stamps holder + token.
+      next.waiter();
+      return { released: true, heldBy, heldMs, handedTo: next.key };
+    }
+    this.locked = false;
+    this.lockedAt = 0;
+    this.lockedByKey = "";
+    return { released: true, heldBy, heldMs, handedTo: null };
   }
 
   async withLock<T>(fn: () => Promise<T> | T, timeoutMs?: number): Promise<T> {

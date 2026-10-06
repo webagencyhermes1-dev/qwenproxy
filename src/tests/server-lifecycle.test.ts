@@ -13,7 +13,7 @@ function isPortAvailable(port: number): Promise<boolean> {
     server.once("listening", () => {
       server.close(() => resolve(true));
     });
-    server.listen(port, "0.0.0.0");
+    server.listen(port, config.server.host);
   });
 }
 

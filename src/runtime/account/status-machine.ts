@@ -7,7 +7,13 @@ import type { AccountStatus } from "../../domain/types.ts";
  */
 const TRANSITIONS: Readonly<Record<AccountStatus, readonly AccountStatus[]>> = {
   DISABLED: ["STANDBY"],
-  STANDBY: ["WARMING", "DISABLED"],
+  // STANDBY → FAILED ("warmup-exhausted"): a candidate that ran out of warmup
+  // attempts WITHOUT ever reaching READY must land in a terminal bucket the
+  // pool snapshot already reports (ACCOUNT_TERMINAL_STATES). Without this edge
+  // `recoverAccount(id, "warmup-exhausted")` fell back to RECOVERING, which the
+  // controller re-launches — the account then cycled warmup → exhaustion →
+  // recovery → warmup forever instead of surfacing as failed.
+  STANDBY: ["WARMING", "FAILED", "DISABLED"],
   WARMING: ["READY", "FAILED", "COOLDOWN", "DISABLED"],
   READY: ["RESERVED", "RECOVERING", "DRAINING", "COOLDOWN", "FAILED", "DISABLED"],
   RESERVED: ["GENERATING", "READY", "RECOVERING", "DRAINING", "FAILED", "DISABLED"],

@@ -7,10 +7,18 @@ import {
 import { v4 as uuidv4 } from "uuid";
 import { ValidationError, ServiceUnavailable } from "../core/errors.js";
 import { sendOpenAIError } from "../api/error-helpers.js";
+import { withDeadline } from "../api/fail-fast.ts";
 import { buildQwenRequestHeaders } from "../services/qwen-headers.ts";
 import { qwenUrl } from "../services/qwen-url.ts";
 import { config } from "../core/config.ts";
 import { fetchUserMedia } from "../utils/egress.ts";
+
+/**
+ * Header acquisition goes through the per-account Playwright mutex, which
+ * warmup may hold for minutes. Bound it so an upload fails fast with the
+ * existing 503 path instead of hanging on a 60s mutex acquire timeout.
+ */
+const UPLOAD_HEADER_FETCH_BUDGET_MS = 3_000;
 
 // Cache the heavy ali-oss module so we import it once, not on every upload.
 let cachedOSSModule: any = null;
@@ -518,8 +526,11 @@ export async function uploadFile(c: Context) {
 
     let headers: Record<string, string>;
     try {
-      const { cookie, userAgent, bxV, bxUa, bxUmidtoken } =
-        await getBasicHeaders();
+      const { cookie, userAgent, bxV, bxUa, bxUmidtoken } = await withDeadline(
+        "upload headers",
+        UPLOAD_HEADER_FETCH_BUDGET_MS,
+        () => getBasicHeaders(),
+      );
       headers = {
         cookie,
         "user-agent": userAgent,

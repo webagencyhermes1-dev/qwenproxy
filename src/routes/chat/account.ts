@@ -130,18 +130,21 @@ import type { Message } from "../../utils/types.ts";
 import type { FunctionToolDefinition } from "../../tools/types.ts";
 import { buildRepeatedToolCallReminder } from "../../utils/tool-call-guard.ts";
 import {
- 	classifyRetryAction,
- 	isAntiBotError as isAntiBotPolicyError,
- 	isAccountInitializationError,
- 	isChatInProgressError,
- 	isQuotaLikeError,
- 	isTerminalLocalError,
- 	shouldRetryInvalidInputOnSameAccount,
+	classifyRetryAction,
+	isAntiBotError as isAntiBotPolicyError,
+	isAccountInitializationError,
+	isChatInProgressError,
+	isQuotaLikeError,
+	isPermanentUpstreamAuthError,
+	isTerminalLocalError,
+	RequestCreateBudgetError,
+	shouldRetryInvalidInputOnSameAccount,
  } from "./retry-policy.ts";
 import { getAccountOwnership, toLegacyAccountLease } from "../../runtime/account/instance.ts";
 import { acquireGenerationAccount } from "../../runtime/gateway.ts";
 import { TypedRuntimeError } from "../../domain/errors.ts";
 import type { AccountLease as DomainAccountLease } from "../../domain/types.ts";
+import { withDeadline } from "../../api/fail-fast.ts";
 
 /** How many alternate accounts a single request may try after a WAF challenge.
  * Scales with pool size (capped by maxAccountSwitches) so large pools can
@@ -241,6 +244,15 @@ export function quarantineChallengedAccountOnce(
  */
 export const PERSONALIZATION_SYNC_DEADLINE_MS = 2_000;
 export const PERSONALIZATION_LOCK_ACQUIRE_TIMEOUT_MS = 2_000;
+
+/**
+ * Budget for the per-attempt model catalog sync. The call normally hits the
+ * in-memory cache (instant); a cache miss goes through the per-account
+ * Playwright mutex, which warmup can hold for minutes — so it is raced
+ * against a short deadline and falls back to the static registry (the same
+ * path used when the fetch outright fails) instead of stalling the request.
+ */
+const MODEL_METADATA_SYNC_BUDGET_MS = 2_000;
 
 export function computePersonalizationDeadlineMs(
 	accountId?: string,
@@ -375,6 +387,20 @@ export interface RequestRetryContext {
   globalRetriesLeft: number;
   /** Number of account switches performed for this request. */
   accountSwitches: number;
+  /**
+   * Per-request CREATE deadline (epoch ms), set by the route from request
+   * arrival (CHAT_CREATE_DEADLINE_MS). Enforced by the inner create loop and
+   * the outer rotation loop; cleared after the FIRST stream is created so
+   * long generations and mid-stream failover keep their own budgets. Absent
+   * = no deadline (direct/unit call sites).
+   */
+  deadlineAt?: number;
+  /**
+   * Total create-stream attempts consumed across every retry layer of this
+   * request (inner retries + rotation + mid-stream re-acquires). Capped by
+   * config.retry.maxTotalAttempts.
+   */
+  createAttempts: number;
 }
 
 /** Create a fresh retry context for a new request. */
@@ -387,7 +413,80 @@ export function createRequestRetryContext(
     triedAccountIds: tried,
     globalRetriesLeft: config.retry.maxAttempts + config.retry.maxAccountSwitches,
     accountSwitches: 0,
+    createAttempts: 0,
   };
+}
+
+/** Milliseconds left on the per-request create deadline (null = no deadline). */
+function createBudgetRemainingMs(
+  retryContext: RequestRetryContext | undefined,
+): number | null {
+  if (!retryContext || retryContext.deadlineAt == null) return null;
+  return retryContext.deadlineAt - Date.now();
+}
+
+/**
+ * Bound a wait (retry delay, lease queue wait, acquire deadline) by the
+ * remaining create-deadline budget so a sleep/queue can never overshoot it.
+ * Returns the delay unchanged when no deadline applies.
+ */
+function capDelayByCreateBudget(
+  retryContext: RequestRetryContext | undefined,
+  delayMs: number,
+): number {
+  const remaining = createBudgetRemainingMs(retryContext);
+  if (remaining === null) return delayMs;
+  return Math.max(0, Math.min(delayMs, remaining));
+}
+
+/**
+ * Non-null when the per-request CREATE budget (wall-clock deadline or total
+ * attempt cap) is exhausted — returns the typed give-up error (and logs the
+ * give-up once) so the loop exits with a structured 503 instead of cycling.
+ */
+function createBudgetViolationError(
+  retryContext: RequestRetryContext | undefined,
+  lastError?: unknown,
+): RequestCreateBudgetError | null {
+  if (!retryContext) return null;
+  const lastMessage = lastError
+    ? lastError instanceof Error
+      ? lastError.message
+      : String(lastError)
+    : "";
+  const lastSuffix = lastMessage
+    ? ` | last error: ${lastMessage.substring(0, 200)}`
+    : "";
+  const attemptsSuffix = ` | attempts=${retryContext.createAttempts}/${config.retry.maxTotalAttempts}`;
+
+  const remaining = createBudgetRemainingMs(retryContext);
+  if (remaining !== null && remaining <= 0) {
+    const budgetMs = config.retry.createDeadlineMs;
+    const elapsed = Date.now() - (retryContext.deadlineAt! - budgetMs);
+    const message =
+      `Request create deadline exceeded (elapsed ${elapsed}ms of ${budgetMs}ms budget); ` +
+      `giving up instead of retrying${attemptsSuffix}${lastSuffix}`;
+    console.error(
+      `⛔ [Chat] Request gave up | reason=request_deadline_exceeded | elapsed=${elapsed}ms | budget=${budgetMs}ms${attemptsSuffix}${lastSuffix}`,
+    );
+    return new RequestCreateBudgetError(message, "request_deadline_exceeded");
+  }
+
+  if (retryContext.createAttempts >= config.retry.maxTotalAttempts) {
+    const message =
+      `Request create attempt budget exhausted ` +
+      `(${retryContext.createAttempts}/${config.retry.maxTotalAttempts} attempts across all retry layers); ` +
+      `giving up instead of retrying${lastSuffix}`;
+    console.error(
+      `⛔ [Chat] Request gave up | reason=request_attempt_budget_exhausted${attemptsSuffix}${lastSuffix}`,
+    );
+    return new RequestCreateBudgetError(
+      message,
+      "request_attempt_budget_exhausted",
+    );
+  }
+
+  return null;
 }
 
 export interface AcquireParams {
@@ -895,6 +994,17 @@ export async function acquireUpstreamStream(
 	let antiBotRotations = 0;
 
 	while (account) {
+		// Per-request CREATE budget: never start another rotation round once
+		// the wall-clock deadline or total attempt cap is spent (covers rounds
+		// begun before expiry and early inner returns such as quota/anti-bot).
+		const budgetViolation = createBudgetViolationError(
+			params.retryContext,
+			lastError ?? undefined,
+		);
+		if (budgetViolation) {
+			lastError = budgetViolation;
+			break;
+		}
 		const accountId = account.id;
 		const accountEmail = maskEmail(account.email);
 
@@ -1087,6 +1197,7 @@ export async function acquireUpstreamStream(
 					parallelEscape: params.parallelEscape,
 					chatMode,
 					ownershipLease: ownershipLease ?? undefined,
+					retryContext: params.retryContext,
 				},
 				accountId,
 				accountEmail,
@@ -1160,6 +1271,19 @@ export async function acquireUpstreamStream(
 		// account; rotating accounts only repeats the same 400 response and can
 		// also rebuild the full history several times.
 		if (isTerminalLocalError(lastError)) {
+			break;
+		}
+
+		// Hard upstream credential rejection: every account would get the same
+		// 401, so rotating only produced the endless
+		// "No other account available after upstream_error" cycle. Fail fast
+		// with the structured upstream error (classified reason upstream_unauthorized).
+		if (isPermanentUpstreamAuthError(lastError)) {
+			console.error(
+				`⛔ [Chat] Upstream credentials rejected | reason=upstream_unauthorized | account=${accountEmail} | giving up (no rotation) | error=${String(
+					(lastError as Error)?.message ?? lastError,
+				).substring(0, 200)}`,
+			);
 			break;
 		}
 
@@ -1295,6 +1419,27 @@ export async function acquireUpstreamStream(
 		}
 
 		account = pickNextHotCandidate(triedAccountIds);
+	}
+
+	// The loop can exit with the create budget already spent (the last attempt
+	// died on the capped acquire deadline, ran out of accounts, or the top-of-
+	// loop check tripped). Whatever that last attempt threw, the operationally
+	// true answer for the client is "we gave up after Nms / X attempts" — a
+	// typed 503 instead of the last internal-looking attempt error (which
+	// classifyError would map to a misleading 500). Terminal/permanent failures
+	// (validation, moderation, upstream 401) keep their own answer: they are
+	// actionable as-is and never depend on the budget.
+	const endBudgetViolation =
+		lastError && !(lastError instanceof RequestCreateBudgetError)
+			? createBudgetViolationError(params.retryContext, lastError)
+			: null;
+	if (
+		endBudgetViolation &&
+		lastError &&
+		!isTerminalLocalError(lastError) &&
+		!isPermanentUpstreamAuthError(lastError)
+	) {
+		lastError = endBudgetViolation;
 	}
 
 	// All accounts exhausted.
@@ -1495,6 +1640,17 @@ async function tryCreateStreamWithRetry(
 	const triedAccounts = new Set<string>([accountId]);
 
 	while (attemptsLeft > 0) {
+		// Per-request CREATE budget: check the wall-clock deadline and the total
+		// attempt cap BEFORE every attempt so an upstream that always rejects
+		// ends in a structured give-up instead of looping until the client
+		// times out (each retry delay below is capped by the same budget).
+		const budgetViolation = createBudgetViolationError(params.retryContext);
+		if (budgetViolation) {
+			return { success: false, error: budgetViolation };
+		}
+		if (params.retryContext) {
+			params.retryContext.createAttempts++;
+		}
 		attempt++;
 		if (attempt > 1) {
 			console.log(
@@ -1544,8 +1700,14 @@ async function tryCreateStreamWithRetry(
 			// Always sync the model catalog so the truncation and prompt-limit
 			// checks use the real context window published by Qwen, not the
 			// conservative registry fallback. The call is cached per account.
+			// The live fetch is bounded so a Playwright mutex held by warmup
+			// cannot stall the request path (falls back to the registry).
 			try {
-				await fetchQwenModels(currentAccountId);
+				await withDeadline(
+					"chat model metadata sync",
+					MODEL_METADATA_SYNC_BUDGET_MS,
+					() => fetchQwenModels(currentAccountId),
+				);
 			} catch (metadataError) {
 				logger.warn("[chat] model metadata sync unavailable; using registry fallback", {
 					model: params.contextModelId ?? params.model,
@@ -1691,10 +1853,16 @@ async function tryCreateStreamWithRetry(
 				}
 				accountLease = quick;
 			} else {
+				// Bound the queue wait by the remaining create deadline: a lease
+				// queue can wait up to queueWaitForeverCapMs (2 min), which must
+				// never outlive the per-request create budget.
 				accountLease = await acquireAccountLease(currentAccountId, {
-					timeoutMs: waitQueueForever
-						? config.concurrency.queueWaitForeverCapMs
-						: config.concurrency.busyWaitMs,
+					timeoutMs: capDelayByCreateBudget(
+						params.retryContext,
+						waitQueueForever
+							? config.concurrency.queueWaitForeverCapMs
+							: config.concurrency.busyWaitMs,
+					),
 					signal: combinedSignal,
 					label: sessionLabel,
 					leaseAbortController: leaseAbort,
@@ -1861,8 +2029,20 @@ async function tryCreateStreamWithRetry(
 			// Bound the whole acquire with a hard deadline: a silent hang in any
 			// phase (mutex wait, header capture, fetch metadata, internal retries)
 			// fails fast and retryable instead of blocking the request for minutes
-			// with zero log output.
-			const acquireDeadlineMs = config.concurrency.acquireDeadlineMs;
+			// with zero log output. Capped by the remaining per-request create
+			// deadline so one attempt can never outlive the request budget.
+			const acquireDeadlineMs = capDelayByCreateBudget(
+				params.retryContext,
+				config.concurrency.acquireDeadlineMs,
+			);
+			// When the timer is shorter than the configured acquire guard, it is
+			// the REQUEST's create budget that is about to expire, not a wedged
+			// account: the account did nothing wrong, so this abort must not be
+			// classified as an initialization failure (that would charge an
+			// AuthInitFailed cooldown and rotate away a healthy account purely
+			// because a client deadline fired).
+			const acquireDeadlineIsCreateBudget =
+				acquireDeadlineMs < config.concurrency.acquireDeadlineMs;
 			let acquireDeadlineTimer: NodeJS.Timeout | undefined;
 			const acquireDeadline = new Promise<never>((_, reject) => {
 				acquireDeadlineTimer = setTimeout(() => {
@@ -1872,9 +2052,13 @@ async function tryCreateStreamWithRetry(
 					// win the lock later and waste an upstream request.
 					acquireAbort.abort();
 					const err = new Error(
-						`Acquire deadline (${acquireDeadlineMs}ms) exceeded creating stream on ${currentAccountEmail}`,
+						acquireDeadlineIsCreateBudget
+							? `Create budget expired (acquire cut at ${acquireDeadlineMs}ms) on ${currentAccountEmail}`
+							: `Acquire deadline (${acquireDeadlineMs}ms) exceeded creating stream on ${currentAccountEmail}`,
 					) as Error & { code?: string };
-					err.code = "acquire_deadline";
+					err.code = acquireDeadlineIsCreateBudget
+						? "create_budget_deadline"
+						: "acquire_deadline";
 					reject(err);
 				}, acquireDeadlineMs);
 				acquireDeadlineTimer.unref?.();
@@ -2145,11 +2329,16 @@ async function tryCreateStreamWithRetry(
 							policy.retryAfterMs || config.retry.baseDelayMs,
 							3_000,
 						);
-						console.warn(
-							`⚠️  [Chat] Temporary upstream load shedding | ${currentAccountEmail} | retrying same account in ${delayMs}ms... (${attemptsLeft} left)`,
-						);
-						await new Promise((resolve) => setTimeout(resolve, delayMs));
-						continue;
+					console.warn(
+						`⚠️  [Chat] Temporary upstream load shedding | ${currentAccountEmail} | retrying same account in ${delayMs}ms... (${attemptsLeft} left)`,
+					);
+					await new Promise((resolve) =>
+						setTimeout(
+							resolve,
+							capDelayByCreateBudget(params.retryContext, delayMs),
+						),
+					);
+					continue;
 					}
 
 					// Do not cooldown/rotate for service-wide high demand. Mark briefly
@@ -2176,11 +2365,16 @@ async function tryCreateStreamWithRetry(
 				if (isSingleAccount && !quotaRetried && attemptsLeft > 0) {
 					quotaRetried = true;
 					const delayMs = config.retry.baseDelayMs;
-					console.warn(
-						`⚠️  [Chat] Quota exceeded | ${currentAccountEmail} | retrying in ${delayMs}ms...`,
-					);
-					await new Promise((resolve) => setTimeout(resolve, delayMs));
-					continue;
+				console.warn(
+					`⚠️  [Chat] Quota exceeded | ${currentAccountEmail} | retrying in ${delayMs}ms...`,
+				);
+				await new Promise((resolve) =>
+					setTimeout(
+						resolve,
+						capDelayByCreateBudget(params.retryContext, delayMs),
+					),
+				);
+				continue;
 				}
 
 				// Consolidate quota details into a single log emitted by the outer
@@ -2462,7 +2656,10 @@ async function tryCreateStreamWithRetry(
 				await new Promise((resolve) =>
 					setTimeout(
 						resolve,
-						Math.min(policy.retryAfterMs ?? config.retry.baseDelayMs, 1000),
+						capDelayByCreateBudget(
+							params.retryContext,
+							Math.min(policy.retryAfterMs ?? config.retry.baseDelayMs, 1000),
+						),
 					),
 				);
 				continue;
@@ -2555,6 +2752,12 @@ async function tryCreateStreamWithRetry(
 				clearAllSessionsForAccount(clearTargetId);
 			}
 
+			// Propagate every account this inner loop touched so the OUTER
+			// rotation never re-selects a lane the inner loop already exhausted
+			// (previously missing on this path: the outer loop re-walked tried
+			// accounts and kept burning attempts on them).
+			attachTriedAccountIds(err, triedAccounts);
+
 			return { success: false, error: err };
 		}
 
@@ -2583,7 +2786,9 @@ async function tryCreateStreamWithRetry(
 				`🔄 [Chat] Qwen request failed for ${failedAccountEmail}, retrying in ${useDelay}ms... (${attemptsLeft} left). reason=${policy.reason} error=${errMsg.slice(0, 200)}`,
 			);
 		}
-		await new Promise((r) => setTimeout(r, useDelay));
+		await new Promise((r) =>
+			setTimeout(r, capDelayByCreateBudget(params.retryContext, useDelay)),
+		);
 		retryDelay = Math.min(retryDelay * 2, config.retry.maxDelayMs);
 	}
 

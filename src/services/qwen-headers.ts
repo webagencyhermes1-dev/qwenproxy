@@ -48,6 +48,13 @@ export interface BuildQwenHeadersOptions {
   secChUaPlatform?: string;
   /** Real web bundle version captured from the browser request (anti-hardcoded). */
   version?: string;
+  /**
+   * Authorization bearer captured from the real client request. The API only
+   * accepts `source: "web"` together with a version when this token is sent;
+   * the pair without it is rejected with
+   * `{"code":"Unauthorized","details":"You do not have permission to access this resource"}`.
+   */
+  authorization?: string;
   extra?: Record<string, string>;
 }
 
@@ -77,7 +84,6 @@ export function buildQwenRequestHeaders(
     "User-Agent": opts.userAgent || getDefaultQwenUserAgent(),
     "X-Request-Id": uuidv4(),
     "bx-v": opts.bxV || "2.5.37",
-    source: "web",
     version: opts.version || getQwenWebVersion(),
     timezone: opts.extra?.timezone || new Date().toString().split(" (")[0],
     // Use the real browser client-hints when captured (anti-hardcoded); fall
@@ -88,6 +94,15 @@ export function buildQwenRequestHeaders(
     "sec-ch-ua-mobile": opts.secChUaMobile || "?0",
     "sec-ch-ua-platform": opts.secChUaPlatform || '"Windows"',
   };
+
+  // Pair source+version with the captured Authorization token exactly like the
+  // real web client. Sending source+version WITHOUT the token is rejected by
+  // the upstream auth layer, which is why every relayed call failed with
+  // "You do not have permission to access this resource".
+  if (opts.authorization) {
+    headers["authorization"] = opts.authorization;
+    headers["source"] = "web";
+  }
 
   // The real chat.qwen.ai client sends ONLY bx-v on API requests — the WAF
   // carries bx-ua/bx-umidtoken as browser cookies, not headers. Match that

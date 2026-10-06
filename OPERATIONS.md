@@ -40,6 +40,7 @@ Grounded in `src/api/server.ts`, `src/core/config.ts`, `src/core/logger.ts`, `Do
 | Prompt > `QWEN_MAX_PROMPT_BYTES` | 400 `context_length_exceeded` (validation.ts:115-123) | summarize/trim |
 | Busy pool (slots full) | 429 fail-fast `account_busy`, no queue (account-concurrency.ts:493-499; account.ts:1325-1334) | retry shortly |
 | Warmup timeout | terminate attempt (`terminateWarmup` closes the account browser) + exponential backoff `min(500·2ⁿ⁻¹, 300000)`; ≥`POOL_MAX_WARMUP_FAILURES` → `recoverAccount("warmup-exhausted")` (readiness-controller.ts:186-229; server.ts:910-916) | wait for backoff/reconcile |
+| Pool stuck BROKEN after a systemic init outage (occluded composer, WAF change, init-deadline storm) | **automatic, no operator step.** Escalation ignores multi-account storms (`POOL_INIT_STORM_MIN_ACCOUNTS` distinct accounts inside `POOL_INIT_STORM_WINDOW_MS` → systemic, never counted per account), an init-failure BROKEN expires `POOL_BROKEN_RECOVERY_AGE_MS` after its last failure, and the reconciliation pass (startup + every `POOL_RECONCILIATION_INTERVAL_MS`) re-arms the account: counter zeroed, broken flag cleared, `FAILED` ownership requeued to `STANDBY`, controller warmup-failure record dropped — log line `🔁 [Pool] BROKEN recovery | account=… | fresh budget=…`. Permanent-auth accounts (`AuthPermanentFailure*` / `auth_failures > 0`) are skipped and stay BROKEN (account-health.ts:522, runtime/readiness/broken-recovery.ts) | watch `pool.broken` in `/health` + the recovery log line |
 
 ## 7. Log redaction
 

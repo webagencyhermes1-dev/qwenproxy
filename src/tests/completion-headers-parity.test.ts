@@ -49,3 +49,29 @@ test("completion headers: missing bx tokens stay absent (no fabrication)", async
     "no chat id means the root referer",
   );
 });
+
+test("request headers: source:web is sent only with the Authorization bearer", async () => {
+  const { buildQwenRequestHeaders } = await import("../services/qwen-headers.ts");
+  const base = {
+    cookie: "qwen_session=abc",
+    userAgent: "Mozilla/5.0 Chrome/151.0.0.0",
+    bxV: "2.5.37",
+    version: "0.2.86",
+  };
+
+  // With the captured access token the pair is legal, so it must be sent.
+  const withToken = buildQwenRequestHeaders({
+    ...base,
+    authorization: "Bearer header.access.payload",
+  });
+  assert.equal(withToken["source"], "web");
+  assert.equal(withToken["authorization"], "Bearer header.access.payload");
+  assert.equal(withToken["version"], "0.2.86");
+
+  // Without it the bare source+version pair is rejected upstream with
+  // 401 Unauthorized, so neither may go out.
+  const withoutToken = buildQwenRequestHeaders(base);
+  assert.equal(withoutToken["source"], undefined);
+  assert.equal(withoutToken["authorization"], undefined);
+  assert.equal(withoutToken["version"], "0.2.86");
+});

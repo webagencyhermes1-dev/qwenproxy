@@ -43,6 +43,76 @@ export interface AccountHealthRecord {
 /** Consecutive init failures before the account is considered BROKEN. */
 export const BROKEN_INIT_FAIL_THRESHOLD = 3;
 
+/**
+ * Prefix of the cooldown reason written by the permanent-auth init path
+ * (`isPermanentInitFailure` / `PermanentAuthError` in services/playwright.ts →
+ * `AuthPermanentFailure: ...`). It is the persisted evidence of an
+ * ACCOUNT-SPECIFIC init failure — the one class that legitimately stays
+ * BROKEN instead of being treated as a transient/systemic condition.
+ */
+export const PERMANENT_INIT_COOLDOWN_PREFIX = "AuthPermanentFailure";
+
+// ─── Systemic vs account-specific init failures ─────────────────────────────
+//
+// Escalation used to count EVERY init failure, so one systemic cause (an
+// occluded composer, a WAF change, an init-deadline storm) poisoned the whole
+// pool: `init_fail_count` is persisted, survived restarts, and nothing ever
+// cleared it — a transient pool-wide failure was recorded as a permanent
+// per-account one. Two rules keep the escalation honest:
+//
+//   1. MULTI-ACCOUNT STORMS ARE SYSTEMIC. When >= POOL_INIT_STORM_MIN_ACCOUNTS
+//      distinct accounts fail init inside POOL_INIT_STORM_WINDOW_MS the cause
+//      is the environment, not any single account: the failure still lands in
+//      the health ledger (score/counters) but does NOT increment
+//      `initFailCount`, the BROKEN escalation counter. Isolated failures still
+//      escalate exactly as before (3 in a row → BROKEN).
+//   2. PERMANENT AUTH EVIDENCE IS ACCOUNT-SPECIFIC AND STICKY. An account with
+//      `auth_failures > 0` or a persisted `AuthPermanentFailure*` cooldown
+//      always counts toward escalation (even mid-storm) and never ages out:
+//      that is the genuinely broken credential, which `isPermanentInitFailure`
+//      already models.
+//
+// Bounded recovery: an init-failure BROKEN that has been quiet for
+// POOL_BROKEN_RECOVERY_AGE_MS stops counting (see isAccountBrokenByHealth) and
+// is actively re-armed by runtime/readiness/broken-recovery.ts, so no systemic
+// era can strand an account forever. No manual step is required.
+
+function envInt(name: string, fallback: number, min: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(parsed) && parsed >= min ? parsed : fallback;
+}
+
+let initStormWindowMsCache: number | null = null;
+/** Window in which distinct-account init failures count as one systemic storm. */
+export function getInitFailureStormWindowMs(): number {
+  if (initStormWindowMsCache === null) {
+    initStormWindowMsCache = envInt("POOL_INIT_STORM_WINDOW_MS", 5 * 60_000, 1_000);
+  }
+  return initStormWindowMsCache;
+}
+
+let initStormMinAccountsCache: number | null = null;
+/** Distinct accounts failing init inside the window before it is systemic. */
+export function getInitFailureStormMinAccounts(): number {
+  if (initStormMinAccountsCache === null) {
+    initStormMinAccountsCache = envInt("POOL_INIT_STORM_MIN_ACCOUNTS", 3, 1);
+  }
+  return initStormMinAccountsCache;
+}
+
+let brokenRecoveryAgeMsCache: number | null = null;
+/**
+ * Idle age after which an init-failure BROKEN is re-armed: it stops counting
+ * at read time and the reconciliation pass zeroes the escalation counter (the
+ * account then gets a fresh, bounded number of warmup attempts).
+ */
+export function getBrokenRecoveryAgeMs(): number {
+  if (brokenRecoveryAgeMsCache === null) {
+    brokenRecoveryAgeMsCache = envInt("POOL_BROKEN_RECOVERY_AGE_MS", 60 * 60_000, 0);
+  }
+  return brokenRecoveryAgeMsCache;
+}
+
 /** Health deltas per failure kind (negative) and success (positive). */
 const DELTA: Record<AccountFailureKind, number> = {
   rate_limit: -8,
@@ -349,16 +419,149 @@ export function recordAccountFailure(
   return { ...rec };
 }
 
-/** Track repeated Playwright/session init failures (BROKEN at threshold). */
+// ─── Init-failure classification (systemic storm vs single account) ─────────
+
+interface InitFailureEvent {
+  accountId: string;
+  at: number;
+}
+
+/** Chronological ring of recent init failures across the pool (in-memory). */
+const initFailureEvents: InitFailureEvent[] = [];
+const INIT_FAILURE_EVENT_CAP = 1024;
+/** Init failures that were classified systemic (observability only, in-memory). */
+let systemicInitFailureCount = 0;
+let stormAnnounced = false;
+
+function noteInitFailureEvent(accountId: string, now: number): void {
+  initFailureEvents.push({ accountId, at: now });
+  if (initFailureEvents.length > INIT_FAILURE_EVENT_CAP) {
+    initFailureEvents.splice(0, initFailureEvents.length - INIT_FAILURE_EVENT_CAP);
+  }
+}
+
+/**
+ * True when >= getInitFailureStormMinAccounts() DISTINCT accounts failed init
+ * within the storm window — the signature of a pool-wide (systemic) cause
+ * such as an init-deadline, WAF or page-occlusion storm, as opposed to one
+ * account failing on its own.
+ */
+function isInitFailureStorm(now: number): boolean {
+  const windowMs = getInitFailureStormWindowMs();
+  const minAccounts = getInitFailureStormMinAccounts();
+  const seen = new Set<string>();
+  for (let i = initFailureEvents.length - 1; i >= 0; i--) {
+    const event = initFailureEvents[i];
+    if (now - event.at > windowMs) break; // events are chronological
+    seen.add(event.accountId);
+    if (seen.size >= minAccounts) return true;
+  }
+  return false;
+}
+
+/** Distinct accounts with an init failure inside the storm window (diagnostics). */
+export function getRecentInitFailureAccounts(now: number = Date.now()): number {
+  const windowMs = getInitFailureStormWindowMs();
+  const seen = new Set<string>();
+  for (let i = initFailureEvents.length - 1; i >= 0; i--) {
+    if (now - initFailureEvents[i].at > windowMs) break;
+    seen.add(initFailureEvents[i].accountId);
+  }
+  return seen.size;
+}
+
+/** Init failures suppressed as systemic since process start (diagnostics). */
+export function getSystemicInitFailureCount(): number {
+  return systemicInitFailureCount;
+}
+
+function readPersistedCooldownReason(accountId: string): string | null {
+  try {
+    const db = getDatabase();
+    const row = db
+      .prepare("SELECT cooldown_reason FROM accounts WHERE id = ?")
+      .get(accountId) as { cooldown_reason?: string | null } | undefined;
+    return row?.cooldown_reason ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when the account carries evidence of an ACCOUNT-SPECIFIC init failure:
+ * a permanent-auth rejection recorded in the health ledger (`auth_failures`,
+ * written by the `PermanentAuthError` path) or a persisted
+ * `AuthPermanentFailure*` cooldown. Such accounts legitimately stay BROKEN and
+ * are excluded from auto-recovery.
+ *
+ * `cooldownReason` lets callers that already hold it (reconciliation over
+ * `loadAccounts()`) skip the single-row lookup.
+ */
+export function hasPermanentInitEvidence(
+  accountId: string,
+  rec?: AccountHealthRecord,
+  cooldownReason?: string | null,
+): boolean {
+  if (!accountId || accountId === "global") return false;
+  const health = rec ?? getAccountHealth(accountId);
+  if (health.authFailures > 0) return true;
+  const reason =
+    cooldownReason !== undefined
+      ? cooldownReason
+      : readPersistedCooldownReason(accountId);
+  return typeof reason === "string" && reason.startsWith(PERMANENT_INIT_COOLDOWN_PREFIX);
+}
+
+/**
+ * Track repeated Playwright/session init failures (BROKEN at threshold).
+ *
+ * Systemic storms (>= N distinct accounts failing inside the window) are
+ * recorded in the health ledger but do NOT escalate any single account —
+ * see the classification note above. A permanent-auth account always counts.
+ */
 export function noteAccountInitFailure(accountId: string): AccountHealthRecord {
   if (!accountId || accountId === "global") {
     return defaultRecord(accountId || "global");
   }
+  const now = Date.now();
+  noteInitFailureEvent(accountId, now);
+  const stormActive = isInitFailureStorm(now);
+  if (stormActive && !stormAnnounced) {
+    stormAnnounced = true;
+    console.warn(
+      `⚠️  [Health] Systemic init-failure storm | accounts=${getRecentInitFailureAccounts(now)} within ${Math.round(getInitFailureStormWindowMs() / 1000)}s | suppressing per-account BROKEN escalation`,
+    );
+  } else if (!stormActive) {
+    stormAnnounced = false;
+  }
   const rec = getAccountHealth(accountId);
-  rec.initFailCount += 1;
-  cache.set(accountId, { ...rec });
-  markDirty(accountId);
+  const permanent = hasPermanentInitEvidence(accountId, rec);
+  if (stormActive && !permanent) {
+    systemicInitFailureCount += 1;
+  } else {
+    rec.initFailCount += 1;
+    cache.set(accountId, { ...rec });
+    markDirty(accountId);
+  }
   return recordAccountFailure(accountId, "generic");
+}
+
+/**
+ * Clear the BROKEN escalation budget for one account (bounded recovery).
+ * The account keeps its health score / failure history — only the init-fail
+ * counter that drives BROKEN is reset, so the next era starts from zero.
+ */
+export function resetInitFailureEscalation(accountId: string): AccountHealthRecord {
+  if (!accountId || accountId === "global") {
+    return defaultRecord(accountId || "global");
+  }
+  const rec = getAccountHealth(accountId);
+  if (rec.initFailCount !== 0) {
+    rec.initFailCount = 0;
+    cache.set(accountId, { ...rec });
+    markDirty(accountId);
+  }
+  return { ...rec };
 }
 
 /** A successful init/recovery clears the init-failure streak gradually. */
@@ -375,9 +578,26 @@ export function noteAccountInitSuccess(accountId: string): AccountHealthRecord {
   return recordAccountSuccess(accountId);
 }
 
-/** True when repeated init failures mark the account BROKEN. */
+/**
+ * True when repeated init failures mark the account BROKEN.
+ *
+ * Escalation holds only while it is actionable:
+ *  - permanent-auth evidence (auth ledger / `AuthPermanentFailure*` cooldown)
+ *    is account-specific → sticky, the account legitimately stays BROKEN;
+ *  - otherwise the escalation expires POOL_BROKEN_RECOVERY_AGE_MS after the
+ *    last failure, so failures produced by a since-fixed systemic cause cannot
+ *    strand an account forever (the reconciliation pass then zeroes the
+ *    counter and re-arms the account with a fresh bounded attempt budget).
+ */
 export function isAccountBrokenByHealth(accountId: string): boolean {
-  return getAccountHealth(accountId).initFailCount >= BROKEN_INIT_FAIL_THRESHOLD;
+  const rec = getAccountHealth(accountId);
+  if (rec.initFailCount < BROKEN_INIT_FAIL_THRESHOLD) return false;
+  if (rec.authFailures > 0) return true;
+  const now = Date.now();
+  const lastFailureAt = rec.lastFailureAt;
+  if (lastFailureAt == null) return true; // counter without a timestamp: let recovery inspect it
+  if (now - lastFailureAt <= getBrokenRecoveryAgeMs()) return true;
+  return hasPermanentInitEvidence(accountId, rec);
 }
 
 /** Aggregate pool success/failure/latency for observability. */
@@ -422,6 +642,9 @@ export function resetAccountHealthForTests(): void {
   cache.clear();
   dirty.clear();
   rollingEvents.clear();
+  initFailureEvents.length = 0;
+  systemicInitFailureCount = 0;
+  stormAnnounced = false;
 }
 
 // ─── TTFB Tracking (Cycle 2) ─────────────────────────────────────────────────

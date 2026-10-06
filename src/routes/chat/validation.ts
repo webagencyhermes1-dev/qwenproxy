@@ -11,6 +11,7 @@ import { processImagesForQwen } from "../upload.ts";
 import { logger, isToolcallDebugEnabled } from "../../core/logger.js";
 import { config } from "../../core/config.ts";
 import { getBasicHeaders } from "../../services/auth-playwright.ts";
+import { withDeadline } from "../../api/fail-fast.ts";
 import { buildToolInstructions } from "../../tools/instructions.ts";
 import {
   mapClientModelToQwen,
@@ -25,6 +26,14 @@ import {
 
 import { TOOL_CALL_OPEN, TOOL_CALL_CLOSE } from "../../tools/toolcall-tags.ts";
 import { robustParseJSON } from "../../utils/json.ts";
+
+/**
+ * Header acquisition for media preprocessing goes through the per-account
+ * Playwright mutex, which warmup may hold for minutes. Bound it so a stuck
+ * account degrades to text-only processing after a short wait instead of
+ * stalling the whole request behind a 60s mutex acquire timeout.
+ */
+const MEDIA_HEADER_FETCH_BUDGET_MS = 3_000;
 
 export interface ParsedRequest {
   body: OpenAIRequest;
@@ -240,7 +249,11 @@ async function buildPromptFromMessages(
         try {
           if (!uploadHeaders) {
             const { cookie, userAgent, bxV, bxUa, bxUmidtoken } =
-              await getBasicHeaders();
+              await withDeadline(
+                "media upload headers",
+                MEDIA_HEADER_FETCH_BUDGET_MS,
+                () => getBasicHeaders(),
+              );
             uploadHeaders = {
               cookie,
               "user-agent": userAgent,

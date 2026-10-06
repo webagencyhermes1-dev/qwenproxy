@@ -1,3 +1,5 @@
+import "dotenv/config";
+
 import os from "os";
 import path from "path";
 import { z } from "zod";
@@ -46,13 +48,15 @@ const envSchema = z
     PLAYWRIGHT_IDLE_CONTEXT_TTL_MS: z.string().default("60000"),
     PLAYWRIGHT_JS_HEAP_MB: z.string().default("256"),
     PLAYWRIGHT_LOW_MEMORY_FLAGS: z.string().default("true"),
-    // Keep 2 warm contexts by default ({main + reserve} covers the common
-    // failover hop without opening one browser per account): after warmup two
-    // browsers stay open; any extra context (simultaneous use / failover) is
-    // closed once idle. The cap only evicts IDLE contexts — busy mutexes and
-    // active streams are never touched, so concurrent accounts each keep their
-    // own context while serving. Accounts in cooldown (rate-limited) sit idle,
-    // drop out of the warm set and get evicted.
+    // HARD ceiling on simultaneously open per-account persistent contexts
+    // (~400 MB each on a 16 GB host: main + renderer processes). Enforced at
+    // LAUNCH time (an account cannot open a context while the cap is reached —
+    // see acquireContextAdmission in services/playwright.ts) and again by idle
+    // eviction, so it holds even while every open context is busy. 0 disables
+    // the ceiling (not recommended: the pool then only closes contexts by TTL).
+    // Default 25 = absolute backstop for large hosts; the steady-state number
+    // of open contexts is governed by POOL_TARGET_READY, which is clamped to
+    // min(target, cap) below.
     PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("25"),
 
     // Bounds how many per-account Chromium contexts may be launching and
@@ -61,7 +65,9 @@ const envSchema = z
     // initialize at once forks N renderers off the same host and the OOM/crash
     // cascade is what kills sibling contexts. 5 is a safe ceiling: an account
     // init spends ~15-20s, so at 5 that is ~4 accounts per minute booting.
-    PLAYWRIGHT_MAX_PARALLEL_INIT: z.string().default("20"),
+    // Never larger than PLAYWRIGHT_MAX_ACTIVE_CONTEXTS (clamped below): an init
+    // that cannot get a context slot would only queue behind the cap anyway.
+    PLAYWRIGHT_MAX_PARALLEL_INIT: z.string().default("5"),
     // DNS bypass for the Qwen origin inside Chromium. Chromium's own DNS/DoH
     // resolution occasionally lands on a frontier/bad IP for chat.qwen.ai,
     // which makes navigations fail (net::ERR_NAME_NOT_RESOLVED) or land on a
@@ -124,6 +130,17 @@ const envSchema = z
     RETRY_ON_UNKNOWN_UPSTREAM: z.string().default("true"),
     RETRY_AUTO_MALFORMED_TOOLS: z.string().default("true"),
     RETRY_AUTO_MALFORMED_TOOLS_MAX: z.string().default("2"),
+    // Per-request wall-clock budget for the CREATE phase (arrival -> first
+    // upstream stream). An upstream that always rejects must surface a
+    // structured error within this budget instead of looping until the client
+    // times out. 12s keeps the give-up response under the 15s SLO.
+    CHAT_CREATE_DEADLINE_MS: z.string().default("12000"),
+    // Hard cap on TOTAL create-stream attempts across every retry layer of one
+    // request (inner per-account retries + outer rotation + mid-stream
+    // re-acquires). Independent of RETRY_MAX_ATTEMPTS, which is per layer.
+    // Default 8 exactly covers the chat_in_progress sequence (6 settle retries
+    // + 1 escalation + 1 failed escalation) and a full 6+2 reserve pool walk.
+    RETRY_MAX_TOTAL_ATTEMPTS: z.string().default("8"),
     MAX_TOOL_CALLS_PER_TURN: z.string().default("24"),
     QWEN_REPEATED_TOOL_CALL_WARN: z.string().default("2"),
     ACCOUNT_MAX_CONCURRENT_STREAMS: z.string().default("2"),
@@ -169,9 +186,20 @@ const envSchema = z
     CHAT_IN_PROGRESS_MAX_RETRIES: z.string().default("6"),
     MID_STREAM_FAILOVER_THRESHOLD: z.string().default("2"),
     MID_STREAM_FAILOVER_BUSY_MS: z.string().default("60000"),
-    POOL_TARGET_READY: z.string().default("20"),
-    POOL_RESERVE_READY: z.string().default("5"),
-    POOL_WARMUP_CONCURRENCY: z.string().default("20"),
+    // Desired number of READY (headers-captured, warm) accounts. Every READY
+    // account owns one open browser context, so this — not the hard cap — is
+    // what sets the steady-state memory of the pool. 6 ready contexts ≈ 2.4 GB
+    // at the measured ~400 MB/context, which is what a 16 GB host can spare.
+    // Clamped to min(target, PLAYWRIGHT_MAX_ACTIVE_CONTEXTS) below: a target
+    // above the cap can never be satisfied and would spin warmup forever.
+    POOL_TARGET_READY: z.string().default("6"),
+    // Extra READY accounts kept beyond the target for failover headroom.
+    POOL_RESERVE_READY: z.string().default("2"),
+    // How many warmups may run at once. Each warmup launches its own browser,
+    // so this is bounded by the target (deficit can never exceed it) and by the
+    // context cap; 4 keeps a full warm-up at ~4 accounts / 15-20s ≈ 12-16
+    // accounts per minute without forking 20 Chromiums at once.
+    POOL_WARMUP_CONCURRENCY: z.string().default("4"),
     POOL_RECONCILIATION_INTERVAL_MS: z.string().default("30000"),
     POOL_WARMUP_TIMEOUT_MS: z.string().default("90000"),
     POOL_MAX_WARMUP_FAILURES: z.string().default("3"),
@@ -231,6 +259,81 @@ const envSchema = z
 
 const env = envSchema.parse(process.env);
 
+// ─── Browser-context budget reconciliation ────────────────────────────────────
+// The four knobs below describe ONE resource (open Chromium contexts) and used
+// to be able to contradict each other: a stock .env with
+// PLAYWRIGHT_MAX_ACTIVE_CONTEXTS=1 while POOL_TARGET_READY defaulted to 20
+// meant readiness could never be satisfied, and warmup kept launching anyway.
+//
+// Policy (documented here because every consumer reads the clamped values):
+//   * PLAYWRIGHT_MAX_ACTIVE_CONTEXTS is a HARD ceiling on open contexts
+//     (0 = unlimited). It is enforced at launch time, not only by eviction.
+//   * effective target      = min(POOL_TARGET_READY, cap)   — readiness that
+//     cannot exceed the ceiling, otherwise warmup loops forever.
+//   * warmup concurrency    = min(POOL_WARMUP_CONCURRENCY, target, cap) — a
+//     warmup burst can never queue more launches than there are slots.
+//   * parallel init         = min(PLAYWRIGHT_MAX_PARALLEL_INIT, cap).
+//   * reserve               = min(POOL_RESERVE_READY, target).
+// Any clamp that actually reduces a value prints a startup warning, so an
+// incoherent .env is loud instead of silently starving the pool.
+function parseEnvInt(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const contextCap = Math.max(0, parseEnvInt(env.PLAYWRIGHT_MAX_ACTIVE_CONTEXTS, 25));
+const configuredTargetReady = Math.max(1, parseEnvInt(env.POOL_TARGET_READY, 6));
+const configuredReserveReady = Math.max(0, parseEnvInt(env.POOL_RESERVE_READY, 2));
+const configuredWarmupConcurrency = Math.max(
+  1,
+  parseEnvInt(env.POOL_WARMUP_CONCURRENCY, 4),
+);
+const configuredParallelInit = Math.max(
+  1,
+  parseEnvInt(env.PLAYWRIGHT_MAX_PARALLEL_INIT, 5),
+);
+
+const effectiveTargetReady =
+  contextCap > 0 ? Math.min(configuredTargetReady, contextCap) : configuredTargetReady;
+const effectiveReserveReady = Math.min(configuredReserveReady, effectiveTargetReady);
+const effectiveWarmupConcurrency = Math.max(
+  1,
+  Math.min(
+    configuredWarmupConcurrency,
+    effectiveTargetReady,
+    contextCap > 0 ? contextCap : configuredWarmupConcurrency,
+  ),
+);
+const effectiveParallelInit =
+  contextCap > 0 ? Math.min(configuredParallelInit, contextCap) : configuredParallelInit;
+
+const configWarnings: string[] = [];
+if (effectiveTargetReady < configuredTargetReady) {
+  configWarnings.push(
+    `POOL_TARGET_READY=${configuredTargetReady} exceeds PLAYWRIGHT_MAX_ACTIVE_CONTEXTS=${contextCap}: readiness can never be satisfied above the ceiling, using effective target ${effectiveTargetReady} (min(target, cap))`,
+  );
+}
+if (effectiveWarmupConcurrency < configuredWarmupConcurrency) {
+  configWarnings.push(
+    `POOL_WARMUP_CONCURRENCY=${configuredWarmupConcurrency} reduced to ${effectiveWarmupConcurrency} (cannot warm more accounts than the effective target ${effectiveTargetReady} / cap ${contextCap})`,
+  );
+}
+if (effectiveParallelInit < configuredParallelInit) {
+  configWarnings.push(
+    `PLAYWRIGHT_MAX_PARALLEL_INIT=${configuredParallelInit} reduced to ${effectiveParallelInit} (cannot initialize more contexts than PLAYWRIGHT_MAX_ACTIVE_CONTEXTS=${contextCap})`,
+  );
+}
+if (effectiveReserveReady < configuredReserveReady) {
+  configWarnings.push(
+    `POOL_RESERVE_READY=${configuredReserveReady} reduced to ${effectiveReserveReady} (reserve must fit in the effective target ${effectiveTargetReady})`,
+  );
+}
+if (configWarnings.length > 0) {
+  for (const warning of configWarnings) {
+    console.warn(`⚠️  [Config] ${warning}`);
+  }
+}
+
 export const config = {
   server: {
     port: parseInt(env.PORT),
@@ -265,8 +368,8 @@ export const config = {
     idleContextTtlMs: Math.max(0, parseInt(env.PLAYWRIGHT_IDLE_CONTEXT_TTL_MS)),
     jsHeapMb: Math.max(64, parseInt(env.PLAYWRIGHT_JS_HEAP_MB)),
     lowMemoryFlags: env.PLAYWRIGHT_LOW_MEMORY_FLAGS !== "false",
-    maxActiveContexts: Math.max(0, parseInt(env.PLAYWRIGHT_MAX_ACTIVE_CONTEXTS)),
-    maxParallelInit: Math.max(1, parseInt(env.PLAYWRIGHT_MAX_PARALLEL_INIT)),
+    maxActiveContexts: contextCap,
+    maxParallelInit: effectiveParallelInit,
     hostResolverRules: env.QWEN_HOST_RESOLVER_RULES !== "false",
     chatOriginIp: env.QWEN_CHAT_ORIGIN_IP,
     storageStateTtlMs: Math.max(0, parseInt(env.PLAYWRIGHT_STORAGE_STATE_TTL_MS)),
@@ -333,6 +436,14 @@ export const config = {
     maxDelayMs: parseInt(env.RETRY_MAX_DELAY_MS),
     maxAttempts: Math.max(1, parseInt(env.RETRY_MAX_ATTEMPTS)),
     maxAccountSwitches: Math.max(0, parseInt(env.RETRY_MAX_ACCOUNT_SWITCHES)),
+    /** Per-request create-phase wall-clock deadline (0 disables enforcement). */
+    createDeadlineMs: Number.isFinite(parseInt(env.CHAT_CREATE_DEADLINE_MS))
+      ? Math.max(0, parseInt(env.CHAT_CREATE_DEADLINE_MS))
+      : 12_000,
+    /** Total create-stream attempts across all retry layers of one request. */
+    maxTotalAttempts: Number.isFinite(parseInt(env.RETRY_MAX_TOTAL_ATTEMPTS))
+      ? Math.max(1, parseInt(env.RETRY_MAX_TOTAL_ATTEMPTS))
+      : 8,
     onUnknownUpstream: env.RETRY_ON_UNKNOWN_UPSTREAM !== "false",
     chatInProgressDelayMs: Math.max(0, parseInt(env.CHAT_IN_PROGRESS_RETRY_DELAY_MS)),
     chatInProgressBusyMs: Math.max(0, parseInt(env.CHAT_IN_PROGRESS_BUSY_MS)),
@@ -397,9 +508,9 @@ export const config = {
     ),
   },
   pool: {
-    targetReady: Math.max(1, parseInt(env.POOL_TARGET_READY)),
-    reserveReady: Math.max(0, parseInt(env.POOL_RESERVE_READY)),
-    warmupConcurrency: Math.max(1, parseInt(env.POOL_WARMUP_CONCURRENCY || "1")),
+    targetReady: effectiveTargetReady,
+    reserveReady: effectiveReserveReady,
+    warmupConcurrency: effectiveWarmupConcurrency,
     warmupTimeoutMs: Math.max(1, parseInt(env.POOL_WARMUP_TIMEOUT_MS || "90000")),
     backoffBaseMs: Math.max(1, parseInt(env.POOL_WARMUP_BACKOFF_BASE_MS || "500")),
     backoffMaxMs: Math.max(1, parseInt(env.POOL_WARMUP_BACKOFF_MAX_MS || "300000")),

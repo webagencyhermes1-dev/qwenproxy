@@ -354,6 +354,14 @@ export async function chatCompletions(c: Context) {
     // single source of truth for which accounts have been tried and how much
     // global retry budget remains.
     const retryCtx = createRequestRetryContext();
+    // Per-request CREATE deadline: wall-clock from request arrival until the
+    // first upstream stream exists (CHAT_CREATE_DEADLINE_MS). Every create
+    // layer enforces it via retryCtx.deadlineAt; it is cleared below once a
+    // stream exists so long generations and mid-stream failover keep their
+    // own budgets.
+    if (config.retry.createDeadlineMs > 0) {
+      retryCtx.deadlineAt = startedAt + config.retry.createDeadlineMs;
+    }
 
     let streamResult = await acquireUpstreamStream({
       finalPrompt,
@@ -407,6 +415,9 @@ export async function chatCompletions(c: Context) {
       throw streamResult.error || new Error("All accounts failed");
     }
     lastActiveAccountId = streamResult.activeAccountId;
+    // First stream created: the create phase is over. Drop the create deadline
+    // so streaming/failover layers are bounded only by their own budgets.
+    retryCtx.deadlineAt = undefined;
 
     // Loop 8: sticky set/rebind on success. First turn binds; account mismatch
     // (failover inside account.ts) rebinds with compressed-context validation.

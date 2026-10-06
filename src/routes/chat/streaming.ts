@@ -27,6 +27,7 @@ import {
 
 import {
   classifyRetryAction,
+  isPermanentUpstreamAuthError,
   shouldRetryChatInProgressOnSameAccount,
   shouldRetryInvalidInputOnSameAccount,
 } from "./retry-policy.ts";
@@ -2966,7 +2967,17 @@ export function handleChatCompletionsError(c: Context, err: unknown): Response {
   }
 
   const message = err instanceof Error ? err.message : String(err);
-  const code = classified.code || "unknown";
+  // Hard upstream credential rejection (payload code "Unauthorized", upstream
+  // 401, ...): the generic classifier would report it as the evergreen
+  // "upstream_unavailable", which tells the operator nothing. Keep the 502
+  // (the proxy is fine, the upstream refused) but give the client a distinct,
+  // actionable code it can alert on. Local proxy 401s stay on the AuthError
+  // path above (isPermanentUpstreamAuthError excludes them).
+  const upstreamAuthRejected =
+    classified.statusCode === 502 && isPermanentUpstreamAuthError(err);
+  const code = upstreamAuthRejected
+    ? "upstream_unauthorized"
+    : classified.code || "unknown";
   const status = classified.statusCode;
   console.error(`❌ [Chat] Error | ${status} ${code} | ${message}`);
 
@@ -3001,6 +3012,13 @@ export function handleChatCompletionsError(c: Context, err: unknown): Response {
     }
     console.log(
       `🧾 [Chat] Error details | ${JSON.stringify(detail)}`,
+    );
+  }
+
+  if (upstreamAuthRejected) {
+    return c.json(
+      { error: { message, type: "upstream_error", code, param: null } },
+      502,
     );
   }
 

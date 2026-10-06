@@ -15,6 +15,14 @@ import {
 } from "../../core/stream-registry.ts";
 import { requestQwenTextInBrowser } from "../../services/qwen.ts";
 import { sendOpenAIError, createError } from "../../api/error-helpers.js";
+import { withDeadline } from "../../api/fail-fast.ts";
+
+/**
+ * The upstream stop call runs through the per-account Playwright mutex, which
+ * warmup can hold for minutes. Bound it so the stop endpoint answers with a
+ * structured error instead of hanging behind a 60s mutex acquire timeout.
+ */
+const UPSTREAM_STOP_BUDGET_MS = 10_000;
 
 export async function chatCompletionsStop(c: Context) {
   try {
@@ -61,20 +69,25 @@ export async function chatCompletionsStop(c: Context) {
       );
     }
 
-    const stopResponse = await requestQwenTextInBrowser(
-      stream.accountId,
-      "POST",
-      `/api/v2/chat/completions/stop?chat_id=${encodeURIComponent(chat_id)}`,
-      buildQwenRequestHeaders({
-        cookie: stream.headers.cookie,
-        userAgent: stream.headers["user-agent"],
-        bxUa: stream.headers["bx-ua"],
-        bxUmidtoken: stream.headers["bx-umidtoken"],
-        bxV: stream.headers["bx-v"],
-        chatSessionId: chat_id,
-      }),
-      JSON.stringify({ chat_id, response_id }),
-      { referrer: qwenUrl(`/c/${encodeURIComponent(chat_id)}`) },
+    const stopResponse = await withDeadline(
+      "upstream stop",
+      UPSTREAM_STOP_BUDGET_MS,
+      () =>
+        requestQwenTextInBrowser(
+          stream.accountId,
+          "POST",
+          `/api/v2/chat/completions/stop?chat_id=${encodeURIComponent(chat_id)}`,
+          buildQwenRequestHeaders({
+            cookie: stream.headers.cookie,
+            userAgent: stream.headers["user-agent"],
+            bxUa: stream.headers["bx-ua"],
+            bxUmidtoken: stream.headers["bx-umidtoken"],
+            bxV: stream.headers["bx-v"],
+            chatSessionId: chat_id,
+          }),
+          JSON.stringify({ chat_id, response_id }),
+          { referrer: qwenUrl(`/c/${encodeURIComponent(chat_id)}`) },
+        ),
     );
 
     if (!stopResponse.ok) {

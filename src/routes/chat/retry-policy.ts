@@ -11,6 +11,7 @@ import { logger } from "../../core/logger.ts";
 import {
   PersonalizationSyncError,
   QwenNetworkError,
+  QwenSessionExpiredError,
   QwenUpstreamError,
   QwenUpstreamUnavailableError,
   RetryableQwenStreamError,
@@ -19,7 +20,9 @@ import {
   AuthError,
   ClientAbortedError,
   NotFoundError,
+  QwenProxyError,
   ValidationError,
+  type QwenProxyStatusCode,
 } from "../../core/errors.ts";
 import { isAbortError } from "./helpers.ts";
 
@@ -106,9 +109,76 @@ export function isContextLengthExceededError(err: unknown): boolean {
   );
 }
 
+/**
+ * The per-request CREATE budget ran out before any upstream stream existed:
+ * either the wall-clock deadline (CHAT_CREATE_DEADLINE_MS, carried on
+ * RequestRetryContext.deadlineAt) or the total attempt cap
+ * (RETRY_MAX_TOTAL_ATTEMPTS) hit zero. Typed 503 so the client gets a
+ * structured service_unavailable body, and terminal in every retry layer so
+ * the request GIVES UP instead of rotating accounts (the unbounded loop that
+ * outlived the client until the upstream/provider timed the request out).
+ */
+export class RequestCreateBudgetError extends QwenProxyError {
+  readonly statusCode: QwenProxyStatusCode = 503;
+  readonly type = "service_unavailable";
+  readonly code: string;
+
+  constructor(
+    message: string,
+    code: "request_deadline_exceeded" | "request_attempt_budget_exhausted",
+  ) {
+    super(message);
+    this.code = code;
+  }
+}
+
+/** Upstream codes that mean "our credentials were rejected outright". */
+const UPSTREAM_UNAUTHORIZED_CODES: ReadonlySet<string> = new Set([
+  "unauthorized",
+  "unauthorized_request",
+  "invalid_token",
+  "token_expired",
+  "access_denied",
+]);
+
+/**
+ * Hard upstream credential rejection (payload `{"code":"Unauthorized"}`,
+ * HTTP 401 from Qwen, "unauthorized"/"não autorizado" in the message).
+ * Rotating accounts cannot fix upstream credentials: every lane gets the same
+ * rejection, which produced the endless
+ * "No other account available after upstream_error | Retrying on same account"
+ * loop until the client timed out. Fail fast with the structured upstream
+ * error instead.
+ *
+ * Excluded on purpose:
+ * - QwenSessionExpiredError: has its own re-login recovery path.
+ * - local AuthError: already terminal via isTerminalLocalError (and is a
+ *   proxy/client concern, not an upstream one).
+ * Branch order matters: anti-bot, moderation and quota matchers run first so
+ * those recoveries keep winning over a stray "unauthorized" substring.
+ */
+export function isPermanentUpstreamAuthError(err: unknown): boolean {
+  if (!err) return false;
+  if (err instanceof QwenSessionExpiredError || err instanceof AuthError) {
+    return false;
+  }
+  const code = errCode(err).toLowerCase();
+  if (UPSTREAM_UNAUTHORIZED_CODES.has(code)) return true;
+  // Any 401 that reached here already passed isTerminalLocalError, so it is
+  // an UPSTREAM 401 (the local-proxy 401 case returned terminal above).
+  if (statusOf(err) === 401) return true;
+  const message = errMessage(err).toLowerCase();
+  return (
+    /\bunauthorized\b/.test(message) || message.includes("não autorizado")
+  );
+}
+
 /** Errors that belong to the proxy/client request itself — retrying is useless. */
 export function isTerminalLocalError(err: unknown): boolean {
   if (!err) return false;
+
+  // Our own give-up error (create deadline / attempt cap): terminal by design.
+  if (err instanceof RequestCreateBudgetError) return true;
 
   if (isContextLengthExceededError(err)) return true;
 
@@ -530,6 +600,11 @@ export function classifyRetryAction(
     return makeRetryAction("client_abort", { retryable: false });
   }
 
+  // Our own give-up error: never re-enter any retry loop with it.
+  if (err instanceof RequestCreateBudgetError) {
+    return makeRetryAction(err.code, { retryable: false });
+  }
+
   if (isTerminalLocalError(err)) {
     return makeRetryAction("terminal_local", { retryable: false });
   }
@@ -655,6 +730,16 @@ export function classifyRetryAction(
         accountCooldownMs: quota.accountCooldownMs,
         accountCooldownReason: quota.accountCooldownReason,
       });
+    }
+
+    // Hard upstream credential rejection: retrying/rotating cannot fix it
+    // (every account gets the same 401), so fail fast with the structured
+    // upstream error instead of burning the pool. Runs AFTER anti-bot /
+    // moderation / quota so those recoveries keep winning, and BEFORE the
+    // broad QwenUpstreamError/network branch that made it "retryable
+    // upstream_error" (the endless same-account loop from the incident).
+    if (isPermanentUpstreamAuthError(err)) {
+      return makeRetryAction("upstream_unauthorized", { retryable: false });
     }
 
     if (

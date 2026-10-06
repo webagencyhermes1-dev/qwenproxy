@@ -93,6 +93,9 @@ Source of truth: `src/core/config.ts` `envSchema` (+ `src/utils/egress.ts`, `src
 | `POOL_WARMUP_TIMEOUT_MS` (3) | `90000` | per-account warmup deadline → terminate + backoff |
 | `POOL_WARMUP_BACKOFF_BASE_MS` / `_MAX_MS` (3) | `500` / `300000` | exponential backoff window |
 | `POOL_MAX_WARMUP_FAILURES` (3) | `3` | failures before `warmup-exhausted` recovery |
+| `POOL_INIT_STORM_WINDOW_MS` | `300000` | window in which init failures from ≥`POOL_INIT_STORM_MIN_ACCOUNTS` distinct accounts count as ONE systemic cause (`account-health.ts`); systemic failures land in the health ledger but never escalate an account to BROKEN |
+| `POOL_INIT_STORM_MIN_ACCOUNTS` | `3` | distinct accounts failing init inside the window before the cause is treated as systemic |
+| `POOL_BROKEN_RECOVERY_AGE_MS` | `3600000` | idle time after which an init-failure BROKEN stops counting and the reconciliation pass re-arms it with a fresh bounded attempt budget; `0` = re-arm on every tick. Accounts with permanent-auth evidence (`AuthPermanentFailure*` cooldown / `auth_failures > 0`) never age out |
 
 ## Inbound caps & context
 
