@@ -18,6 +18,7 @@ Last updated: 2026-10-11
 | `docs/modules/` Phase 1 deliverables (overview, …) | PENDING | dir exists, empty |
 | Anthropic/Responses routes: no session identity | NOT STARTED | out of scope so far |
 | Empty-response guard (reasoning-only → promote to content) | DONE | `src/routes/chat/streaming.ts` both paths |
+| Push all changes to `origin/feature/ultra-low-latency` | DONE | commit `f5fa1aa`; graphify-out/ untracked+gitignored |
 | Restart QwenProxy + opencode to load fixes | PENDING | user action |
 
 ## Pending (continue here)
