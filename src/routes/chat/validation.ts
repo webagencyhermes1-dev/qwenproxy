@@ -132,13 +132,24 @@ export async function parseRequestBody(c: Context): Promise<ParsedRequest> {
   }
   logIncomingChatRequest(c, body);
   const isStream = body.stream ?? false;
+  // Explicit session identity: body keys win, then the x-session-id header.
+  // Header-only clients (OpenCode, Claude Code, Codex) never send
+  // session_id/conversation_id, so without this fallback they get NO logical
+  // thread: every turn is a full replay into a brand-new upstream chat, the
+  // history grows until QWEN_MAX_PROMPT_BYTES rejects the request with a 400,
+  // and the client force-compacts its session. The SESSION-ISOLATION-PLAN
+  // already lists x-session-id as an explicit key source.
+  const sessionHeader =
+    c.req.header("x-session-id") ?? c.req.header("X-Session-Id") ?? null;
   const conversationKey =
     typeof body.session_id === "string" && body.session_id.trim().length > 0
       ? body.session_id.trim()
       : typeof body.conversation_id === "string" &&
           body.conversation_id.trim().length > 0
         ? body.conversation_id.trim()
-        : null;
+        : sessionHeader && sessionHeader.trim().length > 0
+          ? sessionHeader.trim()
+          : null;
 
   const messages = body.messages || [];
   let uploadHeaders: Record<string, string> | null = null;

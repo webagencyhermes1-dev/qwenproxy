@@ -171,8 +171,10 @@ test("tool-loop continuation: settle retries send ONLY the delta; the single esc
     { role: "user", content: smallDelta },
   ];
 
-  // conversationKey is null → buildFinalContext derives the implicit-thread id.
-  const sessionId = deriveSessionId(messages, "", "implicit-thread");
+  // Thread reuse requires an explicit session_id; the seeded logical thread is
+  // keyed on it so the continuation resolves the same upstream chat.
+  const conversationKey = "chat-progress-tool-loop";
+  const sessionId = deriveSessionId(messages, "", conversationKey);
   updateLogicalThreadState(sessionId, {
     accountId: "mock-account",
     chatSessionId: "chat-tool-loop",
@@ -193,6 +195,7 @@ test("tool-loop continuation: settle retries send ONLY the delta; the single esc
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: "qwen3.6-plus",
+          session_id: conversationKey,
           messages,
           stream: true,
         }),

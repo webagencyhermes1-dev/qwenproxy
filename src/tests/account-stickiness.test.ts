@@ -258,10 +258,11 @@ test("tool-loop history without an assistant role is treated as a continuation, 
 			false,
 			`role=${trailing.role} history must be a continuation`,
 		);
+		assert.equal(ctx.sessionId, null, "no explicit key → no derived session id");
 		assert.equal(
 			ctx.allowThreadReuse,
-			true,
-			`role=${trailing.role} history must allow thread reuse`,
+			false,
+			`role=${trailing.role} history without an explicit key must not reuse a thread`,
 		);
 	}
 });
@@ -273,8 +274,10 @@ test("tool-loop continuation resolves the existing thread and sends the delta", 
 		{ role: "user", content: "continue" },
 	] as any[];
 
-	// conversationKey is null → buildFinalContext derives the implicit-thread id.
-	const sessionId = deriveSessionId(messages, "", "implicit-thread");
+	// Thread reuse requires an explicit conversation key; the continuation is
+	// keyed on it so the logical thread resolves for THIS session only.
+	const conversationKey = "tool-loop-session";
+	const sessionId = deriveSessionId(messages, "", conversationKey);
 	updateLogicalThreadState(sessionId, {
 		accountId: "tool-loop-acc",
 		chatSessionId: "chat-tool-loop",
@@ -291,8 +294,8 @@ test("tool-loop continuation resolves the existing thread and sends the delta", 
 			currentPrompt: "DELTA",
 			modelId: "qwen3.7-plus",
 			enableThinking: false,
-			conversationKey: null,
-			hasExplicitConversationKey: false,
+			conversationKey,
+			hasExplicitConversationKey: true,
 		});
 
 		assert.equal(ctx.isNewSession, false);

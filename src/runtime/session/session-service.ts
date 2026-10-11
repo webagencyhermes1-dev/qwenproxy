@@ -1,4 +1,7 @@
 ﻿import { getDatabase } from "../../core/database.ts";
+import { config } from "../../core/config.ts";
+import { logger } from "../../core/logger.ts";
+import { metrics } from "../../core/metrics.ts";
 import { newGenerationId, newMessageId } from "../../domain/ids.ts";
 import type { Session } from "../../domain/session.ts";
 import type { ToolCall } from "../../domain/tools.ts";
@@ -71,6 +74,20 @@ export interface CommitGenerationInput {
 export type CommitGenerationResult =
   | { committed: true; version: number }
   | { committed: false; conflict: true; currentVersion: number };
+
+export class SessionCommitConflictError extends Error {
+  readonly code = "session_commit_conflict";
+
+  constructor(
+    message: string,
+    readonly sessionId: string,
+    readonly generationId: string,
+    readonly currentVersion: number,
+  ) {
+    super(message);
+    this.name = "SessionCommitConflictError";
+  }
+}
 
 export interface FailGenerationInput {
   sessionId: string;
@@ -174,6 +191,21 @@ export class SessionService {
       return { committed: true, version: priorVersion };
     }
 
+    const generation = this.generations.getById(input.generationId);
+    const committableState =
+      generation === null ||
+      generation.state === "QUEUED" ||
+      generation.state === "STREAMING";
+    if (
+      this.activeGenerations.get(input.sessionId) !== input.generationId ||
+      !committableState
+    ) {
+      return this.commitConflict(
+        input,
+        this.sessions.getById(input.sessionId)?.version ?? 0,
+      );
+    }
+
     const result = this.sessions.advanceVersion({
       sessionId: input.sessionId,
       fromVersion: input.fromVersion,
@@ -182,11 +214,7 @@ export class SessionService {
     });
 
     if (!result.advanced) {
-      return {
-        committed: false,
-        conflict: true,
-        currentVersion: result.currentVersion,
-      };
+      return this.commitConflict(input, result.currentVersion);
     }
 
     const userMessage = this.messages.append({
@@ -205,15 +233,50 @@ export class SessionService {
       toolCalls: input.assistantMessage.toolCalls,
     });
 
-    this.generations.updateState(
+    const stateResult = this.generations.updateState(
       { generationId: input.generationId, to: "COMPLETED" },
       { expectedState: "QUEUED" },
     );
+    if (!stateResult.updated) {
+      return this.commitConflict(
+        input,
+        input.fromVersion + 1,
+        "stateMismatch",
+      );
+    }
 
     this.activeGenerations.delete(input.sessionId);
     this.committedVersions.set(input.generationId, input.fromVersion + 1);
 
     return { committed: true, version: input.fromVersion + 1 };
+  }
+
+  private commitConflict(
+    input: CommitGenerationInput,
+    currentVersion: number,
+    hint?: string,
+  ): CommitGenerationResult {
+    metrics.increment(
+      "session.commit_conflict",
+      1,
+      hint ? { hint } : undefined,
+    );
+    logger.warn("session: CAS conflict on generation commit", {
+      sessionId: input.sessionId,
+      generationId: input.generationId,
+      fromVersion: input.fromVersion,
+      currentVersion,
+      ...(hint ? { hint } : {}),
+    });
+    if (config.session.strictIsolation) {
+      throw new SessionCommitConflictError(
+        `Generation ${input.generationId} cannot commit for session ${input.sessionId}: session version is ${currentVersion}, commit expected ${input.fromVersion}`,
+        input.sessionId,
+        input.generationId,
+        currentVersion,
+      );
+    }
+    return { committed: false, conflict: true, currentVersion };
   }
 
   async failGeneration(input: FailGenerationInput): Promise<void> {

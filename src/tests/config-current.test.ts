@@ -81,10 +81,12 @@ test("prompt limits reject byte and model-context overages locally", () => {
   assert.equal(typeof config.qwen.maxPromptBytes, "number");
   assert.equal(typeof config.qwen.maxPersonalizationBytes, "number");
 
-  if (config.qwen.maxPromptBytes > 0) {
-    const oversizedUtf8Prompt = "é".repeat(
-      Math.floor(config.qwen.maxPromptBytes / 2) + 1,
-    );
+  // The byte cap is opt-in (default 0 = disabled), so exercise it by forcing
+  // a small budget and restoring it afterwards.
+  const priorByteBudget = config.qwen.maxPromptBytes;
+  config.qwen.maxPromptBytes = 100;
+  try {
+    const oversizedUtf8Prompt = "é".repeat(51); // 102 bytes > 100
     assert.throws(
       () => assertPromptWithinLimits(oversizedUtf8Prompt, "qwen3.7-plus"),
       (error: unknown) => {
@@ -94,6 +96,8 @@ test("prompt limits reject byte and model-context overages locally", () => {
         return true;
       },
     );
+  } finally {
+    config.qwen.maxPromptBytes = priorByteBudget;
   }
 
   const compactModel = "qwen3-omni-flash-2025-12-01";

@@ -75,6 +75,23 @@ if (isTui) {
   const app = new TuiApp()
   await app.start()
 } else {
+  // Claim the data-dir lock before anything opens SQLite (the Forge import
+  // below writes to the database): a verified live predecessor is stopped
+  // here, so a second `npm start` can never race a process that still owns
+  // this data dir. startServer() re-claims (cheap, same process).
+  const { claimDataDirLock } = await import('./core/data-dir-lock.ts')
+  const { config } = await import('./core/config.ts')
+  try {
+    await claimDataDirLock({
+      port: config.server.port,
+      host: config.server.host,
+      apiKey: process.env.API_KEY || config.apiKey || undefined,
+    })
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exit(1)
+  }
+
   await autoImportForgeAccounts()
   const { startServer } = await import('./api/server.js')
   startServer().catch((error: unknown) => {

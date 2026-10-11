@@ -4,7 +4,7 @@
 
 import type { TuiView } from "../types.ts";
 import type { KeyEvent } from "../screen.ts";
-import { theme, glyphs, drawBox, pad } from "../theme.ts";
+import { theme, glyphs, drawBox, pad, splitPanes } from "../theme.ts";
 import {
   syncAllClients,
   restoreAllClients,
@@ -290,9 +290,8 @@ export class SyncView implements TuiView {
 
   public render(width: number, height: number): string[] {
     const contentH = Math.max(12, height);
-    const leftW = Math.max(46, Math.floor(width * 0.52));
+    const { leftW, rightW } = splitPanes(width, 0.52, 46, 30);
     this.lastLeftW = leftW;
-    const rightW = Math.max(30, width - leftW - 1);
 
     // Left Panel: Options and Selectors
     const leftContent: string[] = [

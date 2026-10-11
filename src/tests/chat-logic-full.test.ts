@@ -507,6 +507,26 @@ test("sendOpenAIError serializes QwenProxyError directly", () => {
   assert.strictEqual(body.error.param, null);
 });
 
+test("sendOpenAIError: a local 'not warmed' AuthError answers 503 capacity, never 401", () => {
+  const { c, calls } = fakeContext();
+  sendOpenAIError(
+    c,
+    new AuthError(
+      "Account a1 is not warmed. The pool controller will prepare it in the background.",
+    ),
+  );
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(
+    calls[0].status,
+    503,
+    "pool capacity must not be echoed back as 401 invalid_api_key",
+  );
+  const body = calls[0].body as any;
+  assert.strictEqual(body.error.code, "no_hot_account");
+  assert.match(body.error.message, /is not warmed/);
+  assert.strictEqual(body.error.type, "service_unavailable");
+});
+
 test("sendOpenAIError honors upstreamStatus hints and fallbacks", () => {
   const { c, calls } = fakeContext();
 

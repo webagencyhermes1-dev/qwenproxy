@@ -295,6 +295,26 @@ export function pad(
 }
 
 /**
+ * Splits a row into two pane widths plus a single-column gutter, guaranteeing
+ * `leftW + 1 + rightW === width`. Views that pick each pane width with its own
+ * `Math.max(min, ...)` clamp can exceed the terminal (the minimums add up to
+ * more than the row), and an over-wide row wraps in the terminal, scrolling
+ * the whole frame — the "screen collapse" glitch.
+ */
+export function splitPanes(
+  width: number,
+  ratio = 0.5,
+  minLeft = 34,
+  minRight = 30,
+): { leftW: number; rightW: number } {
+  const usable = Math.max(2, width - 1);
+  let leftW = Math.floor(usable * ratio);
+  leftW = Math.max(minLeft, Math.min(leftW, usable - minRight));
+  leftW = Math.min(Math.max(1, leftW), usable - 1);
+  return { leftW, rightW: usable - leftW };
+}
+
+/**
  * Word-wraps a content line to fit within maxWidth, preserving leading indentation.
  */
 export function wrapContentLine(line: string, maxWidth: number): string[] {

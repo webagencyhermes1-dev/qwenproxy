@@ -193,6 +193,17 @@ curl http://localhost:7936/v1/chat/completions \
 | `HOST` | `0.0.0.0` | Bind host |
 | `API_KEY` | empty | Protect `/v1/*` with Bearer token |
 
+### Instance lifecycle
+
+One server per data dir (the data dir lock refuses a second replica). A live
+predecessor found on startup is verified (pid + process start time), then
+stopped so the new start can take over.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `QWEN_LOCK_TAKEOVER` | `true` | Stop the previous instance automatically; `false` = refuse to start instead |
+| `QWEN_DATA_DIR` | OS-specific | Data dir holding the database, profiles and `server.pid` lock |
+
 ### Accounts & Session
 
 | Variable | Default | Description |

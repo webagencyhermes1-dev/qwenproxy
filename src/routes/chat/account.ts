@@ -39,7 +39,13 @@ export function healthKindForFailure(
     reason === "content_moderation" ||
     reason === "model_not_found" ||
     reason === "client_abort" ||
-    reason === "unknown_not_retryable"
+    reason === "unknown_not_retryable" ||
+    // Readiness races, not account health: the context died (or the pool had
+    // no live context at all) while the account itself is fine and the
+    // readiness controller is already re-warming it. Debiting the score here
+    // would drain healthy accounts for a transient pool state.
+    reason === "account_not_hot" ||
+    reason === "no_hot_account"
   ) {
     return null;
   }
@@ -104,7 +110,7 @@ import {
 } from "../../core/model-registry.ts";
 import { getRollingSummary } from "../../services/context/summary.ts";
 import { getVectorStore } from "../../services/context/vectorStore.ts";
-import { refreshHeaders } from "../../services/playwright.ts";
+import { isPlaywrightSessionDeathError, refreshHeaders } from "../../services/playwright.ts";
 import {
 	clearAllSessionsForAccount,
 	createQwenStream,
@@ -921,6 +927,21 @@ export async function acquireUpstreamStream(
 					retryAfterMs: NO_HOT_ACCOUNT_RETRY_AFTER_MS,
 				};
 			}
+			// Busy / owned by another generation (or otherwise ineligible): the
+			// same `account_busy` contract the slot lease uses, so
+			// classifyRetryAction rotates to another account instead of a bare
+			// 503 with no rotation.
+			if (claimed.errorCode === "ACCOUNT_UNAVAILABLE") {
+				const busyError = new Error(
+					`Lease authority rejected the generation: ${claimed.failureCode}`,
+				) as Error & { code?: string };
+				busyError.code = "account_busy";
+				return {
+					error: busyError,
+					completionId,
+					allOnCooldown: false,
+				};
+			}
 			return {
 				error: TypedRuntimeError.fromCode(
 					claimed.errorCode,
@@ -1167,6 +1188,7 @@ export async function acquireUpstreamStream(
 					sessionId,
 					useThreadNative,
 					updateLogicalThread,
+					allowThreadReuse,
 					forceNewChat: attemptForceNewChat,
 					existingThread:
 						!mustReplayFullContext &&
@@ -1574,6 +1596,7 @@ async function tryCreateStreamWithRetry(
 		sessionId: string | null;
 		useThreadNative: boolean;
 		updateLogicalThread: boolean;
+		allowThreadReuse: boolean;
 		forceNewChat: boolean;
 		existingThread: LogicalThreadEntry | null;
 		messageCount?: number;
@@ -1659,6 +1682,10 @@ async function tryCreateStreamWithRetry(
 		}
 		let attemptError: any = null;
 		let accountLease: AccountLease | null = null;
+		// Declared at attempt scope so the catch can always stop a pending
+		// acquire deadline (otherwise the losing race leaves a live timer that
+		// aborts an abandoned signal later).
+		let acquireDeadlineTimer: NodeJS.Timeout | undefined;
 		const acquireStartedAt = Date.now();
 
 		try {
@@ -1677,9 +1704,9 @@ async function tryCreateStreamWithRetry(
 			// HARD INVARIANT: NORMAL REQUESTS MAY ONLY EXECUTE ON HOT ACCOUNTS.
 			// Selection already gates on headers-ready; if a non-HOT account
 			// still reaches an attempt (e.g. readiness lost mid-request), fail
-			// the attempt immediately and rotate. This guarantees the request
-			// path never spends a lease wait discovering readiness failure and
-			// never lets "Account <id> is not warmed" surface from execution.
+			// the attempt immediately and rotate. This check runs BEFORE any
+			// expensive work (model sync, prompt truncation, lease acquisition)
+			// so a dead session costs nothing to detect and rotate away from.
 			if (
 				!isAuthMockEnabled() &&
 				currentAccountId !== "global" &&
@@ -1769,7 +1796,7 @@ async function tryCreateStreamWithRetry(
 			const hasFreeAlt =
 				!isSingleAccount &&
 				hasFreeAlternateAccount(accounts, currentAccountId, triedAccounts);
-			const sessionLabel = params.sessionId ?? currentAccountEmail;
+			const sessionLabel = params.sessionId ?? `req:${params.completionId}`;
 			// The thread owner (or the last usable account) may wait for the slot
 			// without a short deadline — but ONLY when the slot is busy with OUR
 			// session (same-session latest-wins / tool loop). If ANOTHER session is
@@ -2043,7 +2070,6 @@ async function tryCreateStreamWithRetry(
 			// because a client deadline fired).
 			const acquireDeadlineIsCreateBudget =
 				acquireDeadlineMs < config.concurrency.acquireDeadlineMs;
-			let acquireDeadlineTimer: NodeJS.Timeout | undefined;
 			const acquireDeadline = new Promise<never>((_, reject) => {
 				acquireDeadlineTimer = setTimeout(() => {
 					// Abort the losing createQwenStream (it is still queued on the
@@ -2084,7 +2110,25 @@ async function tryCreateStreamWithRetry(
 							}
 						: params.reasoningMode ? { reasoningMode: params.reasoningMode } : undefined,
 					combinedSignal,
-				),
+				).catch((streamErr: unknown) => {
+					if (
+						!isAuthMockEnabled() &&
+						currentAccountId !== "global" &&
+						isPlaywrightSessionDeathError(streamErr)
+					) {
+						noteRequestPathNotHotExecution();
+						console.error(
+							`⛔ [Chat] Session death detected during createQwenStream: ${currentAccountId} (${currentAccountEmail}) — failing attempt and rotating`,
+						);
+						const notHotError = new Error(
+							`Account ${currentAccountId} is not warmed`,
+						) as Error & { code?: string; switchAccount?: boolean };
+						notHotError.code = "account_not_hot";
+						notHotError.switchAccount = true;
+						throw notHotError;
+					}
+					throw streamErr;
+				}),
 				acquireDeadline,
 			]);
 			// The acquire won: stop the deadline so it cannot fire later and
@@ -2160,6 +2204,7 @@ async function tryCreateStreamWithRetry(
 			if (
 				params.useThreadNative &&
 				params.updateLogicalThread &&
+				params.allowThreadReuse !== false &&
 				!params.parallelEscape &&
 				params.sessionId &&
 				result.uiSessionId
@@ -2168,11 +2213,13 @@ async function tryCreateStreamWithRetry(
 				// sticky parent — that is the *previous* assistant id we attached to.
 				// Streaming will rememberParent(response_id) with the new assistant id
 				// so the next turn appends (user_action=chat + parent_id=last response).
-				// Preserve any existing sticky parent until the stream updates it.
+				// A parent is only carried when it provably belongs to the account
+				// that just served this attempt — otherwise another account's parent
+				// chain would be stored under this account.
 				const priorParent =
-					params.existingThread?.parentId ??
-					getLogicalThreadState(params.sessionId)?.parentId ??
-					null;
+					params.existingThread?.accountId === result.accountId
+						? params.existingThread.parentId
+						: null;
 				updateLogicalThreadState(params.sessionId, {
 					accountId: result.accountId,
 					chatSessionId: result.uiSessionId,
@@ -2231,6 +2278,7 @@ async function tryCreateStreamWithRetry(
 		} catch (err: any) {
 			attemptError = err;
 			lastAttemptError = err;
+			if (acquireDeadlineTimer) clearTimeout(acquireDeadlineTimer);
 			// Release the lease on failure — the stream was never created or
 			// will not be consumed by the caller.
 			accountLease?.release();
@@ -2628,6 +2676,40 @@ async function tryCreateStreamWithRetry(
 				// Best-effort.
 			}
 			triedAccounts.add(currentAccountId);
+				// The pre-claimed ownership lease belongs to the account we just
+				// exhausted. Release it through the fenced authority and claim the
+				// destination BEFORE switching, otherwise the next account would run
+				// on a FREE authority slot and the tracked lease would be recorded
+				// under the wrong account.
+				if (params.ownershipLease) {
+					try {
+						getAccountOwnership().release({
+							leaseId: params.ownershipLease.leaseId,
+							ownerToken: params.ownershipLease.ownerToken,
+							outcome: "cancelled",
+							reason: "inner-account-switch",
+						});
+					} catch {
+						// Fenced/stale releases are safe no-ops inside the manager.
+					}
+					params.ownershipLease = undefined;
+					const claimed = acquireGenerationAccount({
+						generationId: params.completionId,
+						candidates: [nextAccount.id],
+						deadline: Date.now() + config.timeouts.totalRequestTimeout,
+						modelId: params.model,
+					});
+					if (!claimed.ok) {
+						return {
+							success: false,
+							error: TypedRuntimeError.fromCode(
+								claimed.errorCode,
+								`Lease authority rejected account ${nextAccount.id}: ${claimed.failureCode}`,
+							),
+						};
+					}
+					params.ownershipLease = claimed.lease;
+				}
 				currentAccountId = nextAccount.id;
 				currentAccountEmail = maskEmail(nextAccount.email);
 				accountSwitches++;

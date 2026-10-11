@@ -22,6 +22,7 @@ import {
   NotFoundError,
   QwenProxyError,
   ValidationError,
+  isAccountNotWarmedError,
   type QwenProxyStatusCode,
 } from "../../core/errors.ts";
 import { isAbortError } from "./helpers.ts";
@@ -333,7 +334,8 @@ export function isAccountInitializationError(err: unknown): boolean {
     message.includes("playwright not initialized for account") ||
     message.includes("playwright page unavailable") ||
     message.includes("playwright page operation timed out") ||
-    message.includes("playwright re-initialization timed out")
+    message.includes("playwright re-initialization timed out") ||
+    message.includes("is not warmed")
   );
 }
 
@@ -605,12 +607,45 @@ export function classifyRetryAction(
     return makeRetryAction(err.code, { retryable: false });
   }
 
+  // "Account <id> is not warmed": the selected account had no live Playwright
+  // context when the header fetch ran (context died after HOT selection, or a
+  // readiness entry whose page was gone was selected). This is a LOCAL pool
+  // capacity failure, not a credential rejection, and it must win over BOTH
+  // branches below:
+  //  - isTerminalLocalError: the error is raised as an AuthError, which would
+  //    otherwise be terminal (reason terminal_local, no retry) and reach the
+  //    client as 401 invalid_api_key.
+  //  - isAccountInitializationError: its "is not warmed" match would cool the
+  //    account for initFailureCooldownMs, stranding a healthy account that the
+  //    readiness controller is already re-warming (auth-playwright unmarks the
+  //    phantom entry on detection).
+  // Rotation to another live account is the recovery; the account itself needs
+  // no cooldown here.
+  if (isAccountNotWarmedError(err)) {
+    return makeRetryAction("account_not_hot", {
+      switchAccount: true,
+      retryAfterMs: Math.min(baseDelayMs, 1_000),
+    });
+  }
+
   if (isTerminalLocalError(err)) {
     return makeRetryAction("terminal_local", { retryable: false });
   }
 
   const message = errMessage(err).toLowerCase();
   const code = errCode(err).toLowerCase();
+
+  // Zero live contexts in the pool (thrown by the header resolver when no
+  // account can serve headers). Retryable with an account switch so the
+  // attempt loop can find a context that warmed up in the meantime; the
+  // readiness controller was already woken when the error was raised.
+  if (code === "no_hot_account") {
+    return makeRetryAction("no_hot_account", {
+      switchAccount: true,
+      retryAfterMs: Math.min(baseDelayMs, 3_000),
+    });
+  }
+
   if (isAccountInitializationError(err)) {
     return makeRetryAction("account_initialization_failed", {
       switchAccount: true,

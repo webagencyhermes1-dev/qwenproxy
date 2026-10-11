@@ -615,3 +615,125 @@ test("auth-playwright: falls back to first configured account when no account id
     restoreAccounts(existing);
   }
 });
+
+test("auth-playwright: unpinned resolution only ever picks a live context", async () => {
+  const { pickLiveContextAccountId } = await import(
+    "../services/auth-playwright.ts"
+  );
+  const {
+    registerPlaywrightAccountForTests,
+    unregisterPlaywrightAccountForTests,
+  } = await import("../services/playwright.ts");
+  const {
+    markAccountHeadersReady,
+    unmarkAccountHeadersReady,
+  } = await import("../core/account-manager.ts");
+
+  const livePage = { isClosed: () => false } as any;
+  const deadPage = { isClosed: () => true } as any;
+  const accounts = [
+    { id: "live-ready" },
+    { id: "ready-dead-page" },
+    { id: "live-not-marked" },
+    { id: "cold-never-touched" },
+  ];
+
+  registerPlaywrightAccountForTests("live-ready", livePage, Date.now());
+  registerPlaywrightAccountForTests("ready-dead-page", deadPage, Date.now());
+  registerPlaywrightAccountForTests("live-not-marked", livePage, Date.now());
+  markAccountHeadersReady("live-ready");
+  markAccountHeadersReady("ready-dead-page");
+
+  try {
+    // READY + live context wins over a live context that was never marked.
+    assert.equal(pickLiveContextAccountId(accounts), "live-ready");
+
+    // Drop the READY marks: a dead page is never a fallback candidate and a
+    // READY record whose context died is exactly the selection that used to
+    // reach the client as "Account <id> is not warmed".
+    unmarkAccountHeadersReady("live-ready");
+    unmarkAccountHeadersReady("ready-dead-page");
+    assert.equal(
+      pickLiveContextAccountId([
+        { id: "ready-dead-page" },
+        { id: "cold-never-touched" },
+      ]),
+      null,
+      "no live context must resolve to null, never to a cold or dead account",
+    );
+  } finally {
+    unmarkAccountHeadersReady("live-ready");
+    unmarkAccountHeadersReady("ready-dead-page");
+    unregisterPlaywrightAccountForTests("live-ready");
+    unregisterPlaywrightAccountForTests("ready-dead-page");
+    unregisterPlaywrightAccountForTests("live-not-marked");
+  }
+});
+
+test("auth-playwright: configured pool with no live context is a bounded 503 capacity error", async () => {
+  clearAllHeadersReadyAccounts();
+  const existing = snapshotAccounts();
+  const originalArgv = [...process.argv];
+  delete process.env.TEST_MOCK_QWEN_AUTH;
+  delete process.env.QWEN_ACCOUNTS;
+
+  try {
+    restoreAccounts([
+      {
+        id: "cap-account",
+        email: "cap@example.com",
+        password: "secret",
+        cooldown_until: 0,
+        cooldown_reason: null,
+      },
+    ]);
+    const { resolveHeaderAccountId } = await import(
+      "../services/auth-playwright.ts"
+    );
+
+    // Hide the runner args so isRunningUnderNodeTest() reports production.
+    process.argv.splice(0, process.argv.length, "node", "dist/index.js");
+
+    assert.throws(
+      () => resolveHeaderAccountId(),
+      (err: any) => {
+        assert.equal(err.statusCode, 503, "capacity must not answer 401");
+        assert.equal(err.code, "no_hot_account");
+        assert.match(err.message, /No warmed Qwen account context/);
+        return true;
+      },
+      "an unpinned fetch with zero live contexts must fail as capacity, not as an account auth error",
+    );
+
+    // An explicit account id is honored as given (the HOT gate upstream
+    // already vouched for it); only the unpinned path is restricted.
+    assert.equal(resolveHeaderAccountId("cap-account"), "cap-account");
+  } finally {
+    process.argv.splice(0, process.argv.length, ...originalArgv);
+    restoreAccounts(existing);
+  }
+});
+
+test("auth-playwright: zero configured accounts stays an AuthError", async () => {
+  const existing = snapshotAccounts();
+  const originalArgv = [...process.argv];
+  delete process.env.TEST_MOCK_QWEN_AUTH;
+  delete process.env.QWEN_ACCOUNTS;
+
+  try {
+    restoreAccounts([]);
+    const { resolveHeaderAccountId } = await import(
+      "../services/auth-playwright.ts"
+    );
+    process.argv.splice(0, process.argv.length, "node", "dist/index.js");
+
+    assert.throws(
+      () => resolveHeaderAccountId(),
+      /No Qwen accounts configured/,
+      "a missing configuration is a 401, unlike an empty warm pool",
+    );
+  } finally {
+    process.argv.splice(0, process.argv.length, ...originalArgv);
+    restoreAccounts(existing);
+  }
+});

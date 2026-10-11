@@ -30,7 +30,7 @@ function bigConversation(exchanges: number): Message[] {
   return out;
 }
 
-test("two sessions: different first messages bind different accounts; A failover leaves B", async () => {
+test("two sessions: distinct session keys bind different accounts; A failover leaves B", async () => {
   const sticky = new StickyMap({ autoSweep: false });
   sticky.clearForTests();
   const health = new HealthTracker();
@@ -49,10 +49,10 @@ test("two sessions: different first messages bind different accounts; A failover
     }
 
     const keyA = generateStickyKey({
-      messages: [{ role: "user", content: "session A: refactor auth module" } as Message],
+      explicitKey: "session-A",
     });
     const keyB = generateStickyKey({
-      messages: [{ role: "user", content: "session B: optimize database queries" } as Message],
+      explicitKey: "session-B",
     });
     assert.notEqual(keyA, keyB);
 

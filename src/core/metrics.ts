@@ -148,6 +148,17 @@ export class Metrics extends EventEmitter {
         "counter",
         "Lease lifecycle events by account (acquired|released|swept)",
       ],
+      ["stream.cross_session_chunk_rejected", "counter", "Stream chunks rejected for crossing session boundaries"],
+      ["stream.chat_id_mismatch", "counter", "Stream updates rejected for chat id mismatch"],
+      ["stream.parent_commit_blocked", "counter", "Parent commits blocked by isolation checks"],
+      ["stream.operation_id_mismatch", "counter", "Stream operations rejected for operation id mismatch"],
+      ["browser.cross_operation_event_rejected", "counter", "Browser events rejected for crossing operation boundaries"],
+      ["session.commit_conflict", "counter", "Session generation commit CAS conflicts"],
+      ["session.generation_stranded", "counter", "Generations left stranded without a terminal state"],
+      ["lease.wrong_session_wait", "counter", "Lease waits blocked because another session held the slot"],
+      ["lease.released_after_abort", "counter", "Leases released after their request aborted"],
+      ["supersede.same_session", "counter", "Same-session latest-wins supersede events"],
+      ["retry.after_emission", "counter", "Retries blocked because output was already emitted to the client"],
     ];
 
     for (const [name, type, help] of defaults) {

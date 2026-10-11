@@ -11,14 +11,14 @@ const { parseRequestBody } = await import("../routes/chat/validation.ts");
 const { config } = await import("../core/config.ts");
 const { logger, isToolcallDebugEnabled } = await import("../core/logger.ts");
 
-function mockContext(body: unknown): any {
+function mockContext(body: unknown, headers: Record<string, string> = {}): any {
   return {
     req: {
       json: async () => body,
       header: (name: string) => {
         if (name === "x-request-id") return "req-test-1";
         if (name === "user-agent") return "test-agent";
-        return undefined;
+        return headers[name.toLowerCase()];
       },
     },
   };
@@ -76,6 +76,67 @@ test("parseRequestBody falls back to conversation_id and then null", async () =>
   );
   assert.strictEqual(without.conversationKey, null);
   assert.strictEqual(without.hasExplicitConversationKey, false);
+});
+
+test("parseRequestBody treats the x-session-id header as an explicit session key", async () => {
+  const body = {
+    model: "qwen3.7-plus",
+    messages: [{ role: "user", content: "hi" }],
+  };
+
+  // Header-only clients (OpenCode/Claude Code/Codex) never send body keys;
+  // without the header fallback they would never get a logical thread and
+  // would force-compact after the history outgrew the prompt budget.
+  const headerOnly = await parseRequestBody(
+    mockContext(body, { "x-session-id": "  opn-hdr-1  " }),
+  );
+  assert.strictEqual(headerOnly.conversationKey, "opn-hdr-1");
+  assert.strictEqual(headerOnly.hasExplicitConversationKey, true);
+
+  // An explicit body key wins over the header (more specific source).
+  const bodyWins = await parseRequestBody(
+    mockContext(
+      { ...body, session_id: "body-key" },
+      { "x-session-id": "opn-hdr-2" },
+    ),
+  );
+  assert.strictEqual(bodyWins.conversationKey, "body-key");
+
+  // A blank header is not a key.
+  const blankHeader = await parseRequestBody(
+    mockContext(body, { "x-session-id": "   " }),
+  );
+  assert.strictEqual(blankHeader.conversationKey, null);
+  assert.strictEqual(blankHeader.hasExplicitConversationKey, false);
+});
+
+test("header-derived session key enables logical thread reuse end-to-end", async () => {
+  const { buildFinalContext } = await import("../routes/chat/context.ts");
+  const messages = [
+    { role: "user", content: "first question about coding" },
+    { role: "assistant", content: "an answer" },
+    { role: "user", content: "follow-up" },
+  ];
+  const parsed = await parseRequestBody(
+    mockContext(
+      { model: "qwen3.7-plus", messages },
+      { "x-session-id": "hdr-thread-1" },
+    ),
+  );
+  const ctx = await buildFinalContext({
+    messages: messages as any,
+    systemPrompt: parsed.systemPrompt,
+    toolInstructions: parsed.toolInstructions,
+    prompt: parsed.prompt,
+    currentPrompt: parsed.currentPrompt,
+    modelId: parsed.modelId,
+    enableThinking: parsed.enableThinking,
+    conversationKey: parsed.conversationKey,
+    hasExplicitConversationKey: parsed.hasExplicitConversationKey,
+    chatMode: "thread",
+  });
+  assert.strictEqual(ctx.allowThreadReuse, true);
+  assert.ok(ctx.sessionId, "header key must produce a session id");
 });
 
 test("parseRequestBody handles array, object and empty content", async () => {

@@ -20,7 +20,7 @@ test("burst 429 does not rebind; quota 429 does", () => {
     markAccountHeadersReady("acc-a");
     markAccountHeadersReady("acc-b");
     const key = generateStickyKey({
-      messages: [{ role: "user", content: "burst test session" } as never],
+      explicitKey: "burst-test-session",
     });
     for (let i = 0; i < 3; i++) {
       health.recordSuccess("acc-a", 600);

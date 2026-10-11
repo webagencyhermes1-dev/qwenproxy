@@ -82,6 +82,15 @@ Source of truth: `src/core/config.ts` `envSchema` (+ `src/utils/egress.ts`, `src
 | `CHAT_LOCK_TIMEOUT_MS` | `180000` | per-chat lock wait (covers long turns) |
 | `STREAM_DISCONNECT_GRACE_MS` | `60000` | upstream continues after client drop |
 
+## Session isolation (strict mode)
+
+| Var | Default | Effect |
+|---|---|---|
+| `STRICT_SESSION_ISOLATION` | `false` | `true` = throw `SessionCommitConflictError` (`session_commit_conflict`) instead of returning `{committed:false}` on a CAS conflict |
+| `FAIL_ON_STREAM_MISMATCH` | `false` | `true` = a cross-session stream/chat/operation-id mismatch fails the request instead of being dropped |
+| `FAIL_ON_CAS_CONFLICT` | `false` | `true` = surface generation-commit CAS conflicts as errors |
+| `DISABLE_IMPLICIT_THREAD` | `true` | `true` = never derive/continue an implicit upstream thread without an explicit session/conversation key |
+
 ## Pool / readiness (3)
 
 | Var | Default | Effect |
@@ -101,7 +110,7 @@ Source of truth: `src/core/config.ts` `envSchema` (+ `src/utils/egress.ts`, `src
 
 | Var | Default | Effect |
 |---|---|---|
-| `QWEN_MAX_PROMPT_BYTES` | `200000` | prompt budget; `0` disables; over → 400 |
+| `QWEN_MAX_PROMPT_BYTES` | `0` | hard prompt byte cap; `0` disables (default); over → 400 — model-aware token check + truncation govern instead |
 | `QWEN_MAX_PERSONALIZATION_BYTES` | `200000` | personalization budget |
 | `CONTEXT_METER_ENABLED` / `_WINDOW_TOKENS` / `_REPORT_USAGE` | `true` / `0` / `true` | metering + usage reporting |
 | `CONTEXT_COMPRESSION_ENABLED` / `_THRESHOLD` / `_BUDGET` | `true` / `200000` / `200000` | tiered failover-replay compression (floors 10000) |

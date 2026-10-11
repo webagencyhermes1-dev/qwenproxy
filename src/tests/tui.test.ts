@@ -12,16 +12,18 @@ import {
   truncate,
   pad,
   drawBox,
+  splitPanes,
   theme,
   glyphs,
 } from "../tui/theme.ts";
-import { maskAccountIdentifier } from "../tui/proxy-client.ts";
+import { maskAccountIdentifier, buildStatusSnapshot } from "../tui/proxy-client.ts";
 import { StatusView } from "../tui/views/status-view.ts";
 import { SyncView } from "../tui/views/sync-view.ts";
 import { AccountsView } from "../tui/views/accounts-view.ts";
 import { ChatView } from "../tui/views/chat-view.ts";
 import { StorageView } from "../tui/views/storage-view.ts";
 import { LogsView } from "../tui/views/logs-view.ts";
+import { PerformanceView } from "../tui/views/performance-view.ts";
 import { ServerManager } from "../tui/server-manager.ts";
 import { TuiApp } from "../tui/app.ts";
 
@@ -1293,4 +1295,134 @@ test("TUI Screen: deduplicates identical cell hovers and throttles mouse motion"
   assert.equal(dispatched[0].mouse.row, 5);
 
   (screen as any).active = false;
+});
+
+test("TUI Theme: splitPanes always leaves the merged row exactly the terminal width", () => {
+  const layouts: Array<[number, number, number]> = [
+    [0.42, 34, 34], // Status
+    [0.48, 48, 34], // Storage
+    [0.5, 40, 40], // Performance
+    [0.52, 46, 30], // Sync
+    [0.54, 46, 30], // Accounts
+  ];
+  for (let width = 70; width <= 240; width++) {
+    for (const [ratio, minLeft, minRight] of layouts) {
+      const { leftW, rightW } = splitPanes(width, ratio, minLeft, minRight);
+      assert.equal(
+        leftW + 1 + rightW,
+        width,
+        `panes must fit width=${width} ratio=${ratio}`,
+      );
+      assert.ok(leftW >= 1 && rightW >= 1, `both panes need a column at width=${width}`);
+    }
+  }
+});
+
+test("TUI Views: no view emits a line wider than the terminal (wrapping scrolls the frame)", () => {
+  const snapshot: any = {
+    online: true,
+    port: 7936,
+    host: "127.0.0.1",
+    overallStatus: "healthy",
+    uptimeSeconds: 60,
+    rssMb: 128,
+    activeStreams: 1,
+    waitingStreams: 0,
+    accounts: [
+      {
+        id: "acc-1",
+        emailOrName: "one@test.com",
+        priority: 1,
+        onCooldown: true,
+        remainingCooldownMs: 300000,
+        cooldownReason: "rate_limited",
+        headersReady: true,
+        isInitialized: true,
+        state: "COOLDOWN",
+        health: 100,
+        activeStreams: 0,
+        success: 12,
+        failure: 1,
+        lastUsed: Date.now(),
+      },
+    ],
+    pool: null,
+    performance: null,
+  };
+
+  const viewNames = ["status", "chat", "sync", "storage", "accounts", "performance", "logs"];
+
+  for (let width = 70; width <= 200; width += 5) {
+    for (const name of viewNames) {
+      const view = twoPaneView(name);
+      const lines = view.render(width, 40, snapshot) as string[];
+      const widest = lines.reduce((max, line) => Math.max(max, stringWidth(line)), 0);
+      assert.ok(
+        widest <= width,
+        `${name} emitted a ${widest}-cell line at width=${width}`,
+      );
+    }
+  }
+});
+
+function twoPaneView(name: string): any {
+  switch (name) {
+    case "status":
+      return new StatusView();
+    case "chat":
+      return new ChatView();
+    case "sync":
+      return new SyncView();
+    case "storage":
+      return new StorageView();
+    case "accounts":
+      return new AccountsView();
+    case "performance":
+      return new PerformanceView();
+    default:
+      return new LogsView();
+  }
+}
+
+test("TUI proxy-client: a degraded /health read must not wipe the account list", () => {
+  const pool = {
+    total: 2,
+    ready: 1,
+    warming: 0,
+    busy: 1,
+    cooldown: 0,
+    authError: 0,
+    broken: 0,
+    disabled: 0,
+    activeStreams: 1,
+    queued: 0,
+    successRate: 1,
+    averageHealth: 100,
+  };
+  const rows = [
+    { rawId: "id-1", account: "one@test.com", headersReady: true, state: "READY" },
+    { rawId: "id-2", account: "two@test.com", headersReady: true, state: "BUSY" },
+  ];
+
+  const healthy = buildStatusSnapshot({ status: "healthy", accounts: rows, pool }, null);
+  assert.equal(healthy.accounts.length, 2);
+  assert.equal(healthy.online, true);
+
+  // /health keeps answering 200 but its per-account block failed: pool rows are
+  // still reported while the account list comes back empty.
+  const degraded = buildStatusSnapshot({ status: "healthy", accounts: [], pool }, healthy);
+  assert.equal(degraded.accounts.length, 2, "empty rows with a populated pool must be ignored");
+  assert.equal(degraded.accounts[0].id, "id-1");
+  assert.equal(degraded.pool?.total, 2, "pool stats from the same response are still used");
+
+  // Even a response with no pool block at all keeps the last known rows.
+  const poolDown = buildStatusSnapshot({ status: "healthy", accounts: [] }, degraded);
+  assert.equal(poolDown.accounts.length, 2);
+
+  // A genuinely empty pool (total 0) still clears the list.
+  const emptied = buildStatusSnapshot(
+    { status: "healthy", accounts: [], pool: { ...pool, total: 0, ready: 0, busy: 0 } },
+    degraded,
+  );
+  assert.equal(emptied.accounts.length, 0);
 });

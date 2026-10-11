@@ -82,6 +82,34 @@ test("unified readiness: context death moves READY to RECOVERING, never strands"
   assert.equal(isAccountHeadersReady("b-dead"), true);
 });
 
+test("unified readiness: READY records with a dead context are hidden from the ready list", async () => {
+  const { registerPlaywrightAccountForTests, unregisterPlaywrightAccountForTests } =
+    await import("../services/playwright.ts");
+  const ownership = bind(["b-deadpage"]);
+  ownership.transition("b-deadpage", "WARMING", SYSTEM_FENCE, "t");
+  registerPlaywrightAccountForTests(
+    "b-deadpage",
+    { isClosed: () => true } as any,
+    Date.now(),
+  );
+  try {
+    markAccountHeadersReady("b-deadpage");
+    assert.equal(ownership.getAccountStatus("b-deadpage"), "READY");
+    assert.equal(
+      isAccountHeadersReady("b-deadpage"),
+      false,
+      "the request-path gate rejects a READY record whose context died",
+    );
+    assert.deepEqual(
+      getHeadersReadyAccountIds(),
+      [],
+      "the ready list must agree with the gate, or callers resolve an account that can only answer 'is not warmed'",
+    );
+  } finally {
+    unregisterPlaywrightAccountForTests("b-deadpage");
+  }
+});
+
 test("unified readiness: leased accounts stay hot and unmark is a no-op", () => {
   const ownership = bind(["b-leased"]);
   ownership.transition("b-leased", "WARMING", SYSTEM_FENCE, "t");

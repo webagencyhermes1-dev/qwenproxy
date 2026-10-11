@@ -3,7 +3,13 @@ import net from "node:net";
 import { v4 as uuidv4 } from "uuid";
 import { Hono, type Context } from "hono";
 import { serve } from "@hono/node-server";
+import { getConnInfo } from "@hono/node-server/conninfo";
 import { config } from "../core/config.js";
+import {
+  claimDataDirLock,
+  releaseDataDirLock,
+  takeOverPortHolder,
+} from "../core/data-dir-lock.ts";
 import { metrics } from "../core/metrics.js";
 import { logger, maskEmail } from "../core/logger.js";
 import { MemoryCache } from "../cache/memory-cache.js";
@@ -61,10 +67,18 @@ function isPublicBind(host: string): boolean {
   return host === "0.0.0.0" || host === "::" || host === "::0";
 }
 
-function buildPortInUseMessage(port: number, host: string): string {
+function buildPortInUseMessage(
+  port: number,
+  host: string,
+  listener?: { pid: number; commandLine?: string },
+): string {
+  const occupant = listener
+    ? `\n   Occupied by pid ${listener.pid}${listener.commandLine ? ` — ${listener.commandLine}` : ""}` +
+      `\n   Stop it: ${process.platform === "win32" ? `taskkill /PID ${listener.pid} /T /F` : `kill ${listener.pid}`}`
+    : `\n   Another QwenProxy instance (or another program) is listening on this port.`;
   return (
     `❌ [Server] Port ${port} is already in use (${host}:${port}).` +
-    `\n   Another QwenProxy instance (or another program) is listening on this port.` +
+    occupant +
     `\n   Stop the other instance first, or start on another port: PORT=3001 npm start`
   );
 }
@@ -72,23 +86,34 @@ function buildPortInUseMessage(port: number, host: string): string {
 /**
  * Pre-flight port check run BEFORE the slow account warmup so a conflicting
  * listener fails in <1s with an explanatory message instead of crashing the
- * process minutes later after the warmup completes.
+ * process minutes later after the warmup completes. When the squatter is
+ * itself a QwenProxy (lockfile lost to a hard kill), it is taken over instead.
  */
 async function assertPortAvailable(): Promise<void> {
   const { port, host } = config.server;
-  await new Promise<void>((resolve, reject) => {
-    const probe = net.createServer();
-    probe.once("error", (err: Error) => {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "EADDRINUSE") {
-        reject(new Error(buildPortInUseMessage(port, host)));
-      } else {
-        reject(err);
-      }
+  let lastError: NodeJS.ErrnoException | undefined;
+  const tryBind = (): Promise<boolean> =>
+    new Promise((resolve) => {
+      const probe = net.createServer();
+      probe.once("error", (err: Error) => {
+        lastError = err as NodeJS.ErrnoException;
+        resolve(false);
+      });
+      probe.once("listening", () => probe.close(() => resolve(true)));
+      probe.listen(port, host);
     });
-    probe.once("listening", () => probe.close(() => resolve()));
-    probe.listen(port, host);
+
+  if (await tryBind()) return;
+
+  const { tookOver, listener } = await takeOverPortHolder({
+    port,
+    host,
+    apiKey: process.env.API_KEY || config.apiKey || undefined,
   });
+  if (tookOver && (await tryBind())) return;
+
+  if (lastError && lastError.code !== "EADDRINUSE") throw lastError;
+  throw new Error(buildPortInUseMessage(port, host, listener));
 }
 
 export function setCacheForTesting(nextCache: MemoryCache | undefined): void {
@@ -322,15 +347,39 @@ function maskPoolAccountId(idOrEmail: string): string {
   return idOrEmail.length > 12 ? `${idOrEmail.slice(0, 12)}…` : idOrEmail;
 }
 
+/**
+ * /health polls every second from the TUI and from orchestrators: report a
+ * failing best-effort section loudly, but at most once per interval so a
+ * persistent fault shows up in the logs instead of flooding them.
+ */
+const healthSectionFailureAt = new Map<string, number>();
+const HEALTH_FAILURE_LOG_INTERVAL_MS = 30_000;
+function reportHealthSectionFailure(section: string, error: unknown): void {
+  const now = Date.now();
+  const last = healthSectionFailureAt.get(section) ?? 0;
+  if (now - last < HEALTH_FAILURE_LOG_INTERVAL_MS) return;
+  healthSectionFailureAt.set(section, now);
+  const message = error instanceof Error ? error.message : String(error);
+  logger.warn(`[Health] ${section} unavailable, degrading this section`, {
+    section,
+    error: message,
+  });
+}
+
 app.get("/health", async (c) => {
   const status = await watchdog?.getStatus();
   // Pool 2.0 observability: aggregated counts + per-account rows. All
   // identifiers masked; no passwords, cookies or tokens are ever included.
+  //
+  // The two blocks below are deliberately independent: they used to share one
+  // try/catch, so a throw while building the account rows (locked DB, failed
+  // import, ...) returned 200 with `accounts: []` and made the TUI report "No
+  // accounts configured" even though the pool still had rows.
   let pool: Record<string, unknown> | null = null;
   let poolAccounts: Array<Record<string, unknown>> = [];
+  let accountStates: Record<string, string> = {};
   try {
     const manager = await import("../core/account-manager.js");
-    const { loadAccounts } = await import("../core/accounts.js");
     const stats = manager.getPoolStats();
     const readinessTarget = config.pool?.targetReady ?? 2;
     const readinessDeficit = Math.max(0, readinessTarget - stats.ready);
@@ -353,13 +402,21 @@ app.get("/health", async (c) => {
       readinessTarget,
       readinessDeficit,
     };
+    accountStates = stats.states;
     // Prometheus pool gauges (Phase 3 observability).
     metrics.gauge("pool.ready", stats.ready);
     metrics.gauge("pool.warming", stats.warming);
     metrics.gauge("pool.deficit", readinessDeficit);
+  } catch (error) {
+    reportHealthSectionFailure("pool stats", error);
+    pool = null;
+  }
+  try {
+    const manager = await import("../core/account-manager.js");
+    const { loadAccounts } = await import("../core/accounts.js");
     const accounts = loadAccounts();
     const candidates = manager.buildSchedulerCandidates(accounts);
-    const readyAccountIds = (await import("../core/account-manager.js")).getHeadersReadyAccountIds();
+    const readyAccountIds = manager.getHeadersReadyAccountIds();
     const activeAccountIds = (await import("../services/playwright.js")).getActivePlaywrightAccountIds();
     poolAccounts = candidates.map((cand) => {
       const cd = manager.getAccountCooldownInfo(cand.account.id);
@@ -372,7 +429,7 @@ app.get("/health", async (c) => {
         account: maskPoolAccountId(cand.account.email || cand.account.id),
         // Raw ID for internal TUI use (not masked)
         rawId: cand.account.id,
-        state: stats.states[cand.account.id] ?? "WARMING",
+        state: accountStates[cand.account.id] ?? "WARMING",
         health: cand.health.healthScore,
         activeStreams: cand.activeStreams,
         queued: cand.queuedRequests,
@@ -391,8 +448,8 @@ app.get("/health", async (c) => {
         isInitialized: isActive,
       };
     });
-  } catch {
-    // Pool details are best-effort; core health must always respond.
+  } catch (error) {
+    reportHealthSectionFailure("account list", error);
   }
   return c.json({
     status: status?.overall || "unknown",
@@ -560,6 +617,41 @@ app.get("/metrics", (c) => {
   });
 });
 
+function isLoopbackConnection(c: Context): boolean {
+  try {
+    const { remote } = getConnInfo(c);
+    const address = remote?.address?.replace(/^::ffff:/, "");
+    if (!address) return false;
+    return address === "::1" || address.startsWith("127.");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Loopback handover endpoint: a second instance starting on this data dir
+ * asks this one to exit through its own clean shutdown path (flush SQLite,
+ * close browsers) instead of being hard-killed mid-write. When API_KEY is set
+ * it is required like everywhere else; without one, only loopback callers are
+ * accepted so a keyless local dev server cannot be stopped from the LAN.
+ */
+app.post("/-/shutdown", async (c) => {
+  const apiKey = process.env.API_KEY || config.apiKey;
+  if (!apiKey && !isLoopbackConnection(c)) {
+    return c.json({ error: "Loopback only" }, 403);
+  }
+  const error = verifyApiKey(c);
+  if (error) return error;
+
+  setTimeout(() => {
+    void stopServer().then(
+      () => process.exit(0),
+      () => process.exit(1),
+    );
+  }, 50);
+  return c.json({ ok: true, pid: process.pid }, 202);
+});
+
 app.onError((err, c) => {
   const requestId = c.req.header("X-Request-Id") || "unknown";
   metrics.increment("requests.errors");
@@ -591,60 +683,6 @@ function buildStartedServerInfo(): StartedServerInfo {
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-async function getServerPidLockPath(): Promise<string> {
-  // Dynamic imports keep startup-time module load order unchanged.
-  const { getDataDir } = await import("../core/paths.ts");
-  const path = await import("node:path");
-  return path.join(getDataDir(), "server.pid");
-}
-
-/**
- * Single-replica guard for the data dir. A second live server would
- * double-book accounts (leases are per-process). Stale lockfiles from a
- * crashed predecessor are claimed (pid no longer answers).
- */
-async function claimDataDirLock(): Promise<void> {
-  const fs = await import("node:fs");
-  const lockPath = await getServerPidLockPath();
-  try {
-    const raw = fs.readFileSync(lockPath, "utf8").trim();
-    const pid = Number.parseInt(raw, 10);
-    if (Number.isFinite(pid) && pid > 0) {
-      try {
-        process.kill(pid, 0);
-        throw new Error(
-          `❌ [Server] Another live QwenProxy instance holds this data dir (pid ${pid}). Stop it first, or use a separate data dir.`,
-        );
-      } catch (killErr) {
-        if ((killErr as Error)?.message?.startsWith("❌ [Server] Another live")) {
-          throw killErr;
-        }
-        // ESRCH: predecessor is gone — stale lock, reclaim below.
-      }
-    }
-  } catch (readErr) {
-    if ((readErr as Error)?.message?.startsWith("❌ [Server] Another live")) {
-      throw readErr;
-    }
-    // No lockfile — first claim.
-  }
-  try {
-    fs.mkdirSync((await import("node:path")).dirname(lockPath), { recursive: true });
-    fs.writeFileSync(lockPath, String(process.pid), "utf8");
-  } catch {
-    // Best-effort: the port check below still prevents the common collision.
-  }
-}
-
-async function releaseDataDirLock(): Promise<void> {
-  try {
-    const fs = await import("node:fs");
-    fs.rmSync(await getServerPidLockPath(), { force: true });
-  } catch {
-    // Best-effort.
-  }
 }
 
 async function warmConfiguredChatPools(
@@ -924,6 +962,11 @@ function installSignalHandlers(): void {
   process.on("SIGTERM", () => {
     void handleSignal("SIGTERM");
   });
+  // Windows Ctrl+Break: without a listener the process dies without running
+  // cleanup, which used to leave the data dir lock behind for the next start.
+  process.on("SIGBREAK", () => {
+    void handleSignal("SIGBREAK");
+  });
   signalHandlersInstalled = true;
 }
 
@@ -977,6 +1020,17 @@ export async function startServer(options?: {
       );
     }
 
+    // Single-replica guard: two live servers on one data dir double-book
+    // accounts (module-level leases are per-process) and race SQLite writers.
+    // Claimed BEFORE anything reads or writes the database: a verified live
+    // predecessor is taken over (QWEN_LOCK_TAKEOVER=false keeps the old
+    // refusal), a recycled or dead pid is reclaimed.
+    await claimDataDirLock({
+      port: config.server.port,
+      host: config.server.host,
+      apiKey: process.env.API_KEY || config.apiKey || undefined,
+    });
+
     const { loadAccounts, getAccountCredentials } =
       await import("../core/accounts.ts");
     const accounts = loadAccounts();
@@ -986,11 +1040,6 @@ export async function startServer(options?: {
         "❌ [Server] No Qwen accounts configured. Configure an account with `npm run login`, the QWEN_ACCOUNTS environment variable, or the accounts database before starting the server.",
       );
     }
-
-    // Single-replica guard: two live servers on one data dir double-book
-    // accounts (module-level leases are per-process). Refuse when the pid in
-    // the lockfile still answers.
-    await claimDataDirLock();
 
     // Orphaned-stream sweep (crash-leaked removeStream misses) + account
     // transition audit trail (debug-gated inside the listener).

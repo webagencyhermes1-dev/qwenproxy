@@ -4,7 +4,7 @@
 
 import type { TuiView, ProxyStatusSnapshot } from "../types.ts";
 import type { KeyEvent } from "../screen.ts";
-import { theme, glyphs, drawBox, pad, truncate } from "../theme.ts";
+import { theme, glyphs, drawBox, pad, truncate, splitPanes } from "../theme.ts";
 import { fetchProxyStatus, resetAllCooldowns, formatUptime } from "../proxy-client.ts";
 import { ServerManager } from "../server-manager.ts";
 
@@ -109,9 +109,8 @@ export class StatusView implements TuiView {
     const contentH = Math.max(10, height);
 
     // Two-column layout
-    const leftW = Math.max(34, Math.floor(width * 0.42));
+    const { leftW, rightW } = splitPanes(width, 0.42, 34, 34);
     this.lastLeftW = leftW;
-    const rightW = Math.max(34, width - leftW - 1);
 
     // Left Column: System & Proxy Status
     const serverState = ServerManager.getInstance().getState();

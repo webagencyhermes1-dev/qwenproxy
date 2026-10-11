@@ -58,6 +58,16 @@ const defaultCapabilities: ModelCapabilities = {
   isActive: true,
 };
 
+const KNOWN_VISION_MODELS = new Set([
+  "qwen3.8-max",
+  "qwen3-max",
+  "qwen-max",
+  "qwen-plus",
+  "qwen-turbo",
+  "qwen-vl-max",
+  "qwen-vl-plus",
+]);
+
 interface RegistryEntry {
   contextWindow?: number;
   capabilities: ModelCapabilities;

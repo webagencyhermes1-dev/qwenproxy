@@ -33,8 +33,9 @@ test("deriveSessionId: text parts in array content are joined with spaces", () =
   const withParts = deriveSessionId(
     [msg("user", [{ type: "text", text: "hello" }, { type: "text", text: "world" }])],
     "sys",
+    "conv-guard",
   );
-  const withString = deriveSessionId([msg("user", "hello world")], "sys");
+  const withString = deriveSessionId([msg("user", "hello world")], "sys", "conv-guard");
   assert.equal(withParts, withString);
 });
 
@@ -43,8 +44,8 @@ test("deriveSessionId: non-text parts are ignored", () => {
     { type: "image_url", image_url: { url: "https://example.com/i.png" } },
     { type: "text", text: "describe this" },
   ];
-  const fromArray = deriveSessionId([msg("user", content)], "sys");
-  const fromString = deriveSessionId([msg("user", "describe this")], "sys");
+  const fromArray = deriveSessionId([msg("user", content)], "sys", "conv-guard");
+  const fromString = deriveSessionId([msg("user", "describe this")], "sys", "conv-guard");
   assert.equal(fromArray, fromString);
 });
 
@@ -52,27 +53,35 @@ test("deriveSessionId: null parts and parts without text are tolerated", () => {
   const withNull = deriveSessionId(
     [msg("user", [null, { type: "text", text: "x" }])],
     "",
+    "conv-guard",
   );
-  const plain = deriveSessionId([msg("user", "x")], "");
+  const plain = deriveSessionId([msg("user", "x")], "", "conv-guard");
   assert.equal(withNull, plain);
 
   // A text part without text contributes an empty string, which is dropped
   // from the anchor entirely.
-  const emptyText = deriveSessionId([msg("user", [{ type: "text" }])], "sys");
-  const noUser = deriveSessionId([msg("assistant", "resp")], "sys");
+  const emptyText = deriveSessionId([msg("user", [{ type: "text" }])], "sys", "conv-guard");
+  const noUser = deriveSessionId([msg("assistant", "resp")], "sys", "conv-guard");
   assert.equal(emptyText, noUser);
 });
 
 test("deriveSessionId: non-array object content falls back to empty anchor", () => {
-  const fromObject = deriveSessionId([msg("user", { weird: true })], "sys");
-  const fromNull = deriveSessionId([msg("user", null)], "sys");
+  const fromObject = deriveSessionId([msg("user", { weird: true })], "sys", "conv-guard");
+  const fromNull = deriveSessionId([msg("user", null)], "sys", "conv-guard");
   assert.match(fromObject, /^sess_[a-f0-9]{16}$/);
   assert.equal(fromObject, fromNull);
 });
 
 test("deriveSessionId: different array content produces different IDs", () => {
-  const a = deriveSessionId([msg("user", [{ type: "text", text: "one" }])], "");
-  const b = deriveSessionId([msg("user", [{ type: "text", text: "two" }])], "");
+  const a = deriveSessionId([msg("user", [{ type: "text", text: "one" }])], "", "conv-guard");
+  const b = deriveSessionId([msg("user", [{ type: "text", text: "two" }])], "", "conv-guard");
+  assert.notEqual(a, b);
+});
+
+test("deriveSessionId: missing conversation key never hashes content", () => {
+  const a = deriveSessionId([msg("user", [{ type: "text", text: "one" }])], "sys");
+  const b = deriveSessionId([msg("user", [{ type: "text", text: "two" }])], "sys");
+  assert.match(a, /^sess_eph_/);
   assert.notEqual(a, b);
 });
 

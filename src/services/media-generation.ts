@@ -9,7 +9,7 @@ import {
   markAccountRateLimited,
   clearAccountCooldown,
 } from "../core/account-manager.ts";
-import { UpstreamError, AuthError, UpstreamRateLimit } from "../core/errors.ts";
+import { UpstreamError, AuthError, UpstreamRateLimit, isAccountNotWarmedError } from "../core/errors.ts";
 import { isAntiBotError } from "../routes/chat/retry-policy.ts";
 import { recoverBaxiaCaptcha } from "./captcha-coordinator.ts";
 import { startBaxiaCaptchaWatcher } from "./captcha-solver.ts";
@@ -1282,6 +1282,18 @@ export async function generateImage(params: {
 
       if (lastError instanceof UpstreamRateLimit) {
         markAccountRateLimited(account.id, undefined, "RateLimited");
+      } else if (isAccountNotWarmedError(lastError)) {
+        // The account had no live Playwright context when the header fetch
+        // ran (context died after selection). That is not a generation
+        // failure: a MediaGenFailed cooldown would strand a healthy account
+        // while the readiness controller is already re-warming it. Rotate to
+        // another live context instead (the account stays tried for THIS
+        // request) and let the controller heal it.
+        logMediaWarn(
+          mediaLog("image", "account_context_lost", {
+            account: shortMediaId(account.id),
+          }),
+        );
       } else {
         markAccountRateLimited(account.id, ACCOUNT_COOLDOWN_MS, "MediaGenFailed");
       }
@@ -1521,6 +1533,15 @@ export async function generateVideo(params: {
 
       if (lastError instanceof UpstreamRateLimit) {
         markAccountRateLimited(account.id, undefined, "RateLimited");
+      } else if (isAccountNotWarmedError(lastError)) {
+        // Same as the image path: a dead/missing context is a readiness race,
+        // not a generation failure — no MediaGenFailed cooldown, rotate to
+        // another live context and let the readiness controller re-warm.
+        logMediaWarn(
+          mediaLog("video", "account_context_lost", {
+            account: shortMediaId(account.id),
+          }),
+        );
       } else {
         markAccountRateLimited(account.id, ACCOUNT_COOLDOWN_MS, "MediaGenFailed");
       }

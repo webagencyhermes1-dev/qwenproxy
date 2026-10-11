@@ -72,6 +72,8 @@ export function getStreamKeyBySessionAndResponse(
   for (const [key, entry] of activeStreams.entries()) {
     if (
       entry.uiSessionId === sessionId &&
+      // "" is the unbound sentinel: a not-yet-bound entry must never match.
+      entry.targetResponseId &&
       entry.targetResponseId === responseId
     ) {
       return key;

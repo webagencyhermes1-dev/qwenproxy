@@ -38,6 +38,8 @@ import {
 } from "./streaming.ts";
 import { config, type ChatMode } from "../../core/config.ts";
 import { logger } from "../../core/logger.ts";
+import { metrics } from "../../core/metrics.ts";
+import { getStream } from "../../core/stream-registry.ts";
 import { getContextMeterHeaders, type ContextMeterMode } from "../../services/context-meter.ts";
 import {
   getLogicalThreadState,
@@ -273,10 +275,12 @@ export async function chatCompletions(c: Context) {
 
     const files = ctx.useThreadNative ? currentFiles : allFiles;
 
-    const msgCount =
-      ctx.useThreadNative && !ctx.isNewSession
-        ? parsed.currentMessageCount
-        : parsed.messageCount;
+    // Message count must match what is actually sent upstream: a delta counts
+    // the current-prompt segments, a full replay (no reusable thread / temp
+    // mode) counts the whole conversation.
+    const msgCount = ctx.existingThread
+      ? parsed.currentMessageCount
+      : parsed.messageCount;
 
     const personalizationChars =
       ctx.requestPersonalizationInstruction?.length ?? 0;
@@ -296,7 +300,10 @@ export async function chatCompletions(c: Context) {
         ? typeof body.session_id === "string" &&
           body.session_id.trim().length > 0
           ? "session_id"
-          : "conversation_id"
+          : typeof body.conversation_id === "string" &&
+              body.conversation_id.trim().length > 0
+            ? "conversation_id"
+            : "x-session-id"
         : ctx.isNewSession
           ? "none-new-chat"
           : "implicit-continuation",

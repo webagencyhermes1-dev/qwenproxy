@@ -9,6 +9,7 @@ import {
   UpstreamTimeout,
   ServiceUnavailable,
   ClientAbortedError,
+  isAccountNotWarmedError,
 } from "../core/errors.js";
 import {
   QwenNetworkError,
@@ -24,6 +25,18 @@ import {
  * Preserves specific error metadata when possible.
  */
 export function classifyError(err: unknown): QwenProxyError {
+  // "Account <id> is not warmed": the proxy's own pool had no live Playwright
+  // context for this request. It is raised as an AuthError (that is the class
+  // the header resolver throws), which otherwise answered the client with 401
+  // invalid_api_key — a credential error the client cannot fix and may react
+  // to by dropping the key. It is a capacity condition: 503, retry shortly.
+  if (isAccountNotWarmedError(err)) {
+    return new ServiceUnavailable(
+      err instanceof Error ? err.message : String(err),
+      "no_hot_account",
+    );
+  }
+
   // These errors are retryable upstream failures, not rate-limit responses.
   // RetryableQwenStreamError inherits UpstreamRateLimit for legacy behavior,
   // so classify the concrete network/upstream types before that base class.

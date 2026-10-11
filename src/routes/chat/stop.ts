@@ -38,14 +38,23 @@ export async function chatCompletionsStop(c: Context) {
 
     // Resolve the stream key with the minimum number of registry scans:
     // exact (session, response) match first, then a single session scan.
+    // Real registry keys are `chatcmpl-<uuid>`, so a raw chat_id never matches.
     const exactStreamKey = getStreamKeyBySessionAndResponse(
       chat_id,
       response_id,
     );
-    let streamKey = exactStreamKey ?? chat_id;
-    if (!exactStreamKey) {
+    let streamKey: string | undefined = exactStreamKey;
+    if (!streamKey) {
       const matchingSessionStreamKeys = getStreamKeysBySessionId(chat_id);
-      if (matchingSessionStreamKeys.length > 1) {
+      const verifiedStreamKeys = matchingSessionStreamKeys.filter((key) => {
+        const entry = getStream(key);
+        if (!entry || entry.uiSessionId !== chat_id) return false;
+        if (entry.targetResponseId && entry.targetResponseId !== response_id) {
+          return false;
+        }
+        return true;
+      });
+      if (verifiedStreamKeys.length > 1) {
         return sendOpenAIError(
           c,
           createError(
@@ -55,10 +64,10 @@ export async function chatCompletionsStop(c: Context) {
           ),
         );
       }
-      streamKey = matchingSessionStreamKeys[0] ?? chat_id;
+      streamKey = verifiedStreamKeys[0];
     }
-    const stream = getStream(streamKey);
-    if (!stream) {
+    const stream = streamKey ? getStream(streamKey) : undefined;
+    if (!streamKey || !stream) {
       return sendOpenAIError(c, createError(404, "Stream not found"));
     }
 

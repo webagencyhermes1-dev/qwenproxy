@@ -119,6 +119,8 @@ interface BrowserStreamMetadata {
 }
 
 interface BrowserStreamState {
+  accountId: string;
+  operationId?: string;
   chunks: Uint8Array[];
   done: boolean;
   error: Error | null;
@@ -129,17 +131,26 @@ interface BrowserStreamState {
 const browserStreamStates = new Map<string, BrowserStreamState>();
 const browserStreamBindingPages = new WeakSet<object>();
 const browserStreamBindingContexts = new WeakSet<object>();
+// Bindings install once per page/context, so the owning account is resolved
+// per event here instead of captured in the one-shot registration closure.
+const browserStreamBindingAccounts = new WeakMap<object, string>();
 
 export async function registerBrowserContextStreamBinding(
   context: BrowserContext,
+  accountId?: string,
 ): Promise<void> {
+  if (accountId) browserStreamBindingAccounts.set(context, accountId);
   if (browserStreamBindingContexts.has(context)) return;
   browserStreamBindingContexts.add(context);
   try {
     await context.exposeFunction(
       BROWSER_STREAM_BINDING,
       (requestId: string, event: BrowserStreamEvent) => {
-        handleBrowserStreamEvent(requestId, event);
+        handleBrowserStreamEvent(
+          requestId,
+          event,
+          browserStreamBindingAccounts.get(context),
+        );
       },
     );
   } catch (error) {
@@ -162,9 +173,20 @@ function wakeBrowserStreamState(state: BrowserStreamState): void {
 function handleBrowserStreamEvent(
   requestId: string,
   event: BrowserStreamEvent,
+  sourceAccountId?: string,
 ): void {
   const state = browserStreamStates.get(requestId);
   if (!state) return;
+
+  if (sourceAccountId !== undefined && sourceAccountId !== state.accountId) {
+    logger.warn("[Qwen] dropped browser stream event: account mismatch", {
+      requestId,
+      sourceAccountId,
+      stateAccountId: state.accountId,
+      type: event.type,
+    });
+    return;
+  }
 
   if (event.type === "headers") {
     state.metadata = {
@@ -188,17 +210,26 @@ function handleBrowserStreamEvent(
   wakeBrowserStreamState(state);
 }
 
-async function ensureBrowserStreamBinding(page: Page): Promise<void> {
+async function ensureBrowserStreamBinding(
+  page: Page,
+  accountId: string,
+): Promise<void> {
+  browserStreamBindingAccounts.set(page, accountId);
   const context = page.context();
+  browserStreamBindingAccounts.set(context, accountId);
   if (!browserStreamBindingContexts.has(context)) {
-    await registerBrowserContextStreamBinding(context);
+    await registerBrowserContextStreamBinding(context, accountId);
   }
   if (browserStreamBindingPages.has(page)) return;
   try {
     await page.exposeFunction(
       BROWSER_STREAM_BINDING,
       (requestId: string, event: BrowserStreamEvent) => {
-        handleBrowserStreamEvent(requestId, event);
+        handleBrowserStreamEvent(
+          requestId,
+          event,
+          browserStreamBindingAccounts.get(page),
+        );
       },
     );
   } catch {
@@ -1233,6 +1264,8 @@ async function createQwenBrowserResponse(
 
   const requestId = uuidv4();
   const state: BrowserStreamState = {
+    accountId,
+    operationId: operationIdentity?.operationId,
     chunks: [],
     done: false,
     error: null,
@@ -1240,15 +1273,6 @@ async function createQwenBrowserResponse(
     waiters: new Set(),
   };
   browserStreamStates.set(requestId, state);
-
-  const browserHeaders = getBrowserFetchHeaders(headers);
-  if (
-    !Object.keys(browserHeaders).some(
-      (name) => name.toLowerCase() === "content-type",
-    )
-  ) {
-    browserHeaders["Content-Type"] = "application/json";
-  }
 
   let settled = false;
   let abortListener: (() => void) | undefined;
@@ -1274,26 +1298,44 @@ async function createQwenBrowserResponse(
     return cancelPromise;
   };
 
-  abortListener = () => {
-    void cancel();
-  };
-  signal.addEventListener("abort", abortListener, { once: true });
-
-  const payloadMbForMetadata = Math.ceil(
-    Buffer.byteLength(body, "utf8") / (1024 * 1024),
-  );
-  // First-byte deadline for the completion fetch: honor TIME_TO_FIRST_BYTE
-  // (default 60s) with a 15s floor. A stall past this window is a dead
-  // connection / WAF swallow — classified retryable by the caller.
-  const metadataTimeoutMs = Math.max(
-    5_000,
-    Math.min(
-      pageOperationTimeoutMs,
-      Math.max(15_000, config.timeouts.timeToFirstByte) +
-        payloadMbForMetadata * METADATA_TIMEOUT_PER_PAYLOAD_MB_MS,
-    ),
-  );
+  let browserHeaders: Record<string, string>;
+  let metadataTimeoutMs = pageOperationTimeoutMs;
   let captchaWatcher: ReturnType<typeof startBaxiaCaptchaWatcher> | undefined;
+
+  try {
+    browserHeaders = getBrowserFetchHeaders(headers);
+    if (
+      !Object.keys(browserHeaders).some(
+        (name) => name.toLowerCase() === "content-type",
+      )
+    ) {
+      browserHeaders["Content-Type"] = "application/json";
+    }
+
+    abortListener = () => {
+      void cancel();
+    };
+    signal.addEventListener("abort", abortListener, { once: true });
+
+    const payloadMbForMetadata = Math.ceil(
+      Buffer.byteLength(body, "utf8") / (1024 * 1024),
+    );
+    // First-byte deadline for the completion fetch: honor TIME_TO_FIRST_BYTE
+    // (default 60s) with a 15s floor. A stall past this window is a dead
+    // connection / WAF swallow — classified retryable by the caller.
+    metadataTimeoutMs = Math.max(
+      5_000,
+      Math.min(
+        pageOperationTimeoutMs,
+        Math.max(15_000, config.timeouts.timeToFirstByte) +
+          payloadMbForMetadata * METADATA_TIMEOUT_PER_PAYLOAD_MB_MS,
+      ),
+    );
+  } catch (error) {
+    if (abortListener) signal.removeEventListener("abort", abortListener);
+    browserStreamStates.delete(requestId);
+    throw error;
+  }
 
   try {
     // Phase 6 (flag-gated): register the in-page fetch as a tracked operation.
@@ -1338,7 +1380,7 @@ async function createQwenBrowserResponse(
     const started = await withQwenBrowserPage(
       accountId,
       async (page) => {
-        await ensureBrowserStreamBinding(page);
+        await ensureBrowserStreamBinding(page, accountId);
         if (config.captcha.enabled) {
           captchaWatcher = startBaxiaCaptchaWatcher(
             page,

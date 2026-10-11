@@ -43,7 +43,7 @@ function setupFetchMock(
   };
 }
 
-test("multiturn-thinking-tools: maintains reasoning_content history", async () => {
+test("multiturn-thinking-tools: tool-result turn without a thread replays full history", async () => {
   let capturedBody = "";
 
   const restore = setupFetchMock((_, init) => {
@@ -85,24 +85,116 @@ test("multiturn-thinking-tools: maintains reasoning_content history", async () =
     const res = await app.fetch(req);
     assert.strictEqual(res.status, 200);
 
-    // In thread-native mode, previous user/assistant/tool-call history stays in
-    // Qwen's parent chain. The new prompt only carries the current tool result.
+    // No session_id/conversation_id → no reusable upstream thread exists, so
+    // this request OPENS A NEW CHAT. The full conversation must be replayed:
+    // sending only the "Tool Response" fragment would give the model a chat
+    // with no task, no prior assistant turn, and no tool call to attach the
+    // result to (the model then answers with a generic "What would you like
+    // to do?").
     assert.ok(
-      !capturedBody.includes("User: hello"),
-      "Must not replay previous user message",
+      capturedBody.includes("User: hello"),
+      "Must replay the previous user message when no thread exists",
     );
     assert.ok(
-      !capturedBody.includes("thinking about hello"),
-      "Must not replay previous reasoning content",
+      capturedBody.includes("thinking about hello"),
+      "Must replay reasoning content when no thread exists",
     );
     assert.ok(
-      !capturedBody.includes("tool_call"),
-      "Must not replay previous assistant tool call",
+      capturedBody.includes("qpx_call"),
+      "Must replay the assistant tool call when no thread exists",
     );
     assert.ok(
-      capturedBody.includes("Tool Response (test): success") ||
-        capturedBody.includes("success"),
+      capturedBody.includes("Tool Response (test): success"),
       "Must include current tool response",
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("multiturn-thinking-tools: keyed session with existing thread sends only the tool-result delta", async () => {
+  const capturedPayloads: any[] = [];
+
+  const restore = setupFetchMock((_, init) => {
+    const bodyObj = JSON.parse((init?.body as string) || "{}");
+    capturedPayloads.push(bodyObj);
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(
+          new TextEncoder().encode(
+            `data: {"response.created":{"chat_id":"tool-delta-chat","response_id":"tool-delta-resp-${capturedPayloads.length}"}}\n\n`,
+          ),
+        );
+        c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+        c.close();
+      },
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const sessionId = "test-tool-delta-session";
+
+    // Turn 1: opens the upstream thread.
+    const res1 = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "qwen3.6-plus",
+          session_id: sessionId,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      }),
+    );
+    assert.strictEqual(res1.status, 200);
+    await res1.text();
+
+    // Turn 2: tool-loop continuation — the thread's parent chain already owns
+    // the user message and the assistant's tool call, so ONLY the tool result
+    // is sent as the delta.
+    const res2 = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "qwen3.6-plus",
+          session_id: sessionId,
+          messages: [
+            { role: "user", content: "hello" },
+            {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "call_1",
+                  type: "function",
+                  function: { name: "test", arguments: "{}" },
+                },
+              ],
+            },
+            { role: "tool", name: "test", content: "success" },
+          ],
+        }),
+      }),
+    );
+    assert.strictEqual(res2.status, 200);
+    await res2.text();
+
+    assert.strictEqual(capturedPayloads.length, 2);
+    assert.strictEqual(
+      capturedPayloads[1].parent_id,
+      "tool-delta-resp-1",
+      "Tool-result turn must attach to the thread's parent response",
+    );
+    const turn2Body = JSON.stringify(capturedPayloads[1]);
+    assert.ok(
+      !turn2Body.includes("User: hello"),
+      "History must stay in the parent chain (no replay)",
+    );
+    assert.ok(
+      turn2Body.includes("Tool Response (test): success"),
+      "Delta must carry the tool result",
     );
   } finally {
     restore();

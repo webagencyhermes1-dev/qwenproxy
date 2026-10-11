@@ -4,7 +4,7 @@
 
 import type { TuiView, ProxyStatusSnapshot } from "../types.ts";
 import type { KeyEvent } from "../screen.ts";
-import { theme, glyphs, drawBox, pad, truncate, stringWidth } from "../theme.ts";
+import { theme, glyphs, drawBox, pad, truncate, stringWidth, splitPanes } from "../theme.ts";
 import { formatUptime } from "../proxy-client.ts";
 
 export class PerformanceView implements TuiView {
@@ -96,16 +96,16 @@ export class PerformanceView implements TuiView {
       rightContent.push(`  ${theme.muted("Make some requests to populate metrics.")}`);
     }
 
+    const { leftW, rightW } = splitPanes(width, 0.5, 40, 40);
     const leftBox = drawBox({
       title: "System Metrics",
-      width: Math.max(40, Math.floor(width * 0.5)),
+      width: leftW,
       height: contentH,
       borderColor: theme.borderActive,
       titleColor: theme.cyan,
       content: leftContent,
     });
 
-    const rightW = Math.max(40, width - leftBox[0].length - 1);
     const rightBox = drawBox({
       title: "Analysis",
       width: rightW,
@@ -118,7 +118,7 @@ export class PerformanceView implements TuiView {
     const mergedLines: string[] = [];
     const maxRows = Math.max(leftBox.length, rightBox.length);
     for (let r = 0; r < maxRows; r++) {
-      const leftRow = leftBox[r] || " ".repeat(leftBox[0].length);
+      const leftRow = leftBox[r] || " ".repeat(leftW);
       const rightRow = rightBox[r] || " ".repeat(rightW);
       mergedLines.push(leftRow + " " + rightRow);
     }

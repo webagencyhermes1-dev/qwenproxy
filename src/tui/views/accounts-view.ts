@@ -4,7 +4,7 @@
 
 import type { TuiView, ProxyStatusSnapshot } from "../types.ts";
 import type { KeyEvent } from "../screen.ts";
-import { theme, glyphs, drawBox, pad, truncate } from "../theme.ts";
+import { theme, glyphs, drawBox, pad, truncate, splitPanes } from "../theme.ts";
 import {
   fetchProxyStatus,
   resetAllCooldowns,
@@ -674,9 +674,8 @@ if (key.name === "hover" && key.mouse) {
   public render(width: number, height: number, snapshot?: ProxyStatusSnapshot | null): string[] {
     const contentH = Math.max(12, height);
     this.lastContentH = contentH;
-    const leftW = Math.max(46, Math.floor(width * 0.54));
+    const { leftW, rightW } = splitPanes(width, 0.54, 46, 30);
     this.lastLeftW = leftW;
-    const rightW = Math.max(30, width - leftW - 1);
 
     if (snapshot) {
       this.statusData = snapshot;
@@ -783,7 +782,9 @@ if (key.name === "hover" && key.mouse) {
       height: contentH,
       borderColor: theme.borderActive,
       titleColor: theme.blue,
-      footer: this.statusMessage || undefined,
+      footer:
+        this.statusMessage ||
+        (data && !data.online ? theme.muted("Server offline — showing last known list") : undefined),
       content: leftContent,
     });
 

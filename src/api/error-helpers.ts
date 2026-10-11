@@ -13,6 +13,7 @@ import {
   InternalError,
   ClientAbortedError,
   ServiceUnavailable,
+  isAccountNotWarmedError,
 } from "../core/errors.js";
 import { classifyError } from "./error-classifier.js";
 
@@ -64,24 +65,28 @@ export function sendOpenAIError(
   err: unknown,
   fallbackStatus?: QwenProxyStatusCode,
 ): Response {
+  // Normalize first: a local "Account <id> is not warmed" AuthError is already
+  // a QwenProxyError, so the fast path below would otherwise echo it back as
+  // 401 invalid_api_key instead of the retryable 503 it actually is.
+  const input = isAccountNotWarmedError(err) ? classifyError(err) : err;
   let qwenProxyErr: QwenProxyError;
 
-  if (err instanceof QwenProxyError) {
-    qwenProxyErr = err;
+  if (input instanceof QwenProxyError) {
+    qwenProxyErr = input;
   } else {
-    const hint = (err as Record<string, unknown>)?.upstreamStatus;
+    const hint = (input as Record<string, unknown>)?.upstreamStatus;
     if (typeof hint === "number" && isValidStatus(hint)) {
       qwenProxyErr = errorForStatus(
         hint,
-        err instanceof Error ? err.message : String(err),
+        input instanceof Error ? input.message : String(input),
       );
     } else if (fallbackStatus) {
       qwenProxyErr = errorForStatus(
         fallbackStatus,
-        err instanceof Error ? err.message : String(err),
+        input instanceof Error ? input.message : String(input),
       );
     } else {
-      qwenProxyErr = classifyError(err);
+      qwenProxyErr = classifyError(input);
     }
   }
 

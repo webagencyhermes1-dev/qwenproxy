@@ -32,7 +32,7 @@ test("rebind: quota exhaust triggers rebind with compressed context, stays", () 
     markAccountHeadersReady("acc-b");
     // Turn 1: new session binds.
     const key = generateStickyKey({
-      messages: [{ role: "user", content: "session A task: refactor auth" } as Message],
+      explicitKey: "session A task: refactor auth",
     });
     for (let i = 0; i < 3; i++) {
       health.recordSuccess("acc-a", 800);

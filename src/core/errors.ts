@@ -121,5 +121,25 @@ export class ClientAbortedError extends QwenProxyError {
 export class ServiceUnavailable extends QwenProxyError {
   readonly statusCode = 503;
   readonly type = "service_unavailable";
-  readonly code = "service_degraded";
+  readonly code: string;
+
+  constructor(message: string, code = "service_degraded") {
+    super(message);
+    this.code = code;
+  }
+}
+
+/**
+ * Message marker for the local pool-capacity failure thrown when an account
+ * has no live Playwright context to fetch headers with
+ * ("Account <id> is not warmed ...").
+ *
+ * This is NOT a credential rejection even though it is raised as an AuthError:
+ * it means the pool had no warm context for the request, so callers must
+ * rotate/retry (and finally answer 503), never surface 401 invalid_api_key.
+ */
+export function isAccountNotWarmedError(err: unknown): boolean {
+  return (
+    err instanceof Error && err.message.includes("is not warmed")
+  );
 }

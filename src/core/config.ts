@@ -130,6 +130,10 @@ const envSchema = z
     RETRY_ON_UNKNOWN_UPSTREAM: z.string().default("true"),
     RETRY_AUTO_MALFORMED_TOOLS: z.string().default("true"),
     RETRY_AUTO_MALFORMED_TOOLS_MAX: z.string().default("2"),
+    STRICT_SESSION_ISOLATION: z.string().default("false"),
+    FAIL_ON_STREAM_MISMATCH: z.string().default("false"),
+    FAIL_ON_CAS_CONFLICT: z.string().default("false"),
+    DISABLE_IMPLICIT_THREAD: z.string().default("true"),
     // Per-request wall-clock budget for the CREATE phase (arrival -> first
     // upstream stream). An upstream that always rejects must surface a
     // structured error within this budget instead of looping until the client
@@ -215,8 +219,14 @@ const envSchema = z
     QWEN_BROWSER_ONLY_FETCH: z.string().default("true"),
     QWEN_MAP_OPENAI_MODELS: z.string().default("true"),
     // Local prompt byte budget enforced before the request reaches the
-    // browser replay. 0 disables the check (explicit opt-out, not default).
-    QWEN_MAX_PROMPT_BYTES: z.string().default("200000"),
+    // browser replay. Default 0 (off): a flat byte cap cannot tell an inbound
+    // client history from the payload we actually send upstream (thread-native
+    // deltas are tiny), and at 200000 it rejected requests (~55K tokens) that
+    // the model's ~1M-token window and the truncation pipeline handle fine —
+    // forcing clients to compact mid-session. The authoritative guards are
+    // JSON_BODY_LIMIT_BYTES (memory) and the model-aware token check +
+    // truncation in account.ts. Set >0 only to restore a hard byte reject.
+    QWEN_MAX_PROMPT_BYTES: z.string().default("0"),
     QWEN_MAX_PERSONALIZATION_BYTES: z.string().default("200000"),
     // Max inbound JSON body accepted on chat/completions (Content-Length
     // pre-check + post-parse byte count). Requests above it get 413.
@@ -463,6 +473,12 @@ export const config = {
       1,
       parseInt(env.QWEN_REPEATED_TOOL_CALL_WARN),
     ),
+  },
+  session: {
+    strictIsolation: env.STRICT_SESSION_ISOLATION === "true",
+    failOnStreamMismatch: env.FAIL_ON_STREAM_MISMATCH === "true",
+    failOnCasConflict: env.FAIL_ON_CAS_CONFLICT === "true",
+    disableImplicitThread: env.DISABLE_IMPLICIT_THREAD !== "false",
   },
   concurrency: {
     maxStreamsPerAccount: Math.max(1, parseInt(env.ACCOUNT_MAX_CONCURRENT_STREAMS)),

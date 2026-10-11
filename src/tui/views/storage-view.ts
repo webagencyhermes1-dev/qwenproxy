@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { TuiView } from "../types.ts";
 import type { KeyEvent } from "../screen.ts";
-import { theme, glyphs, drawBox, pad } from "../theme.ts";
+import { theme, glyphs, drawBox, pad, splitPanes } from "../theme.ts";
 import { pruneAllPlaywrightProfiles, cleanupOrphanProfiles } from "../../services/playwright.ts";
 import { getProfilesDir } from "../../core/paths.ts";
 import {
@@ -331,9 +331,8 @@ export class StorageView implements TuiView {
   }
   public render(width: number, height: number): string[] {
     const contentH = Math.max(12, height);
-    const leftW = Math.max(48, Math.floor(width * 0.48));
+    const { leftW, rightW } = splitPanes(width, 0.48, 48, 34);
     this.lastLeftW = leftW;
-    const rightW = Math.max(34, width - leftW - 1);
 
     // Map account directory UUIDs to real user emails
     const accountMap = new Map<string, string>();

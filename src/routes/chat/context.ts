@@ -85,41 +85,41 @@ export async function buildFinalContext(
 
   // Thread reuse is allowed when:
   // 1. Thread-native mode is active
-  // 2. Either: explicit session_id/conversation_id was provided
-  //    OR: this is a continuation (has assistant messages in history)
-  // This prevents new IDE chats from accidentally reusing old Qwen chats
-  // while still allowing continuations without explicit session_id
+  // 2. An explicit session_id/conversation_id was provided. Continuations
+  //    WITHOUT an explicit key must never read or write a logical-thread row:
+  //    their id is not client-unique, so sharing one binds unrelated clients to
+  //    the same upstream Qwen chat.
   const allowThreadReuse = isTempMode
     ? false
-    : useThreadNative && (hasExplicitConversationKey || !isNewSession); // has assistant messages = continuation of existing chat
+    : useThreadNative && hasExplicitConversationKey && !!conversationKey;
 
-  // Compute sessionId: only generate a persistent session ID when we have
-  // an explicit conversation key. Otherwise, generate an ephemeral ID for
-  // logging/metrics only (not used for thread reuse). Temp mode never persists
-  // a thread, so it has no session id.
-  const sessionId = isTempMode
-    ? null
-    : (conversationKey || useThreadNative)
-      ? deriveSessionId(
-          messages,
-          conversationKey ? completeInstructions : "",
-          conversationKey ?? "implicit-thread",
-        )
-      : null;
+  // Compute sessionId: only an explicit conversation key produces one. An
+  // implicit session gets NO id (never derived from prompt content — equal or
+  // empty first prompts would collide across clients). Temp mode never
+  // persists a thread, so it has no session id either.
+  const sessionId =
+    isTempMode || !conversationKey
+      ? null
+      : deriveSessionId(messages, completeInstructions, conversationKey);
 
   // Only load existing thread when reuse is allowed
   const existingThread = allowThreadReuse
     ? getLogicalThreadState(sessionId)
     : null;
 
-  const hasTrailingToolResult = detectTrailingToolResult(messages);
-  // Thread-native: send full history when Qwen has no context yet, but preserve
-  // tool-result deltas because the upstream parent chain already owns the call.
+  // Thread-native: a delta (current prompt only) is safe ONLY when an existing
+  // upstream thread will receive it — the parent chain already owns the prior
+  // turns, including the assistant's tool call, so replaying them would
+  // duplicate context. When Qwen has no context yet (no reusable thread: no
+  // session key, lost/expired/dirty thread), the FULL history must be sent:
+  // a tool-result turn with no thread would otherwise open a brand-new chat
+  // containing nothing but "Tool Response (...)" fragments, and the model
+  // would answer with no memory of the task or its own tool call
+  // ("What would you like to do?").
   // Temp mode: always send the FULL history (OpenAI standard).
   const baseActivePrompt = isTempMode
     ? prompt
-    : (!existingThread && !hasTrailingToolResult ? prompt : currentPrompt) ||
-      prompt;
+    : (existingThread ? currentPrompt : prompt) || prompt;
 
   // If the previous turn of this session was closed early at the per-turn
   // tool-call cap, tell the model so it knows calls beyond the cap were NOT
@@ -222,15 +222,6 @@ function extractMessageText(message: Message | undefined): string {
   }
   if (content && typeof content === "object") return JSON.stringify(content);
   return "";
-}
-
-function detectTrailingToolResult(messages: Message[]): boolean {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const role = messages[i].role;
-    if (role === "system") continue;
-    return role === "tool" || role === "function";
-  }
-  return false;
 }
 
 function detectTitleGenerationRequest(messages: Message[]): boolean {

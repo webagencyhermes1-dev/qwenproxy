@@ -621,6 +621,15 @@ export async function processNonStreamingResponse(
       });
     }
 
+    if (!finalContent && toolCallsOut.length === 0 && reasoningBuffer) {
+      logger.warn("[chat] non-stream: no answer content — promoting reasoning to content", {
+        reasoningLength: reasoningBuffer.length,
+      });
+      finalContent = reasoningBuffer.length > 4000
+        ? reasoningBuffer.slice(0, 4000) + "\n\n[Response ended during reasoning phase. Please retry.]"
+        : reasoningBuffer;
+    }
+
     const usage = enrichUsageWithContextMeter(
       buildUsage(usageAccumulator),
       currentTokenEstimationContext?.contextMeter,
@@ -2591,6 +2600,25 @@ export async function processStreamingResponse(
       if (pendingParentId && upstreamDone) {
         rememberParent(pendingParentId);
         pendingParentId = null;
+      }
+
+      const hasEmittedToolCalls =
+        toolParser !== null && toolParser.getEmittedToolCallCount() > 0;
+      if (
+        !clientDisconnected &&
+        !finalContent &&
+        !hasEmittedToolCalls &&
+        reasoningBuffer
+      ) {
+        logger.warn("[chat] stream: no answer content emitted — promoting reasoning to content", {
+          completionId,
+          reasoningLength: reasoningBuffer.length,
+        });
+        const fallback = reasoningBuffer.length > 4000
+          ? reasoningBuffer.slice(0, 4000) + "\n\n[Response ended during reasoning phase. Please retry.]"
+          : reasoningBuffer;
+        finalContent = fallback;
+        writeDeltaEvent({ content: fallback });
       }
 
       // Finish reason + usage + [DONE]

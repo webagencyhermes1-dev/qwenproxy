@@ -84,6 +84,11 @@ import { setWafContextResetListener } from "../core/waf-isolation.ts";
 import { recordAccountFailure } from "../core/account-health.ts";
 import { markAccountAuthError } from "../core/account-state.ts";
 import { updateQwenWebVersion, getQwenWebVersion } from "./qwen-headers.ts";
+import {
+  accountPages,
+  isPlaywrightInitialized,
+  isPlaywrightPageAlive,
+} from "./playwright-page-state.ts";
 import { getAccountProfilePath, getProfilesDir } from "../core/paths.ts";
 import {
   ensureBrowserProcessHygiene,
@@ -509,7 +514,7 @@ async function recoverStuckAccountMutex(
       skipStorageSave: true,
     });
   }
-  cleanupPlaywrightAccountState(accountId);
+  await cleanupPlaywrightAccountState(accountId);
 
   // 3) Reclaim the lock itself. Deleting the map entry (the old behavior)
   //    orphaned a mutex whose waiter queue stayed stranded and whose holder
@@ -550,9 +555,10 @@ async function acquireAccountMutex(
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-// Per-account browser contexts and pages
+// Per-account browser contexts and pages. accountPages lives in
+// ./playwright-page-state.ts so core readiness gates can query page state
+// without importing this module (see the note there).
 const accountContexts = new Map<string, BrowserContext>();
-const accountPages = new Map<string, Page>();
 const cachedUserAgents = new Map<string, string>();
 
 let sharedBrowser: Browser | null = null;
@@ -786,7 +792,7 @@ export async function getOrLaunchSharedBrowser(
       console.warn("[Playwright] Shared browser disconnected");
       sharedBrowser = null;
       for (const accountId of Array.from(accountPages.keys())) {
-        cleanupPlaywrightAccountState(accountId);
+        void cleanupPlaywrightAccountState(accountId);
       }
     });
 
@@ -2396,7 +2402,7 @@ export async function initPlaywrightForAccount(
       touchAccountActivity(account.id);
     } catch (error) {
       await closePlaywrightContextBestEffort(account.id, acctContext, { skipStorageSave: true });
-      cleanupPlaywrightAccountState(account.id);
+      await cleanupPlaywrightAccountState(account.id);
       throw error;
     }
       },
@@ -2447,7 +2453,7 @@ async function dropDeadAccountContext(accountId: string): Promise<void> {
       skipStorageSave: true,
     }).catch(() => {});
   }
-  cleanupPlaywrightAccountState(accountId);
+  await cleanupPlaywrightAccountState(accountId);
 }
 
 // ─── Standby Validation ──────────────────────────────────────────────────────
@@ -2583,7 +2589,7 @@ export async function validateAccountLogin(
     } finally {
       // Always close browser after validation
       await closePlaywrightContextBestEffort(account.id, acctContext);
-      cleanupPlaywrightAccountState(account.id);
+      await cleanupPlaywrightAccountState(account.id);
     }
   } finally {
     release();
@@ -2923,19 +2929,33 @@ async function loginViaUi(
     // behind an explicit toggle, so switch modes first — otherwise the
     // password wait below times out on every attempt.
     const passwordSelector =
-      'input[type="password"], input[name="password"]';
+      'input[type="password"], input[name="password"], input[autocomplete="current-password"]';
     const passwordVisibleInitially = await page
       .locator(passwordSelector)
       .first()
       .isVisible()
       .catch(() => false);
     if (!passwordVisibleInitially) {
-      const passwordModeToggle = page
-        .locator('button:has-text("Log in with a password")')
-        .first();
-      if (await passwordModeToggle.isVisible().catch(() => false)) {
-        await passwordModeToggle.click({ timeout: 3_000 }).catch(() => {});
-        await sleep(500);
+      const passwordToggleSelectors = [
+        'button:has-text("Log in with a password")',
+        'button:has-text("Sign in with a password")',
+        'button:has-text("Use password")',
+        'button:has-text("Use Password")',
+        'button:has-text("Password login")',
+        'button:has-text("Continue with password")',
+        'button:has-text("password")',
+        'a:has-text("Log in with a password")',
+        'a:has-text("password")',
+        '[role="button"]:has-text("password" i)',
+        '[role="tab"]:has-text("password" i)',
+      ];
+      for (const toggleSel of passwordToggleSelectors) {
+        const passwordModeToggle = page.locator(toggleSel).first();
+        if (await passwordModeToggle.isVisible().catch(() => false)) {
+          await passwordModeToggle.click({ timeout: 3_000 }).catch(() => {});
+          await sleep(500);
+          break;
+        }
       }
     }
 
@@ -2943,9 +2963,16 @@ async function loginViaUi(
     const emailSelector = [
       'input[type="email"]',
       'input[name="email"]',
+      'input[name="Email"]',
+      'input[name="loginId"]',
       'input[autocomplete="email"]',
+      'input[autocomplete="username"]',
       'input[placeholder*="Email" i]',
       'input[placeholder*="email" i]',
+      'input[placeholder*="account" i]',
+      'input[type="text"][name*="mail" i]',
+      'input[type="text"][id*="mail" i]',
+      'input[type="text"][id*="account" i]',
     ].join(", ");
     try {
       await page.waitForSelector(emailSelector, {
@@ -3921,7 +3948,7 @@ export async function withAccountPage<T>(
         if (context) {
           await closePlaywrightContextBestEffort(accountId, context, { skipStorageSave: true });
         }
-        cleanupPlaywrightAccountState(accountId);
+        await cleanupPlaywrightAccountState(accountId);
       }
       throw error;
     }
@@ -4589,7 +4616,7 @@ export function installContextDeathHandlers(
   page: Page,
 ): void {
   const onDeath = (): void => {
-    cleanupPlaywrightAccountState(accountId);
+    void cleanupPlaywrightAccountState(accountId);
     void closePlaywrightContextBestEffort(accountId, context, { skipStorageSave: true }).catch((error: unknown) => {
       logger.warn("[Playwright] context-death close suppressed", {
         accountId,
@@ -4602,23 +4629,16 @@ export function installContextDeathHandlers(
   page.on("crash", onDeath);
 }
 
-function cleanupPlaywrightAccountState(accountId: string): void {
+async function cleanupPlaywrightAccountState(accountId: string): Promise<void> {
   accountContexts.delete(accountId);
   accountPages.delete(accountId);
   headerCaches.delete(accountId);
   cookieCaches.delete(accountId);
   lastAccountActivity.delete(accountId);
   lastKeepAliveNavigation.delete(accountId);
-  // The context (and any in-flight reservation) is gone: free the hard-cap
-  // slot so a queued launch waiting in acquireContextAdmission can proceed.
   releaseContextAdmission(accountId);
   clearFingerprintCache(accountId);
-  // The account's context died/closed — its captured headers are stale or the
-  // page is gone, so it must not be selected by the rotation gate until a
-  // fresh capture succeeds again.
-  unmarkAccountHeadersReady(accountId);
-  // The ownership move (READY → RECOVERING) makes the account a warmup
-  // candidate; wake the controller so re-warm starts now, not next interval.
+  await unmarkAccountHeadersReady(accountId);
   void import("../runtime/construct.ts")
     .then((m) => m.requestReadinessTick("context-death"))
     .catch(() => {});
@@ -4739,7 +4759,7 @@ async function closePlaywrightForAccountLocked(
       await closePlaywrightContextBestEffort(accountId, acctContext);
     }
   } finally {
-    cleanupPlaywrightAccountState(accountId);
+    await cleanupPlaywrightAccountState(accountId);
     try {
       const profilePath = getAccountProfilePath(accountId);
       prunePlaywrightProfileCaches(profilePath);
@@ -4774,6 +4794,10 @@ export function isPlaywrightAlreadyClosedError(error: unknown): boolean {
     message.includes("Network.setCacheDisabled") ||
     message.includes("Protocol error")
   );
+}
+
+export function isPlaywrightSessionDeathError(error: unknown): boolean {
+  return isPlaywrightAlreadyClosedError(error);
 }
 
 export async function closePlaywrightForAccount(
@@ -4846,9 +4870,10 @@ export async function closeAllPlaywright(): Promise<void> {
 
 // ─── Status ───────────────────────────────────────────────────────────────────
 
-export function isPlaywrightInitialized(accountId: string): boolean {
-  return accountPages.has(accountId);
-}
+// Defined in ./playwright-page-state.ts (leaf: core readiness gates must be
+// able to query page state without importing this module and re-creating the
+// waf-isolation cycle) and re-exported here for existing consumers.
+export { isPlaywrightInitialized, isPlaywrightPageAlive };
 
 /**
  * Register an account as if it had been initialized, with a chosen last

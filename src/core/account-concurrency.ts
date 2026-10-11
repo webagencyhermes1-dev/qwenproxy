@@ -115,10 +115,12 @@ export function isAccountSlotHeldByOtherSession(
   accountId: string,
   label: string | null | undefined,
 ): boolean {
-  if (!label) return false;
   const slot = slots.get(accountId);
   if (!slot) return false;
   if (slot.activeLeases.length === 0) return false;
+  // Fail closed: an unknown holder must never be treated as OUR session, or an
+  // unlabeled caller would wait the full forever-cap on someone else's stream.
+  if (!label) return true;
   if (slot.activeLeases.length < config.concurrency.maxStreamsPerAccount) {
     return false;
   }
@@ -640,6 +642,13 @@ export function abortLeaseByLabel(
       }
     }
   }
+
+  logger.info("concurrency: superseding same-session lease", {
+    accountId,
+    label,
+    oldLeaseId: lease.leaseId,
+    oldCompletionId: lease.completionId ?? null,
+  });
 
   const heldMs = Date.now() - lease.acquiredAt;
   slot.activeLeases.splice(idx, 1);

@@ -1,18 +1,24 @@
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import type { Message } from "./types.js";
 
 /**
  * Derive a deterministic session ID from a caller-provided conversation key
  * plus the conversation's anchoring content.
+ *
+ * An absent/empty conversation key is never hashed: content-derived ids would
+ * collide across clients sharing the same first prompt, so a unique ephemeral
+ * id is minted instead.
  */
 export function deriveSessionId(
   messages: Message[],
   systemPrompt: string = "",
   conversationKey?: string,
 ): string {
+  const key = conversationKey?.trim();
+  if (!key) return `sess_eph_${randomUUID()}`;
   const firstUser = messages.find((m) => m.role === "user");
   const anchor = [
-    conversationKey?.trim(),
+    key,
     systemPrompt.trim(),
     extractTextContent(firstUser),
   ]

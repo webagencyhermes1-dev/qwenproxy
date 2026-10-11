@@ -4,6 +4,7 @@ import test from "node:test";
 import { generateStickyKey, extractFirstUserText } from "../services/session/key.ts";
 
 const HEX16 = /^[0-9a-f]{16}$/;
+const EPHEM = /^ephem:[0-9a-f-]{36}$/;
 
 test("stickyKey: header takes priority over first message", () => {
   const a = generateStickyKey({
@@ -18,14 +19,14 @@ test("stickyKey: header takes priority over first message", () => {
   assert.equal(a, b);
 });
 
-test("stickyKey: same first message produces same key", () => {
+test("stickyKey: same first message without a key produces distinct keys", () => {
   const a = generateStickyKey({
     messages: [{ role: "user", content: "fix the bug" } as never],
   });
   const b = generateStickyKey({
     messages: [{ role: "user", content: "fix the bug" } as never],
   });
-  assert.equal(a, b);
+  assert.notEqual(a, b, "content must never identify the sticky namespace");
 });
 
 test("stickyKey: different first messages produce different keys", () => {
@@ -38,12 +39,12 @@ test("stickyKey: different first messages produce different keys", () => {
   assert.notEqual(a, b);
 });
 
-test("stickyKey: missing both produces random key", () => {
+test("stickyKey: missing both produces ephemeral key", () => {
   const a = generateStickyKey({ messages: [] });
   const b = generateStickyKey({ messages: [] });
-  assert.match(a, HEX16);
-  assert.match(b, HEX16);
-  // Random fallback must (almost certainly) differ.
+  assert.match(a, EPHEM);
+  assert.match(b, EPHEM);
+  // Ephemeral fallback must (almost certainly) differ.
   assert.notEqual(a, b);
 });
 

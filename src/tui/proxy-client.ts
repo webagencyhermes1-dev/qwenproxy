@@ -93,10 +93,26 @@ export function formatUptime(seconds: number): string {
   return `${pad2(mins)}:${pad2(secs)}`;
 }
 
-let healthPollMutex = false;
-let lastHealthPollTime = 0;
+let pollInFlight: Promise<void> | null = null;
+let lastPollStartedAt = 0;
 let cachedStatus: ProxyStatusSnapshot | null = null;
 let lastStatusTime = 0;
+
+/** Minimum spacing between two /health polls (the app polls every second). */
+const POLL_MIN_INTERVAL_MS = 1000;
+/**
+ * Budget for a /health round-trip. The old 350ms budget was tighter than a
+ * busy server can reliably meet, so a loaded instance looked "dead" and the
+ * TUI dropped back to an empty account list while it was serving fine.
+ */
+const HEALTH_TIMEOUT_MS = 1000;
+/**
+ * How long the last successful snapshot is served as-is. Beyond it the data is
+ * still returned (marked offline) instead of being replaced by an empty list —
+ * losing the account rows is what made the Accounts tab flicker to "No
+ * accounts configured" whenever the server was restarting or momentarily slow.
+ */
+const LAST_KNOWN_MAX_AGE_MS = 15000;
 
 async function fetchHealth(): Promise<any> {
   const port = config.server?.port || 7936;
@@ -104,7 +120,7 @@ async function fetchHealth(): Promise<any> {
   const host = configuredHost && configuredHost !== "0.0.0.0" ? configuredHost : "127.0.0.1";
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 350);
+  const timeout = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
 
   try {
     const resp = await fetch(`http://${host}:${port}/health`, {
@@ -123,33 +139,54 @@ async function fetchHealth(): Promise<any> {
   return null;
 }
 
-export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
-  const now = Date.now();
+function offlineSnapshot(): ProxyStatusSnapshot {
+  return {
+    online: false,
+    port: config.server?.port || 7936,
+    host: config.server?.host || "127.0.0.1",
+    overallStatus: "offline",
+    uptimeSeconds: process.uptime(),
+    rssMb: 0,
+    systemMemoryPct: 0,
+    activeStreams: 0,
+    waitingStreams: 0,
+    accounts: [],
+    pool: null,
+    performance: null,
+  };
+}
 
-  // Serialized polling - prevent overlapping requests
-  if (healthPollMutex || now - lastHealthPollTime < 1000) {
-    if (cachedStatus && now - lastStatusTime < 5000) {
-      return cachedStatus;
-    }
-  }
+/**
+ * Maps one `/health` payload onto a snapshot, using `previous` to survive a
+ * degraded read: /health builds its account rows inside a best-effort block,
+ * so it can answer 200 with `accounts: []` while the pool still reports rows.
+ * Reporting that as "no accounts" is what made the Accounts tab flicker, so a
+ * contradictory payload keeps the rows we already had.
+ */
+export function buildStatusSnapshot(
+  healthData: any,
+  previous: ProxyStatusSnapshot | null,
+): ProxyStatusSnapshot {
+  const port = config.server?.port || 7936;
+  const configuredHost = config.server?.host;
+  const host = configuredHost && configuredHost !== "0.0.0.0" ? configuredHost : "127.0.0.1";
 
-  healthPollMutex = true;
-  lastHealthPollTime = now;
+  const reported = Array.isArray(healthData?.accounts) ? healthData.accounts : [];
+  const poolTotal = Number(healthData?.pool?.total ?? 0);
+  const keepLastAccounts =
+    reported.length === 0 &&
+    previous !== null &&
+    previous.accounts.length > 0 &&
+    (poolTotal > 0 || !healthData?.pool);
 
-  try {
-    const healthData = await fetchHealth();
-
-    if (healthData) {
-      const port = config.server?.port || 7936;
-      const configuredHost = config.server?.host;
-      const host = configuredHost && configuredHost !== "0.0.0.0" ? configuredHost : "127.0.0.1";
-
-      const accounts = (healthData.accounts || []).map((acc: any) => {
+  const accounts = keepLastAccounts
+    ? previous!.accounts
+    : reported.map((acc: any) => {
         // Use rawId if available, otherwise use id (masked)
         const accountId = acc.rawId || acc.id || "";
         // Use account field for email, or fall back to email field
         const emailOrName = maskAccountIdentifier(acc.account || acc.email || accountId || "");
-        
+
         return {
           id: accountId,
           emailOrName,
@@ -170,60 +207,80 @@ export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
         };
       });
 
-      cachedStatus = {
-        online: true,
-        port,
-        host,
-        overallStatus: healthData.status || "healthy",
-        uptimeSeconds: healthData.uptimeSeconds,
-        rssMb: healthData.rssMb,
-        systemMemoryPct: healthData.systemMemoryPct,
-        activeStreams: healthData.activeStreams,
-        waitingStreams: healthData.waitingStreams,
-        accounts,
-        pool: healthData.pool ? {
-          total: healthData.pool.total,
-          ready: healthData.pool.ready,
-          warming: healthData.pool.warming,
-          busy: healthData.pool.busy,
-          cooldown: healthData.pool.cooldown,
-          authError: healthData.pool.authError,
-          broken: healthData.pool.broken,
-          disabled: healthData.pool.disabled,
-          activeStreams: healthData.pool.activeStreams,
-          queued: healthData.pool.queued,
-          successRate: healthData.pool.successRate,
-          averageHealth: healthData.pool.averageHealth,
-        } : null,
-        performance: healthData.performance || null,
-      };
-      lastStatusTime = now;
-    }
-  } catch {} finally {
-    healthPollMutex = false;
+  return {
+    online: true,
+    port,
+    host,
+    overallStatus: healthData?.status || "healthy",
+    uptimeSeconds: healthData?.uptimeSeconds,
+    rssMb: healthData?.rssMb,
+    systemMemoryPct: healthData?.systemMemoryPct,
+    activeStreams: healthData?.activeStreams,
+    waitingStreams: healthData?.waitingStreams,
+    accounts,
+    pool: healthData?.pool ? {
+      total: healthData.pool.total,
+      ready: healthData.pool.ready,
+      warming: healthData.pool.warming,
+      busy: healthData.pool.busy,
+      cooldown: healthData.pool.cooldown,
+      authError: healthData.pool.authError,
+      broken: healthData.pool.broken,
+      disabled: healthData.pool.disabled,
+      activeStreams: healthData.pool.activeStreams,
+      queued: healthData.pool.queued,
+      successRate: healthData.pool.successRate,
+      averageHealth: healthData.pool.averageHealth,
+    } : null,
+    performance: healthData?.performance || null,
+  };
+}
+
+/** One poll. Never throws; failures simply leave the previous snapshot alone. */
+async function pollHealth(): Promise<void> {
+  try {
+    const healthData = await fetchHealth();
+    if (!healthData) return;
+
+    cachedStatus = buildStatusSnapshot(healthData, cachedStatus);
+    lastStatusTime = Date.now();
+  } catch {}
+}
+
+export async function fetchProxyStatus(): Promise<ProxyStatusSnapshot> {
+  const now = Date.now();
+
+  // Single-flight polling: callers coalesce onto one in-flight request instead
+  // of stacking overlapping ones (the old mutex let a second poll start while
+  // the first was still running).
+  let startedHere = false;
+  if (!pollInFlight && now - lastPollStartedAt >= POLL_MIN_INTERVAL_MS) {
+    lastPollStartedAt = now;
+    pollInFlight = pollHealth().finally(() => {
+      pollInFlight = null;
+    });
+    startedHere = true;
   }
 
-  if (cachedStatus && now - lastStatusTime < 10000) {
+  // Only the caller that starts a poll waits for it (the periodic status
+  // poller, which should paint fresh data). Keypress-driven refreshes reuse
+  // the cache instead of stalling on a slow server; with no cache yet every
+  // caller waits so the first frame is not drawn as "offline".
+  if ((startedHere || !cachedStatus) && pollInFlight) {
+    await pollInFlight;
+  }
+
+  if (!cachedStatus) {
+    return offlineSnapshot();
+  }
+
+  if (Date.now() - lastStatusTime <= LAST_KNOWN_MAX_AGE_MS) {
     return cachedStatus;
   }
 
-  // Fallback when server is offline
-  const fallbackStatus: ProxyStatusSnapshot = {
-    online: false,
-    port: config.server?.port || 7936,
-    host: config.server?.host || "127.0.0.1",
-    overallStatus: "offline",
-    uptimeSeconds: process.uptime(),
-    rssMb: 0,
-    systemMemoryPct: 0,
-    activeStreams: 0,
-    waitingStreams: 0,
-    accounts: [],
-    pool: null,
-    performance: null,
-  };
-
-  return fallbackStatus;
+  // Server stopped answering: keep the last-known accounts/pool, only flag the
+  // snapshot as offline so views can show the state without losing the list.
+  return { ...cachedStatus, online: false, overallStatus: "offline" };
 }
 
 export interface StreamChatOptions {

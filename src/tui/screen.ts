@@ -4,7 +4,7 @@
 
 import readline from "node:readline";
 import fs from "node:fs";
-import { ANSI, theme, pad } from "./theme.ts";
+import { ANSI, theme, pad, truncate, stringWidth } from "./theme.ts";
 import { ServerManager } from "./server-manager.ts";
 export interface MouseInfo {
   type: "click" | "release" | "drag" | "scroll-up" | "scroll-down" | "hover";
@@ -193,6 +193,9 @@ export class Screen {
 
     this.resizeHandler = () => {
       if (!this.active) return;
+      // Terminals reflow on resize, so the cached frame no longer matches the
+      // screen: force a full repaint instead of a diff against stale rows.
+      this.prevRenderedRows = [];
       const { cols, rows } = this.getSize();
       for (const listener of this.resizeListeners) {
         listener(cols, rows);
@@ -295,13 +298,22 @@ export class Screen {
         "",
         theme.muted("  Press Ctrl+C twice to exit."),
       ];
-      process.stdout.write(ANSI.cursorHome + warnLines.join("\n") + "\n");
+      // Drop the cached frame so recovering from this state repaints
+      // everything; clearing here also removes the old frame that would
+      // otherwise stay visible around the warning.
+      this.prevRenderedRows = [];
+      process.stdout.write(ANSI.cursorHome + "\x1b[2J" + warnLines.join("\n") + "\n");
       return;
     }
     const currentRows: string[] = [];
     for (let r = 0; r < rows; r++) {
       const rawLine = r < lines.length ? lines[r] : "";
-      currentRows.push(pad(rawLine, cols));
+      const padded = pad(rawLine, cols);
+      // Never emit more than `cols` cells: a wider line wraps in the terminal
+      // and scrolls the frame out of sync (every row below shifts).
+      currentRows.push(
+        stringWidth(padded) > cols ? truncate(padded, cols) + ANSI.reset : padded,
+      );
     }
 
     let diffBuffer = "";

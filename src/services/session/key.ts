@@ -5,17 +5,17 @@
  *  1. X-Session-Id header (covers Claude Code / Codex explicit sessions,
  *     also accepts x-session-id, session_id / conversation_id body fields
  *     via the caller's `explicitKey`).
- *  2. First user message text.
- *  3. systemPrompt + first user message (when caller passes systemPrompt).
- *  4. Random per-request key (no stickiness; warns).
+ *  2. Per-request unique key (no stickiness; warns).
  *
- * Always returns 16 lowercase hex chars. Deterministic for same input.
+ * Header keys are 16 lowercase hex chars, deterministic for the same input.
+ * The fallback is never derived from prompt content: two clients with the
+ * same (or empty) first message must not share a sticky namespace.
  */
 
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Message } from "../../utils/types.ts";
 
-export type StickyKeySource = "header" | "first_message" | "combined" | "random";
+export type StickyKeySource = "header" | "ephemeral";
 
 export interface StickyKeyRequest {
   sessionHeader?: string | null;
@@ -57,27 +57,13 @@ export function generateStickyKey(req: StickyKeyRequest): string {
     console.log(`[Session] Sticky key generated | key=${key} | source=header`);
     return key;
   }
-  const firstUser = extractFirstUserText(req.messages);
-  if (firstUser.trim().length > 0 && !req.systemPrompt?.trim()) {
-    const key = sha16(firstUser);
-    console.log(`[Session] Sticky key generated | key=${key} | source=first_message`);
-    return key;
-  }
-  if (firstUser.trim().length > 0 || req.systemPrompt?.trim()) {
-    const combined = `${req.systemPrompt?.trim() ?? ""}|${firstUser}`;
-    if (combined.replace("|", "").trim().length > 0) {
-      const key = sha16(combined);
-      console.log(`[Session] Sticky key generated | key=${key} | source=combined`);
-      return key;
-    }
-  }
-  const key = randomBytes(8).toString("hex");
+  const key = `ephem:${randomUUID()}`;
   console.warn(`[Session] No stable key; session will not be sticky | key=${key}`);
-  console.log(`[Session] Sticky key generated | key=${key} | source=random`);
+  console.log(`[Session] Sticky key generated | key=${key} | source=ephemeral`);
   return key;
 }
 
-/** True when the key came from a stable source (anything but random fallback). */
+/** True when the key came from a stable source (anything but the ephemeral fallback). */
 export function isStableStickyKey(source: StickyKeySource): boolean {
-  return source !== "random";
+  return source !== "ephemeral";
 }

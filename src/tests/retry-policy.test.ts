@@ -12,6 +12,7 @@ import {
   throwFromSseUpstreamError,
   toRetryableStreamError,
 } from "../routes/chat/retry-policy.ts";
+import { healthKindForFailure } from "../routes/chat/account.ts";
 import {
   getQwenErrorCode,
   QwenNetworkError,
@@ -24,6 +25,7 @@ import {
   AuthError,
   ContextLengthExceededError,
   ClientAbortedError,
+  ServiceUnavailable,
 } from "../core/errors.ts";
 import { config } from "../core/config.ts";
 import { parseQwenErrorPayload } from "../routes/chat/errors.ts";
@@ -520,4 +522,87 @@ test("throwFromSseUpstreamError: data_inspection_failed throws non-retryable mod
       return true;
     },
   );
+});
+
+// ─── Local "not warmed" failures (pool capacity, never credentials) ──────────
+
+test("classifyRetryAction: a local 'not warmed' AuthError rotates instead of terminating", () => {
+  const notWarmed = new AuthError(
+    "Account a1 is not warmed. The pool controller will prepare it in the background.",
+  );
+
+  // The reason this branch has to run FIRST: by class the error is terminal.
+  assert.equal(
+    isTerminalLocalError(notWarmed),
+    true,
+    "AuthError is terminal by class — the policy must special-case it before this check",
+  );
+
+  const action = classifyRetryAction(notWarmed);
+  assert.equal(action.retryable, true, "must not fail the request as terminal");
+  assert.equal(action.switchAccount, true, "must rotate to a live account");
+  assert.equal(action.reason, "account_not_hot");
+  assert.equal(
+    action.accountCooldownMs,
+    undefined,
+    "a readiness race must not cool a healthy account",
+  );
+  assert.equal(action.accountCooldownReason, undefined);
+  assert.notEqual(action.reason, "terminal_local");
+});
+
+test("classifyRetryAction: request-path 'not warmed' gate error rotates without an init cooldown", () => {
+  const gateError = Object.assign(new Error("Account a2 is not warmed"), {
+    code: "account_not_hot",
+    switchAccount: true,
+  });
+
+  const action = classifyRetryAction(gateError);
+  assert.equal(action.reason, "account_not_hot");
+  assert.equal(action.retryable, true);
+  assert.equal(action.switchAccount, true);
+  assert.equal(
+    action.accountCooldownMs,
+    undefined,
+    "the account-initialization cooldown must not apply (the readiness controller re-warms it)",
+  );
+});
+
+test("classifyRetryAction: empty warm pool (no_hot_account) is retryable with rotation", () => {
+  const capacity = new ServiceUnavailable(
+    "No warmed Qwen account context is available right now. The pool controller is preparing accounts in the background; retry in about 3s.",
+    "no_hot_account",
+  );
+
+  const action = classifyRetryAction(capacity);
+  assert.equal(action.reason, "no_hot_account");
+  assert.equal(action.retryable, true);
+  assert.equal(action.switchAccount, true);
+  assert.equal(action.accountCooldownMs, undefined);
+});
+
+test("classifyError: a local 'not warmed' AuthError answers 503, never 401", () => {
+  const notWarmed = new AuthError(
+    "Account a1 is not warmed. The pool controller will prepare it in the background.",
+  );
+
+  const classified = classifyError(notWarmed);
+  assert.equal(
+    classified.statusCode,
+    503,
+    "pool capacity must not be reported to the client as invalid_api_key",
+  );
+  assert.equal(classified.code, "no_hot_account");
+  assert.match(classified.message, /is not warmed/);
+
+  // Wrapped variants (an outer layer prefixed the message) keep the mapping.
+  const wrapped = classifyError(
+    new Error(`Upload failed: Account a1 is not warmed`),
+  );
+  assert.equal(wrapped.statusCode, 503);
+});
+
+test("healthKindForFailure: readiness races do not debit account health", () => {
+  assert.equal(healthKindForFailure("account_not_hot"), null);
+  assert.equal(healthKindForFailure("no_hot_account"), null);
 });

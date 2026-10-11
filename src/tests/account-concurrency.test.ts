@@ -66,8 +66,8 @@ test("AccountConcurrency: slot at capacity held by another session is detected",
   );
   assert.strictEqual(
     isAccountSlotHeldByOtherSession("acc-cross-session", ""),
-    false,
-    "empty label never counts as held by other",
+    true,
+    "empty label fails closed on a busy slot (never treated as our own session)",
   );
 
   leaseA.release();

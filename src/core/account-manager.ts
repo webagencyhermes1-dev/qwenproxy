@@ -35,6 +35,12 @@ import {
   getAccountOwnership,
   isAccountOwnershipBound,
 } from "../runtime/account/instance.ts";
+// Page-state queries come from the leaf module, not services/playwright.ts:
+// importing the browser layer here closes the
+// waf-isolation -> account-manager -> playwright -> waf-isolation cycle and
+// crashes module initialization with a TDZ ReferenceError depending on entry
+// order (src/tests/waf-isolation.test.ts).
+import { isPlaywrightInitialized, isPlaywrightPageAlive } from "../services/playwright-page-state.ts";
 
 /** Accounts currently warming (ownership WARMING status; empty when unbound). */
 function getWarmingAccountIds(): string[] {
@@ -241,14 +247,16 @@ export function markAccountHeadersReady(accountId: string): void {
   headersReadyAccounts.add(accountId);
 }
 
-export function unmarkAccountHeadersReady(accountId: string): void {
+export async function unmarkAccountHeadersReady(accountId: string): Promise<void> {
   if (!accountId) return;
   if (isAccountOwnershipBound()) {
     const ownership = getAccountOwnership();
     // Only a lease-free READY account may move; RESERVED/GENERATING carry a
     // live generation and recover through the release path instead.
     if (ownership.getAccountStatus(accountId) === "READY") {
-      void ownership.recoverAccount(accountId, "context-death").catch(() => {});
+      try {
+        await ownership.recoverAccount(accountId, "context-death");
+      } catch {}
     }
     return;
   }
@@ -261,16 +269,26 @@ export function isAccountHeadersReady(accountId: string): boolean {
     // A leased account (RESERVED/GENERATING) is hot by construction: the set
     // stayed marked for the whole generation under the legacy model, and the
     // same-generation re-entry check depends on passing here.
-    return status === "READY" || status === "RESERVED" || status === "GENERATING";
+    if (status !== "READY" && status !== "RESERVED" && status !== "GENERATING") {
+      return false;
+    }
+  } else if (!headersReadyAccounts.has(accountId)) {
+    return false;
   }
-  return headersReadyAccounts.has(accountId);
+  return !isPlaywrightInitialized(accountId) || isPlaywrightPageAlive(accountId);
 }
 
 export function getHeadersReadyAccountIds(): string[] {
-  if (isAccountOwnershipBound()) {
-    return [...getAccountOwnership().listAccountsByStatus("READY")];
-  }
-  return Array.from(headersReadyAccounts);
+  // Both backings must agree with isAccountHeadersReady: a READY record whose
+  // Playwright context died (page closed but still in the map) is listed as
+  // READY by the state machine while the gate rejects it. Downstream readers
+  // (implicit header resolution, /v1/models gating, pool warm counts) must see
+  // the same truth as the request-path gate, otherwise they select an account
+  // that can only answer with "Account <id> is not warmed".
+  const ids = isAccountOwnershipBound()
+    ? [...getAccountOwnership().listAccountsByStatus("READY")]
+    : Array.from(headersReadyAccounts);
+  return ids.filter((id) => isAccountHeadersReady(id));
 }
 
 export function clearAllHeadersReadyAccounts(): void {
@@ -411,7 +429,11 @@ export function pickNextHotCandidate(
     syncCooldownsFromDb(accounts);
     for (const id of peekReadyAccountIds(triedSet)) {
       const account = accounts.find((a) => a.id === id);
-      if (account) return account;
+      // READY in the state machine is not sufficient: re-apply the same
+      // readiness truth as the request-path gate so a READY record whose
+      // context died (page closed) is never handed to a caller that can only
+      // answer with "Account <id> is not warmed".
+      if (account && isAccountHeadersReady(id)) return account;
     }
     return null;
   }
