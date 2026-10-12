@@ -53,11 +53,16 @@ Last updated: 2026-10-12
 - Global compaction config: `tail_turns: 10`, `preserve_recent_tokens: 30000`
   so recent turns survive any future compaction verbatim.
 - Recovery protocol lives in `AGENTS.md` (this repo).
-- Empty-completion hole: `streaming.ts:2607` only promotes reasoning→content;
-  a stream with no content AND no reasoning finishes as a clean `stop`
-  (metrics count it as success). Non-stream twin at `streaming.ts:624`.
-  Fix pending: turn fully-empty completions into a retryable `empty_response`
-  error so clients retry instead of storing an empty assistant message.
+- Empty-completion hole FIXED: `streaming.ts` non-stream (`:621`) and stream
+  (`:2637`) paths now throw a retryable `empty_response` when a turn yields no
+  content, reasoning, or tool calls, instead of finishing as a clean `stop`
+  that clients persist as an empty assistant message. Covered by
+  `src/tests/empty-response-guard.test.ts` (5/5).
+- Repo hygiene (2026-10-12): dropped tracked `test-output.txt` artifact,
+  repointed `gettyuser/qwen-proxy` URLs/author to `webagencyhermes1-dev/qwenproxy`
+  (ISC attribution to Pedro Farias kept), added GitHub description + 10 topics.
+  CI runs on `main` only, so the `feature/ultra-low-latency` branch was never
+  exercised by Actions.
 - Proxy logs now on disk: `logs/qwenproxy-<ts>-pid<N>-1.log` (file logger).
 - File log retention: kept until TTL (default 1h) rather than deleted on
   shutdown, so a crash or restart keeps a readable post-mortem. Keys:

@@ -6,7 +6,7 @@
 
 High-performance **OpenAI & Anthropic compatible API gateway** for [Qwen](https://chat.qwen.ai) with multi-account rotation, intelligent failover, robust tool calling, Responses API with persistent memory, and a full TUI dashboard.
 
-[![CI](https://github.com/gettyuser/qwen-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/gettyuser/qwen-proxy/actions/workflows/ci.yml)
+[![CI](https://github.com/webagencyhermes1-dev/qwenproxy/actions/workflows/ci.yml/badge.svg)](https://github.com/webagencyhermes1-dev/qwenproxy/actions/workflows/ci.yml)
 [![TypeScript](https://img.shields.io/badge/TypeScript-7.0-blue)](https://www.typescriptlang.org/)
 [![Hono](https://img.shields.io/badge/Hono-4.13-green)](https://hono.dev/)
 [![License: ISC](https://img.shields.io/badge/License-ISC-yellow.svg)](LICENSE)
@@ -52,7 +52,7 @@ npm install -g qwenproxy-cli
 npx qwenproxy-cli
 
 # Or clone and develop
-git clone https://github.com/gettyuser/qwen-proxy.git
+git clone https://github.com/webagencyhermes1-dev/qwenproxy.git
 cd qwen-proxy
 npm install
 npm run tui  # Interactive TUI dashboard
@@ -285,7 +285,7 @@ QwenProxy/
 
 ## Credits
 
-Built by **gettyuser**, based on original open-source work by **Pedro Farias** under the [ISC License](LICENSE).
+Maintained by **webagencyhermes1-dev**, based on original open-source work by **Pedro Farias** under the [ISC License](LICENSE).
 
 ## Disclaimer
 
