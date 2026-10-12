@@ -43,18 +43,37 @@ function setupFetchMock(
   };
 }
 
+// A mock Qwen turn that actually answers.
+//
+// Several tests here only assert on the REQUEST payload (thread reuse, delta
+// vs replay, parent chaining) and used a bare `data: [DONE]` stream as filler.
+// That filler is a fully-empty completion, which the proxy now rejects as a
+// retryable `empty_response` instead of finishing as a clean empty stop — see
+// empty-response-guard.test.ts. Emitting real content keeps those tests
+// asserting what they were written to assert.
+function mockAnswer(content = "ok"): Response {
+  const stream = new ReadableStream({
+    start(c) {
+      c.enqueue(
+        new TextEncoder().encode(
+          `data: {"response_id":"resp-mock","choices":[{"delta":{"content":${JSON.stringify(
+            content,
+          )},"phase":"answer"}}]}\n\n`,
+        ),
+      );
+      c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+      c.close();
+    },
+  });
+  return new Response(stream, { status: 200 });
+}
+
 test("multiturn-thinking-tools: tool-result turn without a thread replays full history", async () => {
   let capturedBody = "";
 
   const restore = setupFetchMock((_, init) => {
     capturedBody = (init?.body as string) || "";
-    const stream = new ReadableStream({
-      start(c) {
-        c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
-        c.close();
-      },
-    });
-    return new Response(stream, { status: 200 });
+    return mockAnswer();
   });
 
   try {
