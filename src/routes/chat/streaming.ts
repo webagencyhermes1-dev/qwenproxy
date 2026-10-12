@@ -621,13 +621,29 @@ export async function processNonStreamingResponse(
       });
     }
 
-    if (!finalContent && toolCallsOut.length === 0 && reasoningBuffer) {
-      logger.warn("[chat] non-stream: no answer content — promoting reasoning to content", {
-        reasoningLength: reasoningBuffer.length,
-      });
-      finalContent = reasoningBuffer.length > 4000
-        ? reasoningBuffer.slice(0, 4000) + "\n\n[Response ended during reasoning phase. Please retry.]"
-        : reasoningBuffer;
+    if (!finalContent && toolCallsOut.length === 0) {
+      if (reasoningBuffer) {
+        logger.warn("[chat] non-stream: no answer content — promoting reasoning to content", {
+          reasoningLength: reasoningBuffer.length,
+        });
+        finalContent = reasoningBuffer.length > 4000
+          ? reasoningBuffer.slice(0, 4000) + "\n\n[Response ended during reasoning phase. Please retry.]"
+          : reasoningBuffer;
+      } else {
+        // Fully empty turn: a silent upstream failure, not an empty answer.
+        // Throwing keeps the outer retry loop (index.ts) rotating accounts
+        // instead of handing the client a 200 with an empty message.
+        logger.warn("[chat] non-stream: empty completion — failing retryably");
+        throw toRetryableStreamError(
+          "empty_response",
+          "upstream produced no content, reasoning, or tool calls",
+          {
+            reason: "empty_response",
+            switchAccount: true,
+            retryAfterMs: config.retry.baseDelayMs,
+          },
+        );
+      }
     }
 
     const usage = enrichUsageWithContextMeter(
@@ -2619,6 +2635,34 @@ export async function processStreamingResponse(
           : reasoningBuffer;
         finalContent = fallback;
         writeDeltaEvent({ content: fallback });
+      }
+
+      // A turn that produced no content, no tool calls and no reasoning is a
+      // silent upstream failure. Finishing it as a clean `stop` makes clients
+      // (OpenCode and friends) persist an empty assistant message and keep
+      // going, leaving a permanent hole in the conversation. Fail retryably
+      // instead: the stream error handler emits a terminal SSE error so the
+      // client retries rather than storing nothing.
+      if (
+        !clientDisconnected &&
+        !finalContent &&
+        !hasEmittedToolCalls &&
+        !reasoningBuffer
+      ) {
+        logger.warn("[chat] stream: empty completion — failing retryably", {
+          completionId,
+          account: currentAccountId,
+          upstreamDone,
+        });
+        throw toRetryableStreamError(
+          "empty_response",
+          "upstream produced no content, reasoning, or tool calls",
+          {
+            reason: "empty_response",
+            switchAccount: true,
+            retryAfterMs: config.retry.baseDelayMs,
+          },
+        );
       }
 
       // Finish reason + usage + [DONE]
