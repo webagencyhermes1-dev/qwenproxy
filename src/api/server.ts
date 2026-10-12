@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import net from "node:net";
+import os from "node:os";
 import { v4 as uuidv4 } from "uuid";
 import { Hono, type Context } from "hono";
 import { serve } from "@hono/node-server";
@@ -11,6 +12,7 @@ import {
   takeOverPortHolder,
 } from "../core/data-dir-lock.ts";
 import { metrics } from "../core/metrics.js";
+import { performanceMetrics } from "../core/performance-metrics.ts";
 import { logger, maskEmail } from "../core/logger.js";
 import { MemoryCache } from "../cache/memory-cache.js";
 import { Watchdog } from "../core/watchdog.js";
@@ -378,6 +380,8 @@ app.get("/health", async (c) => {
   let pool: Record<string, unknown> | null = null;
   let poolAccounts: Array<Record<string, unknown>> = [];
   let accountStates: Record<string, string> = {};
+  let activeStreams = 0;
+  let waitingStreams = 0;
   try {
     const manager = await import("../core/account-manager.js");
     const stats = manager.getPoolStats();
@@ -403,6 +407,8 @@ app.get("/health", async (c) => {
       readinessDeficit,
     };
     accountStates = stats.states;
+    activeStreams = stats.totalActiveStreams;
+    waitingStreams = stats.queuedRequests;
     // Prometheus pool gauges (Phase 3 observability).
     metrics.gauge("pool.ready", stats.ready);
     metrics.gauge("pool.warming", stats.warming);
