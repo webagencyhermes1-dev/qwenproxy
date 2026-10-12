@@ -137,6 +137,11 @@ Source of truth: `src/core/config.ts` `envSchema` (+ `src/utils/egress.ts`, `src
 |---|---|---|
 | `LOG_LEVEL` | `warn` | `debug`\|`info`\|`warn`\|`error` (logger.ts:249-257) |
 | `LOG_FORMAT` | `pretty` | `json` = one object/line for Loki/ELK (logger.ts:123-125) |
+| `LOG_FILE_ENABLED` | `true` | file sink: redacted JSON lines under `./logs` (file-logger.ts); `false` = console only |
+| `QWEN_LOG_DIR` | `""` | log dir override (paths.ts `getLogsDir`) |
+| `LOG_FILE_TTL_MS` | `3600000` (1h) | auto-delete log files older than this (startup reaper + 5min sweep) |
+| `LOG_FILE_MAX_SIZE_MB` | `10` | rotate active file at this size (`.1`, `.2`, …) |
+| `LOG_FILE_MAX_FILES` | `5` | max rotated segments kept per run |
 | `TOOLCALL_DEBUG` | `errors` | `1` = full, `0` = off |
 | `UPSTREAM_DEBUG` / `REQUEST_DEBUG` / `CHAT_REQUEST_LOG` | unset / unset / `false` | raw SSE chunks / full body / debug request details |
 | `CACHE_TTL` / `RESPONSE_TTL` | `3600` / `1800` | cache entry TTLs |

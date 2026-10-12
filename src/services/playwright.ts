@@ -4546,10 +4546,29 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
   return closed;
 }
 
+function areHeadersStale(accountId: string): boolean {
+  const cache = headerCaches.get(accountId);
+  if (!cache || !hasRequiredQwenHeaders(cache.headers)) return false;
+  return (
+    Date.now() - cache.lastRefresh >
+    HEADER_CACHE_TTL * HEADER_REFRESH_THRESHOLD
+  );
+}
+
 export async function keepAlivePlaywrightAccount(
   accountId: string,
 ): Promise<boolean> {
-  return withPlaywrightOpSlot(() => keepAlivePlaywrightAccountInner(accountId));
+  const kept = await withPlaywrightOpSlot(() =>
+    keepAlivePlaywrightAccountInner(accountId),
+  );
+  if (kept && areHeadersStale(accountId)) {
+    await refreshHeaders(accountId).catch((error) => {
+      console.warn(
+        `[Playwright] Keep-alive header refresh failed for ${accountId}: ${getErrorMessage(error)}`,
+      );
+    });
+  }
+  return kept;
 }
 
 async function keepAlivePlaywrightAccountInner(

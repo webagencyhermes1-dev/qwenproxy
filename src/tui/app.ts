@@ -144,6 +144,37 @@ export class TuiApp {
     await ServerManager.getInstance().stop();
   }
 
+  /**
+   * Kill switch (Ctrl+K): stop the server process, clear all TUI state,
+   * and exit. This is a hard stop — no graceful drain, no auto-restart.
+   */
+  public async killSwitch(): Promise<void> {
+    if (!this.isRunning) {
+      process.exit(0);
+    }
+    this.isRunning = false;
+    clearInterval(this.pollInterval!);
+
+    // Stop the server child process (SIGTERM → SIGKILL after 5s)
+    const serverManager = ServerManager.getInstance();
+    await serverManager.stop();
+
+    // Clear all TUI state
+    serverManager.clearLogs();
+    this.statusSnapshot = null;
+    this.hoveredTabIndex = null;
+    this.activeViewIndex = 0;
+
+    // Reset all views to their initial state
+    for (const view of this.views) {
+      if (view.onDeactivate) view.onDeactivate();
+    }
+
+    // Restore terminal and exit
+    this.screen.stop();
+    process.exit(0);
+  }
+
   private async handleKey(key: KeyEvent): Promise<void> {
     const activeView = this.views[this.activeViewIndex];
 
@@ -173,7 +204,13 @@ export class TuiApp {
       this.requestRender();
     }
 
-    // 2. Double Ctrl+C to exit cleanly (within 1.5 seconds)
+    // 2. Ctrl+K — Kill switch: stop server, clear everything, exit
+    if (key.ctrl && key.name === "k") {
+      await this.killSwitch();
+      return;
+    }
+
+    // 3. Double Ctrl+C to exit cleanly (within 1.5 seconds)
     if (key.ctrl && key.name === "c") {
       const now = Date.now();
       if (now - this.lastCtrlCTime < 1500) {

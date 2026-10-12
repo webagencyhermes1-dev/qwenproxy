@@ -944,6 +944,15 @@ async function cleanupServerResources(): Promise<void> {
 
   const { closeDatabase } = await import("../core/database.ts");
   closeDatabase();
+
+  try {
+    // Flush and close the file log sink LAST so the whole shutdown sequence
+    // is captured. Files remain on disk until their TTL expires.
+    const { stopFileLogger } = await import("../core/file-logger.ts");
+    await stopFileLogger();
+  } catch {
+    // File logging is best-effort; never block shutdown on it.
+  }
 }
 
 async function handleSignal(signal: string): Promise<never> {
@@ -1004,6 +1013,22 @@ export async function startServer(options?: {
   startPromise = (async () => {
     cache = new MemoryCache();
     await cache.connect();
+
+    // File log sink (JSON lines, size rotation, TTL auto-delete). Started
+    // before anything else logs so the whole startup is captured; failure
+    // degrades to console-only output.
+    if (config.logging.file.enabled) {
+      const { initFileLogger } = await import("../core/file-logger.ts");
+      const logFile = initFileLogger({
+        dir: config.logging.file.dir || undefined,
+        ttlMs: config.logging.file.ttlMs,
+        maxSizeBytes: config.logging.file.maxSizeBytes,
+        maxRotatedFiles: config.logging.file.maxRotatedFiles,
+      });
+      if (logFile) {
+        console.log(`📄 [Server] File logging active → ${logFile}`);
+      }
+    }
 
     // Open-proxy guard: binding a public interface without an API key exposes
     // every configured Qwen account to the LAN. Fail fast with a fix; bind
@@ -1109,6 +1134,16 @@ export async function startServer(options?: {
         `[Server] Pool controller owns all warmup (${accounts.length} accounts registered)`,
       );
     }
+
+    const { startSessionKeeper } = await import(
+      "../services/session-keeper.ts"
+    );
+    startSessionKeeper();
+
+    const { startLeaseSweepTimer } = await import(
+      "../core/account-concurrency.ts"
+    );
+    startLeaseSweepTimer();
 
     const serverInstance = serve({
       fetch: app.fetch,

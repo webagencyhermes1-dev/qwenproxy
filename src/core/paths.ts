@@ -182,6 +182,18 @@ export function getEnvFilePath(customDataDir?: string): string {
 }
 
 /**
+ * Directory for file-based log output. Resolution order:
+ * explicit argument > QWEN_LOG_DIR env > ./logs under the working directory.
+ */
+export function getLogsDir(overrideDir?: string): string {
+  const override = overrideDir ?? process.env.QWEN_LOG_DIR;
+  if (override && override.trim().length > 0) {
+    return path.resolve(override.trim());
+  }
+  return path.resolve("logs");
+}
+
+/**
  * Ensures all standard directories exist on disk with proper recursive creation.
  */
 export function ensureDataDirs(targetDataDir?: string): void {

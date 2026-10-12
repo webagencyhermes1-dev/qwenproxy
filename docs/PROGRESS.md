@@ -3,7 +3,7 @@
 > Session-resilience worklog. Read this first on session start / after compaction.
 > Update it after every completed step. Keep it short: status + decisions only.
 
-Last updated: 2026-10-11
+Last updated: 2026-10-12
 
 ## Status
 
@@ -20,6 +20,12 @@ Last updated: 2026-10-11
 | Empty-response guard (reasoning-only → promote to content) | DONE | `src/routes/chat/streaming.ts` both paths |
 | Push all changes to `origin/feature/ultra-low-latency` | DONE | commit `f5fa1aa`; graphify-out/ untracked+gitignored |
 | Restart QwenProxy + opencode to load fixes | PENDING | user action |
+| Browserless-transport research (RAM 7.95GB → ~150MB) | DONE | plan written, **outside repo** (see below) |
+| Warmup slowness fix (15 accts stuck "warming") | DONE | `.env` + `readiness-controller.ts` `onSettled` → immediate tick; see Decisions |
+| Post-idle 503 `request_deadline_exceeded` | DONE | `4c1781b` dropped startup timers; restored + idle header refresh (see Decisions) |
+| File log sink (JSON lines, rotation, TTL auto-delete) | DONE | `src/core/file-logger.ts`; `src/tests/file-logger.test.ts` 6/6 |
+| TUI kill switch (`Ctrl+K`) | DONE | `src/tui/app.ts` — stop server, clear state, exit |
+| TUI polish: bright purple hover, 10ms hover debounce, clean header | DONE | `theme.ts`, `screen.ts`, `app.ts` |
 
 ## Pending (continue here)
 
@@ -31,6 +37,14 @@ Last updated: 2026-10-11
 
 ## Decisions
 
+- Warmup slowness root causes (2026-10-12): `POOL_TARGET_READY=20` >
+  context cap 14 made deficit hit 0 with STANDBY accounts → one account never
+  launched; scheduling only on 30s interval with no settle wake-up; failure
+  cooldown 5 min. Fixes: target=14, `POOL_RECONCILIATION_INTERVAL_MS=5000`,
+  warmup concurrency/parallel-init 6, `ACCOUNT_INIT_FAILURE_COOLDOWN_MS=60000`,
+  new `ReadinessDeps.onSettled` fires `requestReadinessTick("warmup-settled")`
+  after settle bookkeeping; `setActiveReadiness` now set at startup (was only
+  inside the interval callback). Tests: mock-relevant 55/55, runtime 164/164.
 - Compaction trigger (proxy 400 at 200,000 bytes) removed; byte cap default
   is now off. Guards are 4MB body limit + model-aware token check.
 - OpenCode providers `qwen/qwen3.8-max`, `ownserver/...`, `qwenproxy/...` now
@@ -39,3 +53,23 @@ Last updated: 2026-10-11
 - Global compaction config: `tail_turns: 10`, `preserve_recent_tokens: 30000`
   so recent turns survive any future compaction verbatim.
 - Recovery protocol lives in `AGENTS.md` (this repo).
+- Empty-completion hole: `streaming.ts:2607` only promotes reasoning→content;
+  a stream with no content AND no reasoning finishes as a clean `stop`
+  (metrics count it as success). Non-stream twin at `streaming.ts:624`.
+  Fix pending: turn fully-empty completions into a retryable `empty_response`
+  error so clients retry instead of storing an empty assistant message.
+- Proxy logs now on disk: `logs/qwenproxy-<ts>-pid<N>-1.log` (file logger).
+- File log retention: kept until TTL (default 1h) rather than deleted on
+  shutdown, so a crash or restart keeps a readable post-mortem. Keys:
+  `LOG_FILE_ENABLED` (default true), `QWEN_LOG_DIR`, `LOG_FILE_TTL_MS`,
+  `LOG_FILE_MAX_SIZE_MB` (10), `LOG_FILE_MAX_FILES` (5). `.env.test` sets
+  `LOG_FILE_ENABLED=false` to keep the mock/runtime suites hermetic.
+- TUI `Ctrl+K` is the kill switch: stops the server child (SIGTERM → SIGKILL),
+  clears logs/snapshot/view state, restores the terminal, exits.
+- Browserless transport verified viable from 3 sources:
+  `AnonymoDGH/Qwen-Reverse` (Python, bx-ua = AES-CBC(JSON), ssxmod = LZW+custom
+  base64, umidtoken = cached GET sg-wum.alibaba.com/w/wu.json, 50-concurrent
+  stress test 100%), `ckcoding/QwenChat2Api` (pure Node, cookie pool +
+  `GET /api/v1/auths/` JWT refresh), and this repo's own
+  `requestQwenSettingsDirectFetch` (qwen.ts:1078). Keep 1 rescue browser,
+  drop the other 13.

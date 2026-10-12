@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { getRequestId } from "./request-context.ts";
+import { writeToFileLog } from "./file-logger.ts";
 
 /**
  * Mask an email address for safe logging.
@@ -157,81 +158,69 @@ export class Logger {
     const coloredLevel = colorCode + pad(entry.level.toUpperCase()) + reset;
     const contextPart = entry.context ? ` [${entry.context}]` : "";
 
-    // Redact credentials from BOTH the message (payload previews often embed
-    // cookies/JWTs) and the structured data.
-    const safeMessage = redactLogMessage(entry.message);
-    const safeData = entry.data ? redactLogValue(entry.data) : undefined;
-
     if (resolveLogFormat() === "json") {
       return JSON.stringify({
         timestamp: entry.timestamp.toISOString(),
         level: entry.level,
         ...(entry.context ? { context: entry.context } : {}),
         ...(getRequestId() ? { requestId: getRequestId() } : {}),
-        message: safeMessage,
-        ...(safeData !== undefined ? { data: safeData } : {}),
+        message: entry.message,
+        ...(entry.data !== undefined ? { data: entry.data } : {}),
       });
     }
 
-    let output = `${coloredLevel}${contextPart} ${safeMessage}`;
+    let output = `${coloredLevel}${contextPart} ${entry.message}`;
 
-    if (safeData !== undefined) {
-      output += "\n" + JSON.stringify(safeData, null, 2);
+    if (entry.data !== undefined) {
+      output += "\n" + JSON.stringify(entry.data, null, 2);
     }
 
     return output;
   }
 
+  /**
+   * Single emission path for every level: redact once, then fan out to the
+   * console (pretty/json) and the file sink (JSON line, when active).
+   */
+  private emit(
+    level: LogLevel,
+    message: string,
+    data?: Record<string, unknown>,
+  ): void {
+    const composed = this.context ? `[${this.context}] ${message}` : message;
+    // Redact credentials from BOTH the message (payload previews often embed
+    // cookies/JWTs) and the structured data before any sink sees the entry.
+    const entry: LogEntry = {
+      timestamp: new Date(),
+      level,
+      message: redactLogMessage(composed),
+      context: this.context,
+      data: data ? (redactLogValue(data) as Record<string, unknown>) : undefined,
+    };
+    const write =
+      level === "warn"
+        ? console.warn
+        : level === "error"
+          ? console.error
+          : console.log;
+    write(this.formatEntry(entry));
+    writeToFileLog(entry);
+  }
+
   debug(message: string, data?: Record<string, unknown>): void {
-    if (this.shouldLog("debug")) {
-      console.log(
-        this.formatEntry({
-          timestamp: new Date(),
-          level: "debug",
-          message: this.context ? `[${this.context}] ${message}` : message,
-          data,
-        }),
-      );
-    }
+    if (this.shouldLog("debug")) this.emit("debug", message, data);
   }
 
   info(message: string, data?: Record<string, unknown>): void {
-    if (this.shouldLog("info")) {
-      console.log(
-        this.formatEntry({
-          timestamp: new Date(),
-          level: "info",
-          message: this.context ? `[${this.context}] ${message}` : message,
-          data,
-        }),
-      );
-    }
+    if (this.shouldLog("info")) this.emit("info", message, data);
   }
 
   warn(message: string, data?: Record<string, unknown>): void {
-    if (this.shouldLog("warn")) {
-      console.warn(
-        this.formatEntry({
-          timestamp: new Date(),
-          level: "warn",
-          message: this.context ? `[${this.context}] ${message}` : message,
-          data,
-        }),
-      );
-    }
+    if (this.shouldLog("warn")) this.emit("warn", message, data);
   }
 
   error(message: string, data?: Record<string, unknown>): void {
-    if (this.shouldLog("error")) {
-      console.error(
-        this.formatEntry({
-          timestamp: new Date(),
-          level: "error",
-          message: this.context ? `[${this.context}] ${message}` : message,
-          data,
-        }),
-      );
-    }
+    if (this.shouldLog("error")) this.emit("error", message, data);
   }
 }
 

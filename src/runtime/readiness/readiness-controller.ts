@@ -25,6 +25,13 @@ export interface ReadinessDeps {
   terminateWarmup?: (accountId: string) => Promise<void> | void;
   /** Observability sink for settled warmups (metrics, audit). Never throws into the controller. */
   onOutcome?: (accountId: string, outcome: WarmupOutcome, timedOut: boolean) => void;
+  /**
+   * Called once per settle, AFTER the account state (backoff/exhaustion) and
+   * in-flight bookkeeping are updated. Wired to requestReadinessTick in
+   * construct.ts so a freed warmup slot refills immediately instead of waiting
+   * for the next reconciliation interval tick.
+   */
+  onSettled?: (accountId: string, outcome: WarmupOutcome) => void;
   jitter?: () => number;
   now?: () => number;
 }
@@ -226,33 +233,41 @@ export class ReadinessController {
     if (this.stopped) return;
     if (success) {
       this.states.delete(accountId);
-      return;
-    }
-    const state: AccountWarmState = this.states.get(accountId) ?? {
-      failures: 0,
-      backoffUntil: 0,
-      exhausted: false,
-    };
-    state.failures += 1;
-    if (state.failures >= this.maxWarmupFailures) {
-      state.exhausted = true;
-      this.states.set(accountId, state);
-      // Operator signal: this account is out of warmup attempts and is parked
-      // as terminal by recoverAccount("warmup-exhausted"). Silently exhausting
-      // left a pool that looked like it was still trying while nothing moved.
-      console.warn(
-        `❌ [Readiness] Warmup exhausted for ${accountId} after ${state.failures} attempt(s); marking the account terminal (recovery reason "warmup-exhausted")`,
-      );
-      void Promise.resolve(
-        this.ownership.recoverAccount(accountId, "warmup-exhausted"),
-      ).catch(() => {});
     } else {
-      const delay = Math.min(
-        this.backoffBaseMs * 2 ** (state.failures - 1),
-        this.backoffMaxMs,
-      );
-      state.backoffUntil = this.now() + delay + this.jitter();
-      this.states.set(accountId, state);
+      const state: AccountWarmState = this.states.get(accountId) ?? {
+        failures: 0,
+        backoffUntil: 0,
+        exhausted: false,
+      };
+      state.failures += 1;
+      if (state.failures >= this.maxWarmupFailures) {
+        state.exhausted = true;
+        this.states.set(accountId, state);
+        // Operator signal: this account is out of warmup attempts and is parked
+        // as terminal by recoverAccount("warmup-exhausted"). Silently exhausting
+        // left a pool that looked like it was still trying while nothing moved.
+        console.warn(
+          `❌ [Readiness] Warmup exhausted for ${accountId} after ${state.failures} attempt(s); marking the account terminal (recovery reason "warmup-exhausted")`,
+        );
+        void Promise.resolve(
+          this.ownership.recoverAccount(accountId, "warmup-exhausted"),
+        ).catch(() => {});
+      } else {
+        const delay = Math.min(
+          this.backoffBaseMs * 2 ** (state.failures - 1),
+          this.backoffMaxMs,
+        );
+        state.backoffUntil = this.now() + delay + this.jitter();
+        this.states.set(accountId, state);
+      }
+    }
+    // Fire after all settle bookkeeping so the follow-up pass sees the final
+    // in-flight set, backoff, and exhaustion state (construct.ts ticks the
+    // reconciliation loop on this event).
+    try {
+      this.deps.onSettled?.(accountId, success ? "ready" : "failed");
+    } catch {
+      // Observability must never break the warmup state machine.
     }
   }
 

@@ -94,6 +94,15 @@ const envSchema = z
     CAPTCHA_HARD_BLOCK_MAX_COOLDOWN_MS: z.string().default("3600000"),
     OSS_MULTIPART_THRESHOLD_MB: z.string().default("5"),
     CHAT_REQUEST_LOG: z.string().default("false"),
+    // File log sink: one JSON object per line under ./logs (override dir via
+    // QWEN_LOG_DIR). Active file rotates at LOG_FILE_MAX_SIZE_MB (keeping
+    // LOG_FILE_MAX_FILES rotated segments) and every file auto-deletes once
+    // its mtime is older than LOG_FILE_TTL_MS (sweep on startup + every 5min).
+    LOG_FILE_ENABLED: z.string().default("true"),
+    QWEN_LOG_DIR: z.string().default(""),
+    LOG_FILE_TTL_MS: z.string().default("3600000"),
+    LOG_FILE_MAX_SIZE_MB: z.string().default("10"),
+    LOG_FILE_MAX_FILES: z.string().default("5"),
     HTTP_TIMEOUT: z.string().default("15000"),
     CHAT_TIMEOUT: z.string().default("180000"),
     NAVIGATION_TIMEOUT: z.string().default("60000"),
@@ -362,6 +371,15 @@ export const config = {
   },
   logging: {
     chatRequests: env.CHAT_REQUEST_LOG === "true",
+    file: {
+      enabled: env.LOG_FILE_ENABLED !== "false",
+      dir: env.QWEN_LOG_DIR.trim(),
+      /** Auto-delete log files whose mtime is older than this (min 1min). */
+      ttlMs: Math.max(60_000, parseInt(env.LOG_FILE_TTL_MS) || 3_600_000),
+      maxSizeBytes:
+        Math.max(1, parseInt(env.LOG_FILE_MAX_SIZE_MB) || 10) * 1024 * 1024,
+      maxRotatedFiles: Math.max(1, parseInt(env.LOG_FILE_MAX_FILES) || 5),
+    },
   },
   auth: {
     userAgent: env.USER_AGENT,

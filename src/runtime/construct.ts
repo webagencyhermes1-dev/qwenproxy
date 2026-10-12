@@ -190,8 +190,17 @@ export async function constructRuntime(
           });
         }
       },
+      // A settled warmup frees a concurrency slot — refill it immediately
+      // instead of idling until the next reconciliation interval tick.
+      // settleWarmup invokes this after backoff/exhaustion state is written,
+      // so the follow-up pass makes decisions on final state.
+      onSettled: () => requestReadinessTick("warmup-settled"),
     },
   );
+  // Register the controller as the process-wide tick target BEFORE the first
+  // pass so out-of-band ticks (context death, cooldown-set, warmup-settled)
+  // work from startup, not only after the first interval fires.
+  setActiveReadiness(readiness);
   // Bounded BROKEN recovery (startup + every reconciliation tick): accounts
   // escalated to BROKEN by init failures while a systemic cause was in effect
   // are re-armed once they stop failing, so the persisted escalation can never
@@ -223,9 +232,8 @@ export async function constructRuntime(
   maintenance.start();
 
   const tickTimer = setInterval(() => {
-  setActiveReadiness(readiness);
-  runBrokenRecovery();
-  void readiness.tick();
+    runBrokenRecovery();
+    void readiness.tick();
   }, config.pool.reconciliationIntervalMs);
   tickTimer.unref?.();
 

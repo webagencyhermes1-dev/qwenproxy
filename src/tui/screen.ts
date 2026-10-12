@@ -137,7 +137,7 @@ export class Screen {
               });
             };
 
-            if (timeSinceLast >= 30) {
+            if (timeSinceLast >= 10) {
               if (self.pendingHoverTimeout) {
                 clearTimeout(self.pendingHoverTimeout);
                 self.pendingHoverTimeout = null;
@@ -152,7 +152,7 @@ export class Screen {
                 if (col !== self.lastHoverCol || row !== self.lastHoverRow) {
                   emitHover(col, row);
                 }
-              }, 30 - timeSinceLast);
+              }, 10 - timeSinceLast);
             }
           }
         }
