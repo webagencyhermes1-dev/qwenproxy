@@ -1,5 +1,5 @@
 {
-  "name": "qwenproxy-cli",
+  "name": "@webagencyhermes1-dev/qwenproxy",
   "version": "1.0.21",
   "description": "High-performance OpenAI & Anthropic compatible API gateway for Qwen with multi-account rotation, interactive TUI, and resilient tool calling.",
   "main": "src/index.ts",

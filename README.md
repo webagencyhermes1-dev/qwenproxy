@@ -46,7 +46,7 @@ High-performance **OpenAI & Anthropic compatible API gateway** for [Qwen](https:
 
 ```bash
 # Global install (recommended)
-npm install -g qwenproxy-cli
+npm install -g @webagencyhermes1-dev/qwenproxy
 
 # Or run instantly
 npx qwenproxy-cli
