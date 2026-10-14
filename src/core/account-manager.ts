@@ -272,9 +272,13 @@ export function isAccountHeadersReady(accountId: string): boolean {
     if (status !== "READY" && status !== "RESERVED" && status !== "GENERATING") {
       return false;
     }
+    // For ownership-bound accounts in hot states, the Playwright page MUST be
+    // alive. A context that died mid-generation must not pass the gate.
+    return isPlaywrightPageAlive(accountId);
   } else if (!headersReadyAccounts.has(accountId)) {
     return false;
   }
+  // Legacy path: allow cold start if never initialized; otherwise require alive page.
   return !isPlaywrightInitialized(accountId) || isPlaywrightPageAlive(accountId);
 }
 

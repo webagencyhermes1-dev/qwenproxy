@@ -401,6 +401,86 @@ test("recovery in progress counts as warming: no second initializer", async () =
   );
 });
 
+test("warmup circuit breaker parks an account that never succeeds, and a success clears it", async () => {
+  const own = makePool(1);
+  const ctrl = new ReadinessController(
+    own,
+    {
+      targetReady: 1,
+      warmupConcurrency: 1,
+      warmupTimeoutMs: 0,
+      maxWarmupFailures: 1,
+      backoffBaseMs: 1,
+      backoffMaxMs: 1,
+      maxFailedWarmupEras: 2,
+      failedEraSkipBaseMs: 60_000,
+      failedEraSkipMaxMs: 600_000,
+    },
+    {
+      warmWarmup: async () => "failed",
+      jitter: () => 0,
+    },
+  );
+
+  // Era 1: the single attempt fails, exhausts, and BROKEN recovery re-arms the
+  // account with a fresh budget — exactly what construct.ts does every tick.
+  await ctrl.tick();
+  await settle();
+  own.accounts.get("acct1")!.status = "STANDBY";
+  ctrl.clearWarmupFailureState("acct1");
+
+  // Era 2 crosses the threshold and parks the account.
+  await ctrl.tick();
+  await settle();
+  own.accounts.get("acct1")!.status = "STANDBY";
+  ctrl.clearWarmupFailureState("acct1");
+
+  const breakers = ctrl.getWarmupCircuitBreakers();
+  assert.equal(breakers[0]?.accountId, "acct1");
+  assert.equal(breakers[0]?.eras, 2);
+  assert.equal(breakers[0]?.parked, true, "two failed eras must park the account");
+
+  // Re-armed and record-cleared, it is still never launched: a WAF-blocked or
+  // dead-credential account stops spending a ~450MB Chromium context per cycle.
+  const parked = await ctrl.tick();
+  assert.deepEqual(parked.launched, [], "a parked account must not launch a browser");
+  assert.ok(parked.skipped.includes("acct1"));
+
+  // Operator escape hatch un-parks it.
+  ctrl.clearWarmupCircuitBreaker("acct1");
+  const resumed = await ctrl.tick();
+  assert.deepEqual(resumed.launched, ["acct1"]);
+});
+
+test("breaker disabled by maxFailedWarmupEras=0 keeps the old re-arm behaviour", async () => {
+  const own = makePool(1);
+  const ctrl = new ReadinessController(
+    own,
+    {
+      targetReady: 1,
+      warmupConcurrency: 1,
+      warmupTimeoutMs: 0,
+      maxWarmupFailures: 1,
+      backoffBaseMs: 1,
+      backoffMaxMs: 1,
+      maxFailedWarmupEras: 0,
+    },
+    {
+      warmWarmup: async () => "failed",
+      jitter: () => 0,
+    },
+  );
+  for (let era = 0; era < 4; era++) {
+    await ctrl.tick();
+    await settle();
+    own.accounts.get("acct1")!.status = "STANDBY";
+    ctrl.clearWarmupFailureState("acct1");
+  }
+  assert.equal(ctrl.getWarmupCircuitBreakers().length, 0);
+  const stillLaunched = await ctrl.tick();
+  assert.deepEqual(stillLaunched.launched, ["acct1"], "breaker off = old behaviour");
+});
+
 test("overlapping ticks are coalesced into one pass plus a trailing re-check", async () => {
   const own = makePool(4);
   let passes = 0;
@@ -421,4 +501,47 @@ test("overlapping ticks are coalesced into one pass plus a trailing re-check", a
   assert.equal(passes, 1, "the second concurrent tick must not run a new pass");
   assert.equal(a.launched.length, 1);
   assert.equal(b.launched.length, 0);
+});
+
+// Regression for the warmup double-count ("stops midway" freeze). The other
+// fakes never move an account to WARMING status, so they cannot catch a bug in
+// the deficit term — they only exercise the concurrency clamp. This one mimics
+// production `warmAccount`: a launched account holds WARMING status while
+// in-flight, so `snapshot.warming` already includes it. With 2 in-flight and 2
+// free concurrency slots the controller MUST launch 2 more, not 0.
+test("in-flight WARMING-status accounts must not shrink the launch budget", async () => {
+  const own = makePool(12);
+  own.accounts.get("acct1")!.status = "READY";
+  own.accounts.get("acct2")!.status = "READY";
+  const gates: Array<() => void> = [];
+  const ctrl = new ReadinessController(
+    own,
+    { targetReady: 8, warmupConcurrency: 4, warmupTimeoutMs: 10_000 },
+    {
+      warmWarmup: (id) => {
+        own.accounts.get(id)!.status = "WARMING";
+        return new Promise<"ready">((resolve) => {
+          gates.push(() => {
+            own.accounts.get(id)!.status = "READY";
+            resolve("ready");
+          });
+        });
+      },
+      jitter: () => 0,
+    },
+  );
+  // Tick 1: ready=2, warming=0 → deficit 6, slots min(6,4)=4 → launch 4.
+  const t1 = await ctrl.tick();
+  assert.equal(t1.launched.length, 4);
+  // Settle 2 of the 4: ready=4, 2 still WARMING + in-flight, 2 free slots.
+  gates.splice(0, 2).forEach((g) => g());
+  await settle();
+  // Tick 2: correct warming=2 → deficit 8-4-2=2 → launch 2 (fills free slots).
+  // The double-count bug would compute warming=4 → deficit 0 → launch 0, leaving
+  // the pool frozen at 4 ready with 2 concurrency slots idle forever.
+  const t2 = await ctrl.tick();
+  assert.equal(t2.launched.length, 2, "must fill every free concurrency slot");
+  gates.forEach((g) => g());
+  await settle();
+  assert.equal(own.getPoolSnapshot().ready, 8, "pool converges to target");
 });

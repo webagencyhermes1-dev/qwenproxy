@@ -511,6 +511,40 @@ export class AccountResourceManager implements IAccountOwnership {
     return reaped;
   }
 
+  /**
+   * Force-release leases whose deadline has passed. This is the
+   * ownership-level safety net: the slot-level sweep in
+   * account-concurrency.ts only sees tracked entries, but a lease can
+   * outlive its tracking entry (error paths that skip release, process
+   * restarts that lose the in-memory slot map). Without this sweep a
+   * single leaked lease pins an account in RESERVED/GENERATING forever
+   * and `isAccountBusy` reports BUSY indefinitely.
+   *
+   * Returns the number of leases force-released.
+   */
+  sweepExpiredLeases(nowMs: number = now()): number {
+    let swept = 0;
+    for (const record of this.accounts.values()) {
+      const lease = record.lease;
+      if (!lease) continue;
+      if (lease.deadline > 0 && lease.deadline <= nowMs) {
+        record.lease = null;
+        record.fencingEpoch += 1;
+        const to: AccountStatus =
+          record.status === "GENERATING" ? "RECOVERING" : "READY";
+        if (canTransitionAccount(record.status, to)) {
+          this.applyTransition(
+            record,
+            to,
+            `sweep:lease-deadline-expired:${lease.leaseId}`,
+          );
+        }
+        swept += 1;
+      }
+    }
+    return swept;
+  }
+
   private checkCooldown(record: InternalAccountRecord): boolean {
     if (record.cooldownUntil <= 0) return false;
     if (record.cooldownUntil > now()) return true;

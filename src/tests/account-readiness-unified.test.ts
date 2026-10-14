@@ -12,9 +12,30 @@ import {
   initAccountOwnership,
   resetAccountOwnershipForTests,
 } from "../runtime/account/instance.ts";
+import {
+  registerPlaywrightAccountForTests,
+  unregisterPlaywrightAccountForTests,
+} from "../services/playwright.ts";
 import type { OwnershipFence } from "../runtime/contracts.ts";
 
 const SYSTEM_FENCE: OwnershipFence = { leaseId: "system", ownerToken: "system" };
+
+/**
+ * Ownership-BOUND readiness deliberately requires a LIVE Playwright page: a
+ * READY record whose context died must not pass the request-path gate. Any
+ * test asserting the bound path therefore has to register a live page for the
+ * account — without one the gate correctly returns false and the assertion is
+ * exercising the wrong contract.
+ */
+function withLivePage(accountId: string): void {
+  registerPlaywrightAccountForTests(
+    accountId,
+    { isClosed: () => false } as never,
+    Date.now(),
+  );
+}
+
+const PAGE_BACKED = ["b-warm", "b-dead", "b-leased"] as const;
 
 function bind(ids: string[]): ReturnType<typeof initAccountOwnership> {
   const ownership = initAccountOwnership(
@@ -31,6 +52,7 @@ function bind(ids: string[]): ReturnType<typeof initAccountOwnership> {
 test.afterEach(() => {
   resetAccountOwnershipForTests();
   clearAllHeadersReadyAccounts();
+  for (const id of PAGE_BACKED) unregisterPlaywrightAccountForTests(id);
 });
 
 test("unified readiness: unbound ownership falls back to the in-memory set", () => {
@@ -52,6 +74,7 @@ test("unified readiness: STANDBY cannot be marked READY without warmup", () => {
 
 test("unified readiness: WARMING marks READY through the state machine", () => {
   const ownership = bind(["b-warm"]);
+  withLivePage("b-warm");
   assert.equal(
     ownership.transition("b-warm", "WARMING", SYSTEM_FENCE, "t").transitioned,
     true,
@@ -64,6 +87,7 @@ test("unified readiness: WARMING marks READY through the state machine", () => {
 
 test("unified readiness: context death moves READY to RECOVERING, never strands", () => {
   const ownership = bind(["b-dead"]);
+  withLivePage("b-dead");
   ownership.transition("b-dead", "WARMING", SYSTEM_FENCE, "t");
   markAccountHeadersReady("b-dead");
   assert.equal(isAccountHeadersReady("b-dead"), true);
@@ -112,6 +136,7 @@ test("unified readiness: READY records with a dead context are hidden from the r
 
 test("unified readiness: leased accounts stay hot and unmark is a no-op", () => {
   const ownership = bind(["b-leased"]);
+  withLivePage("b-leased");
   ownership.transition("b-leased", "WARMING", SYSTEM_FENCE, "t");
   markAccountHeadersReady("b-leased");
   const acquired = ownership.acquire({

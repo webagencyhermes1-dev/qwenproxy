@@ -614,6 +614,7 @@ export async function chatCompletions(c: Context) {
     // Retry loop for mid-stream/create-stream failures (generic policy)
         let streamProcessingRetries = Math.max(0, config.retry.maxAttempts - 1);
         let invalidInputSameAccountRetries = 0;
+        let modelCapRotations = 0;
         let currentStreamResult = streamResult;
         let currentParams = params;
         // Use the shared per-request retry context — the tried set is shared
@@ -673,29 +674,46 @@ export async function chatCompletions(c: Context) {
               throw streamErr;
             }
 
-            // Prefer explicit RetryableQwenStreamError OR generic retryable policy
-            const canRetry =
-              streamProcessingRetries > 0 &&
-              policy.retryable &&
-              (streamErr instanceof RetryableQwenStreamError ||
-                config.retry.onUnknownUpstream !== false);
-
-            if (!canRetry) {
-              // Terminal (or retry budget exhausted): say WHY instead of just
-              // letting the error bubble to handleChatCompletionsError — the
-              // operator must distinguish "upstream refused" from "our retry
-              // budget ran out".
-              if (logger.isLevelEnabled("info")) {
-                console.log(
-                  `⛔ [Chat] Stream retry exhausted | req=${reqId} | reason=${policy.reason} | retriesLeft=${streamProcessingRetries} | retryable=${policy.retryable} | error=${streamErr?.message?.substring(0, 150)}`,
+            // model_daily_limit is a ROUTING issue, not a failure: the account
+            // is healthy for every other model, so burning the general retry
+            // budget on it would exhaust retries before the pool walk finds an
+            // uncapped account. Give it its own generous rotation budget
+            // (bounded by the configured account count) instead.
+            if (policy.reason === "model_daily_limit") {
+              modelCapRotations++;
+              const { loadAccounts: loadAccts } = await import("../../core/accounts.ts");
+              const maxCapRotations = Math.max(loadAccts().length, 5);
+              if (modelCapRotations > maxCapRotations) {
+                console.warn(
+                  `[Chat] model_daily_limit rotations exhausted (${modelCapRotations}/${maxCapRotations}) | req=${reqId} | no uncapped account found`,
                 );
+                throw streamErr;
               }
-              throw streamErr;
-            }
+            } else {
+              // Prefer explicit RetryableQwenStreamError OR generic retryable policy
+              const canRetry =
+                streamProcessingRetries > 0 &&
+                policy.retryable &&
+                (streamErr instanceof RetryableQwenStreamError ||
+                  config.retry.onUnknownUpstream !== false);
 
-            streamProcessingRetries--;
+              if (!canRetry) {
+                // Terminal (or retry budget exhausted): say WHY instead of just
+                // letting the error bubble to handleChatCompletionsError — the
+                // operator must distinguish "upstream refused" from "our retry
+                // budget ran out".
+                if (logger.isLevelEnabled("info")) {
+                  console.log(
+                    `⛔ [Chat] Stream retry exhausted | req=${reqId} | reason=${policy.reason} | retriesLeft=${streamProcessingRetries} | retryable=${policy.retryable} | error=${streamErr?.message?.substring(0, 150)}`,
+                  );
+                }
+                throw streamErr;
+              }
+
+              streamProcessingRetries--;
+            }
             console.warn(
-              `[Chat] Stream processing error, retrying with new stream | reason=${policy.reason} | ${streamErr.message?.substring(0, 150)} | retries left: ${streamProcessingRetries}`,
+              `[Chat] Stream processing error, retrying with new stream | reason=${policy.reason} | ${streamErr.message?.substring(0, 150)} | retries left: ${streamProcessingRetries} | capRotations: ${modelCapRotations}`,
             );
 
             // Recover a generic invalid_input on the same account once by

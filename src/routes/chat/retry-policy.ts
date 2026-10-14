@@ -54,6 +54,8 @@ export type RetryableStreamError = RetryableQwenStreamError & {
   retryWithFullPrompt?: boolean;
   switchAccount?: boolean;
   dropFiles?: boolean;
+  /** Policy reason this error was raised for (e.g. "empty_response"). */
+  reason?: string;
 };
 
 function errMessage(err: unknown): string {
@@ -77,6 +79,12 @@ function statusOf(err: unknown): number | undefined {
   if (typeof anyErr?.upstreamStatus === "number") return anyErr.upstreamStatus;
   if (typeof anyErr?.statusCode === "number") return anyErr.statusCode;
   return undefined;
+}
+
+/** Policy reason attached by `toRetryableStreamError`, when present. */
+function typedReason(err: unknown): string | undefined {
+  const anyErr = err as { reason?: unknown };
+  return typeof anyErr?.reason === "string" ? anyErr.reason : undefined;
 }
 
 /**
@@ -719,6 +727,50 @@ export function classifyRetryAction(
     // Content moderation rejections are deterministic — retrying on any
     // account with the same content produces the same rejection. Fail fast
     // instead of burning through accounts, personalization syncs and captchas.
+    // Zero-token upstream turn (our own guard): the model produced no content,
+  // reasoning or tool calls. Nothing about it is account-specific — a stale
+  // upstream parent chain, a collapsed WAF session or a throttled generation
+  // reproduces identically everywhere — so the recovery must be a FRESH chat
+  // with the FULL prompt, which is the only shape that changes those inputs.
+  // Without this branch the error falls through to `explicit_retryable`, which
+  // replays the same delta prompt on the same kind of chat.
+  // Qwen's per-account DAILY MODEL CAP (`extra.update_member: true` on the
+  // terminal delta). Scoped to ONE model on ONE account: the account is fine
+  // for every other model, so it must NOT take an account-wide cooldown —
+  // doing so would shrink the pool for a model-specific condition. Rotate to
+  // an account that still has allowance; the capped one is skipped for this
+  // model from then on.
+  if (
+    code === "model_daily_limit" ||
+    typedReason(err) === "model_daily_limit" ||
+    message.includes("model_daily_limit")
+  ) {
+    const typed = err as RetryableStreamError;
+    return makeRetryAction("model_daily_limit", {
+      switchAccount: true,
+      forceNewChat: true,
+      retryWithFullPrompt: true,
+      // No accountCooldownMs by design: see above.
+      retryAfterMs: typed.retryAfterMs ?? 0,
+    });
+  }
+
+  if (
+      code === "empty_response" ||
+      typedReason(err) === "empty_response" ||
+      message.includes("empty_response")
+    ) {
+    const typed = err as RetryableStreamError;
+    return makeRetryAction("empty_response", {
+      switchAccount: typed.switchAccount !== false,
+      forceNewChat: true,
+      retryWithFullPrompt: true,
+      // 0 by default: a dead upstream chat produces nothing on an immediate
+      // replay too, so there is nothing to gain from sleeping first.
+      retryAfterMs: typed.retryAfterMs ?? 0,
+    });
+  }
+
     if (isContentModerationError(err)) {
       return makeRetryAction("content_moderation", { retryable: false });
     }
@@ -851,10 +903,12 @@ export function toRetryableStreamError(
 
   const error = new RetryableQwenStreamError(
     `Qwen retryable upstream error: ${errCode}: ${errDetails.substring(0, 200)}`,
-    merged.retryAfterMs || config.retry.baseDelayMs,
+    // `??`, not `||`: 0 is a deliberate "retry immediately" delay.
+    merged.retryAfterMs ?? config.retry.baseDelayMs,
   ) as RetryableStreamError;
 
   error.upstreamCode = errCode;
+  error.reason = merged.reason;
   error.forceNewChat = merged.forceNewChat;
   error.retryWithFullPrompt = merged.retryWithFullPrompt;
   error.switchAccount = merged.switchAccount;

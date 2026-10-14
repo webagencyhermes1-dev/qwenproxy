@@ -324,6 +324,11 @@ export function updateSessionParent(
  * upstream chat binding. The next request will see a missing parent and must
  * rebuild the upstream chat with full context instead of appending to a
  * possibly corrupted parent chain.
+ *
+ * Unlike `updateLogicalThreadState` this persists IMMEDIATELY (it does not join
+ * the debounce batch). A stale `parent_id` surviving a restart is exactly the
+ * ghost-parent failure this exists to prevent: the process would come back up
+ * still believing it can append to a chain nobody ever saw the answer to.
  */
 export function invalidateLogicalThreadParent(
   logicalSessionId: string | null | undefined,
@@ -340,6 +345,71 @@ export function invalidateLogicalThreadParent(
     parentId: null,
     instructionsSent: existing.instructionsSent,
   });
+  persistLogicalThreadStateNow(logicalSessionId);
+}
+
+/** Write one logical thread row straight through, bypassing the debounce. */
+function persistLogicalThreadStateNow(logicalSessionId: string): void {
+  // It is already queued for the batch; drop it so the batch cannot re-write a
+  // newer value over this one.
+  logicalThreadDirty.delete(logicalSessionId);
+  const entry = logicalThreadStates.get(logicalSessionId);
+  if (!entry || isAuthMockEnabled()) return;
+
+  try {
+    getDatabase()
+      .prepare(
+        `INSERT INTO logical_thread_states (session_id, account_id, chat_session_id, parent_id, instructions_sent, updated_at)
+         VALUES (?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(session_id) DO UPDATE SET
+           account_id = excluded.account_id,
+           chat_session_id = excluded.chat_session_id,
+           parent_id = excluded.parent_id,
+           instructions_sent = excluded.instructions_sent,
+           updated_at = datetime('now')`,
+      )
+      .run(
+        logicalSessionId,
+        entry.accountId,
+        entry.chatSessionId,
+        entry.parentId,
+        entry.instructionsSent ? 1 : 0,
+      );
+  } catch (err) {
+    logger.warn("[Qwen] Failed to persist invalidated logical thread state", {
+      sessionId: logicalSessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Forget a logical thread entirely: in-memory entry, pending debounced write
+ * and the persisted row. Used when a session must be rebuilt from scratch
+ * (operator reset, recovery teardown, test isolation) rather than merely
+ * detached from its current parent via `invalidateLogicalThreadParent`.
+ */
+export function purgeLogicalThreadState(
+  logicalSessionId: string | null | undefined,
+): void {
+  if (!logicalSessionId) return;
+
+  logicalThreadStates.delete(logicalSessionId);
+  logicalThreadDirty.delete(logicalSessionId);
+  toolCapNotices.delete(logicalSessionId);
+
+  if (isAuthMockEnabled()) return;
+
+  try {
+    getDatabase()
+      .prepare("DELETE FROM logical_thread_states WHERE session_id = ?")
+      .run(logicalSessionId);
+  } catch (err) {
+    logger.warn("[Qwen] Failed to purge logical thread state", {
+      sessionId: logicalSessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 export function clearAllSessionsForAccount(accountId: string): void {

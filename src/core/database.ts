@@ -230,6 +230,40 @@ function runMigrations(db: Database.Database): void {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_account_health_score ON account_health(health_score);
+
+    CREATE TABLE IF NOT EXISTS usage_totals (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      total_requests INTEGER NOT NULL DEFAULT 0,
+      total_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+      total_completion_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT OR IGNORE INTO usage_totals (id) VALUES (1);
+
+    CREATE TABLE IF NOT EXISTS usage_daily (
+      day TEXT PRIMARY KEY,
+      requests INTEGER NOT NULL DEFAULT 0,
+      prompt_tokens INTEGER NOT NULL DEFAULT 0,
+      completion_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0
+    );
+
+    -- Per-account DAILY MODEL CAP persistence. Qwen's allowance resets at
+    -- 00:00 UTC, so resets_at is the next midnight at cap time; the
+    -- reconciliation sweep drops lapsed rows and the in-memory mirror with
+    -- them. Persisting survives a restart: without it the proxy forgot every
+    -- cap, re-probed already-exhausted accounts, and re-drained the warm pool
+    -- for the capped model within the first few requests.
+    CREATE TABLE IF NOT EXISTS model_daily_caps (
+      account_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      capped_at INTEGER NOT NULL,
+      resets_at INTEGER NOT NULL,
+      PRIMARY KEY (account_id, model)
+    );
+    CREATE INDEX IF NOT EXISTS idx_model_daily_caps_resets
+      ON model_daily_caps(resets_at);
   `);
 }
 

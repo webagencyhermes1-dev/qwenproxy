@@ -152,4 +152,5 @@ export interface IAccountOwnership {
   setCooldownUntil(accountId: string, untilMs: number, reason: string | null): void;
   isCoolingDown(accountId: string): boolean;
   reapExpiredCooldowns(nowMs?: number): number;
+  sweepExpiredLeases(nowMs?: number): number;
 }

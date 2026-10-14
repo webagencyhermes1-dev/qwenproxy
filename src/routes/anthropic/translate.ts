@@ -344,6 +344,7 @@ export interface AnthropicStreamState {
   inputTokens: number;
   outputTokens: number;
   hasEmittedToolUse: boolean;
+  pendingStopReason?: string | null;
 }
 
 /**
@@ -358,9 +359,30 @@ export function translateStreamChunk(
   const usage = chunk.usage;
   if (usage?.prompt_tokens !== undefined) {
     state.inputTokens = usage.prompt_tokens;
+  } else if (usage?.input_tokens !== undefined) {
+    state.inputTokens = usage.input_tokens;
   }
   if (usage?.completion_tokens !== undefined) {
     state.outputTokens = usage.completion_tokens;
+  } else if (usage?.output_tokens !== undefined) {
+    state.outputTokens = usage.output_tokens;
+  }
+
+  // If finish_reason was already encountered and we were waiting for the usage chunk:
+  if (usage && state.pendingStopReason) {
+    events.push(
+      JSON.stringify({
+        type: "message_delta",
+        delta: {
+          stop_reason: state.pendingStopReason,
+          stop_sequence: null,
+        },
+        usage: {
+          output_tokens: state.outputTokens || 0,
+        },
+      }),
+    );
+    state.pendingStopReason = null;
   }
 
   const choice = chunk.choices?.[0];
@@ -504,18 +526,29 @@ export function translateStreamChunk(
         ? "max_tokens"
         : "end_turn";
 
-    events.push(
-      JSON.stringify({
-        type: "message_delta",
-        delta: {
-          stop_reason: stopReason,
-          stop_sequence: null,
-        },
-        usage: {
-          output_tokens: state.outputTokens || 0,
-        },
-      }),
-    );
+    // If usage was already provided in this chunk (or previous chunks), emit message_delta immediately.
+    // Otherwise, defer emitting message_delta until the dedicated usage chunk arrives.
+    if (
+      chunk.usage?.completion_tokens !== undefined ||
+      chunk.usage?.output_tokens !== undefined ||
+      state.outputTokens > 0
+    ) {
+      events.push(
+        JSON.stringify({
+          type: "message_delta",
+          delta: {
+            stop_reason: stopReason,
+            stop_sequence: null,
+          },
+          usage: {
+            output_tokens: state.outputTokens || 0,
+          },
+        }),
+      );
+      state.pendingStopReason = null;
+    } else {
+      state.pendingStopReason = stopReason;
+    }
   }
 
   return events;

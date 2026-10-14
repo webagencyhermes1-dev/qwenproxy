@@ -382,11 +382,29 @@ app.get("/health", async (c) => {
   let accountStates: Record<string, string> = {};
   let activeStreams = 0;
   let waitingStreams = 0;
+  // Resolved once and reused by the cap-aware readiness block below, so the
+  // capacity view and the `ready` count are computed from the same snapshot
+  // instead of racing each other.
+  let capObservability: Awaited<ReturnType<typeof buildModelCapObservability>> = {
+    degraded: false,
+    anyServable: true,
+    models: [],
+  };
   try {
     const manager = await import("../core/account-manager.js");
     const stats = manager.getPoolStats();
     const readinessTarget = config.pool?.targetReady ?? 2;
     const readinessDeficit = Math.max(0, readinessTarget - stats.ready);
+    // Cap-aware readiness: `ready` counts LANES, not servability. An account
+    // capped for a model stays READY (it is fine for every other model) but
+    // cannot serve THAT model, so the raw deficit understates real capacity
+    // pressure — this deployment reached ready 14/14 with readyUncapped 1.
+    // `usableDeficit` / `degraded` are the model-aware view to alert on.
+    capObservability = await buildModelCapObservability(stats.ready);
+    const worstUsable = capObservability.models.length
+      ? Math.min(...capObservability.models.map((m) => m.readyUncapped))
+      : stats.ready;
+    const usableDeficit = Math.max(0, readinessTarget - worstUsable);
     pool = {
       total: stats.total,
       ready: stats.ready,
@@ -405,6 +423,8 @@ app.get("/health", async (c) => {
       averageHealth: stats.averageHealth,
       readinessTarget,
       readinessDeficit,
+      usableDeficit,
+      degraded: capObservability.degraded,
     };
     accountStates = stats.states;
     activeStreams = stats.totalActiveStreams;
@@ -413,6 +433,7 @@ app.get("/health", async (c) => {
     metrics.gauge("pool.ready", stats.ready);
     metrics.gauge("pool.warming", stats.warming);
     metrics.gauge("pool.deficit", readinessDeficit);
+    metrics.gauge("pool.usable_deficit", usableDeficit);
   } catch (error) {
     reportHealthSectionFailure("pool stats", error);
     pool = null;
@@ -457,10 +478,24 @@ app.get("/health", async (c) => {
   } catch (error) {
     reportHealthSectionFailure("account list", error);
   }
+  const rss = process.memoryUsage().rss;
+  const totalMem = os.totalmem();
+  const mem = process.memoryUsage();
+  const uptimeSeconds = Math.floor(process.uptime());
+  const systemMemoryPct =
+    Number.isFinite(totalMem) && totalMem > 0
+      ? Number(((mem.rss / totalMem) * 100).toFixed(1))
+      : 0;
+
   return c.json({
     status: status?.overall || "unknown",
     ram: status?.ram || "unknown",
     streams: status?.streams || "unknown",
+    uptimeSeconds,
+    rssMb: Number((mem.rss / (1024 * 1024)).toFixed(1)),
+    systemMemoryPct,
+    activeStreams,
+    waitingStreams,
     heap: status?.heap
       ? {
           used: status.heap.heapUsed,
@@ -475,10 +510,105 @@ app.get("/health", async (c) => {
     activeAccounts: (await import("../services/playwright.js")).getActivePlaywrightAccountIds(),
     pool,
     accounts: poolAccounts,
+    // Accounts that hit Qwen's per-account DAILY allowance for a given model.
+    // They stay in the pool for every other model — this is model-scoped.
+    // `readyUncapped` answers the operator question "can this model run right
+    // now?" in one field: READY accounts minus the ones capped for it. Zero
+    // with ready>0 is the exact condition that used to surface as the
+    // misleading "no hot accounts" error.
+    modelDailyCaps: capObservability,
+    // Pool-wide WAF challenge pressure (decayed EWMA) and the hottest lanes.
+    // Used to size adaptive backoff and to explain a rising challenge rate.
+    wafPressure: (await import("../core/waf-isolation.js")).getWafIsolationStats(),
+    performance: performanceMetrics.getSnapshot(),
     metrics: {
       cache: await cache?.getStats(),
     },
   });
+});
+
+/**
+ * Per-model cap + availability snapshot, plus pool-wide WAF challenge pressure.
+ *
+ * `ready` alone is a misleading health signal: a model-daily cap removes an
+ * account from service for that model while leaving the lane READY, so a pool
+ * can report `ready 14/14` and still be unable to serve a single request (this
+ * deployment hit exactly that at capped=13 / readyUncapped=1). The `degraded`
+ * flag below is the operator-facing consequence — it turns "structurally full"
+ * into "cannot serve right now", which is what actually pages someone.
+ *
+ * Read-only; every import is guarded so a missing module degrades the field
+ * instead of failing /health.
+ */
+async function buildModelCapObservability(
+  ready: number,
+): Promise<{
+  degraded: boolean;
+  anyServable: boolean;
+  models: Array<{
+    model: string;
+    capped: number;
+    readyUncapped: number;
+    accounts: string[];
+  }>;
+}> {
+  try {
+    const capMod = await import("../services/model-daily-limit.js");
+    const gwMod = await import("../runtime/gateway.js");
+    const stats = capMod.getModelCapStats();
+    const models = stats.models.map((m) => {
+      let readyUncapped = 0;
+      try {
+        // peekReadyAccountIds returns READY minus the excluded set; excluding
+        // the capped accounts for this model yields the servable-now count.
+        readyUncapped = gwMod.peekReadyAccountIds(
+          new Set(capMod.cappedAccountsForModel(m.model)),
+        ).length;
+      } catch {
+        // Gateway unbound (pre-startup / hermetic tests): report capped only.
+      }
+      return {
+        model: m.model,
+        capped: m.capped,
+        readyUncapped,
+        accounts: m.accounts,
+      };
+    });
+    // Degraded only when a model is tracked as capped AND the pool has warm
+    // lanes: that is the case where `ready` overstates real capacity. With no
+    // caps at all the pool is not degraded by this axis.
+    const anyServable = models.length === 0 || models.some((m) => m.readyUncapped > 0);
+    const degraded = models.length > 0 && !anyServable && ready > 0;
+    return { degraded, anyServable, models };
+  } catch {
+    return { degraded: false, anyServable: true, models: [] };
+  }
+}
+
+// Cumulative token/request usage: all-time totals, today, and a daily
+// breakdown. Backed by SQLite (usage_totals + usage_daily) so the numbers
+// survive restarts and accumulate across sessions instead of resetting per
+// process. Auth-gated like the other /health probes.
+app.get("/health/usage", async (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  try {
+    const tracker = await import("../core/usage-tracker.js");
+    const daysParam = c.req.query("days");
+    const parsedDays = daysParam != null ? parseInt(daysParam) : NaN;
+    const days = Number.isFinite(parsedDays) && parsedDays > 0 ? Math.min(parsedDays, 365) : 30;
+    return c.json({
+      allTime: tracker.loadUsageTotals(),
+      today: tracker.getTodayUsage(),
+      daily: tracker.getDailyUsage(days),
+      timestamp: Date.now(),
+    });
+  } catch (err) {
+    return c.json(
+      { error: err instanceof Error ? err.message : String(err) },
+      500,
+    );
+  }
 });
 
 // Deep readiness probe for orchestrators (k8s readinessProbe, Docker
@@ -560,6 +690,10 @@ app.get("/health/recovery", async (c) => {
     return c.json({
       readiness: {
         inFlight: runtimeServices?.readiness.getInFlight() ?? [],
+        // Accounts parked by the warmup circuit breaker: burned several whole
+        // warmup eras without ever succeeding, so no browser is launched for
+        // them. This is the "dead upstream account" cohort made visible.
+        warmupParked: runtimeServices?.readiness.getWarmupCircuitBreakers() ?? [],
         targetReady,
         readyCount,
         deficit: Math.max(0, targetReady - readyCount),
@@ -710,11 +844,16 @@ export async function prepareQwenRuntime(params: {
   successMessage: string;
   failureMessage: string;
   initAuth: () => Promise<void>;
-  disableNativeTools: (accountId?: string) => Promise<void>;
+disableNativeTools: (accountId?: string) => Promise<void>;
   warmQwenChatPool: (
     accountId: string | undefined,
     modelId: string,
   ) => Promise<void>;
+  /**
+   * Internal: a post-captcha-solve retry has already been spent for this
+   * attempt, so the recovery below can never recurse more than once.
+   */
+  captchaRetrySpent?: boolean;
 }): Promise<boolean> {
   if (params.accountId) {
     const { getAccountCooldownInfo } =
@@ -765,6 +904,47 @@ export async function prepareQwenRuntime(params: {
         (getAccountCooldownInfo(params.accountId)?.reason ?? "").startsWith(
           "AuthPermanentFailure",
         );
+
+      // Baxia challenge recovery on the WARMUP path. `recoverBaxiaCaptcha` was
+      // only reachable from the served-request and media-generation paths, so
+      // an account challenged during header capture was never solved — it just
+      // failed as a generic `AuthInitFailed` and sat in the cooldown/retry loop
+      // until the readiness controller gave up on it.
+      //
+      // A challenge during header capture does NOT surface as an explicit WAF
+      // error: the punish document replaces the completion request, so the
+      // capture reports "no completion request". Classifying the error text is
+      // therefore unreliable, and the solver doubles as the detector — it
+      // returns false fast when there is no captcha on the page, which keeps
+      // genuinely-dead accounts (pending activation, wrong credentials) cheap.
+      // Permanent-auth failures are skipped: a slider cannot fix those.
+      if (params.accountId && !permanentFailure && !params.captchaRetrySpent) {
+        try {
+          const { recoverBaxiaCaptcha } = await import(
+            "../services/captcha-coordinator.ts"
+          );
+          const solved = await recoverBaxiaCaptcha(
+            params.accountId,
+            "warmup-init",
+          );
+          if (solved) {
+            const { clearAccountCooldown } = await import(
+              "../core/account-manager.ts"
+            );
+            // Drop anything initAuth parked while failing so the retry is not
+            // rejected by the cooldown guard at the top of this function.
+            clearAccountCooldown(params.accountId);
+            console.log(
+              `🛡️ [Server] Solved WAF challenge during init | account=${formatAccountId(params.accountId)} | retrying warmup once`,
+            );
+            return prepareQwenRuntime({ ...params, captchaRetrySpent: true });
+          }
+        } catch {
+          // Solver unavailable or wedged: fall through to the normal
+          // cooldown path so the account stays in the bounded retry loop.
+        }
+      }
+
       if (permanentFailure) {
         markAccountRateLimited(
           params.accountId,

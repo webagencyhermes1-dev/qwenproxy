@@ -31,6 +31,10 @@ import {
   ReadinessController,
   type WarmupOutcome,
 } from "../runtime/readiness/readiness-controller.ts";
+import {
+  registerPlaywrightAccountForTests,
+  unregisterPlaywrightAccountForTests,
+} from "../services/playwright.ts";
 
 interface AccountRow {
   id: string;
@@ -43,11 +47,31 @@ interface AccountRow {
 
 const SYSTEM_FENCE: OwnershipFence = { leaseId: "system", ownerToken: "system" };
 
+/**
+ * Ownership-BOUND readiness requires a LIVE Playwright page (see
+ * `isAccountHeadersReady`): a READY record whose context died must not pass the
+ * request-path gate. Warming an account in production implies a live browser
+ * context, so the warm executor below registers one — without it the gate
+ * correctly returns false and these tests assert the wrong contract.
+ */
+const livePages = new Set<string>();
+
+function registerLivePage(accountId: string): void {
+  livePages.add(accountId);
+  registerPlaywrightAccountForTests(
+    accountId,
+    { isClosed: () => false } as never,
+    Date.now(),
+  );
+}
+
 beforeEach(() => {
   resetAccountOwnershipForTests();
 });
 
 afterEach(() => {
+  for (const id of livePages) unregisterPlaywrightAccountForTests(id);
+  livePages.clear();
   resetAccountOwnershipForTests();
   resetAccountManagerForTests();
   resetAccountStateForTests();
@@ -136,6 +160,7 @@ function bindPool(ids: string[]): void {
 function markReadyBound(id: string): void {
   const ownership = getAccountOwnership();
   ownership.transition(id, "WARMING", SYSTEM_FENCE, "test-warm");
+  registerLivePage(id);
   markAccountHeadersReady(id);
   assert.equal(ownership.getAccountStatus(id), "READY");
 }
@@ -164,6 +189,7 @@ function makeExecutor(
     }
     const claimed = ownership.transition(id, "WARMING", SYSTEM_FENCE, "warmup-start");
     if (!claimed.transitioned) return "failed";
+    registerLivePage(id);
     markAccountHeadersReady(id);
     return ownership.getAccountStatus(id) === "READY" ? "ready" : "failed";
   };

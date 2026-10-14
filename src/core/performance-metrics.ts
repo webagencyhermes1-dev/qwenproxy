@@ -1,4 +1,5 @@
 import { EventEmitter } from "events";
+import { loadUsageTotals, recordUsagePersist } from "./usage-tracker.ts";
 
 interface RequestMetrics {
   timestamp: number;
@@ -27,6 +28,19 @@ export class PerformanceMetrics extends EventEmitter {
   private totalCompletionTokens = 0;
   private totalTokens = 0;
 
+  constructor() {
+    super();
+    // Durable totals: the cumulative counters must survive a restart, so the
+    // all-time baseline is restored from SQLite before this process records
+    // anything. The DB write itself is coalesced (see usage-tracker) so the
+    // request path never blocks on it.
+    const persisted = loadUsageTotals();
+    this.totalRequests = persisted.totalRequests;
+    this.totalPromptTokens = persisted.totalPromptTokens;
+    this.totalCompletionTokens = persisted.totalCompletionTokens;
+    this.totalTokens = persisted.totalTokens;
+  }
+
   recordRequest(metrics: RequestMetrics): void {
     this.requestHistory.push(metrics);
     if (this.requestHistory.length > this.maxHistorySize) {
@@ -37,6 +51,12 @@ export class PerformanceMetrics extends EventEmitter {
     this.totalPromptTokens += metrics.promptTokens;
     this.totalCompletionTokens += metrics.completionTokens;
     this.totalTokens += metrics.totalTokens;
+
+    recordUsagePersist(
+      metrics.promptTokens,
+      metrics.completionTokens,
+      metrics.totalTokens,
+    );
 
     this.emit("update", this.getSnapshot());
   }

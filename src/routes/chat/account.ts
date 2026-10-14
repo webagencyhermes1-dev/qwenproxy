@@ -9,7 +9,7 @@ import {
  	syncCooldownsFromDb,
  } from "../../core/account-manager.ts";
 import { markAccountSuccessful, markAccountFailed, getAccountsByPriority } from "../../core/account-priority.ts";
-import { recordWafHardBlock, noteWafRecovery } from "../../core/waf-isolation.ts";
+import { recordWafHardBlock, noteWafRecovery, noteWafSuccess } from "../../core/waf-isolation.ts";
 import {
   noteAccountInitFailure,
   noteAccountInitSuccess,
@@ -97,6 +97,10 @@ import {
 } from "../../core/account-concurrency.ts";
 import { isAuthMockEnabled } from "../../services/auth-playwright.ts";
 import {
+	allAccountsCappedForModel,
+	cappedAccountsForModel,
+} from "../../services/model-daily-limit.ts";
+import {
   assembleCompressedContext,
   renderFailoverPrompt,
   TIERED_DEFAULT_BUDGET,
@@ -147,16 +151,22 @@ import {
 	shouldRetryInvalidInputOnSameAccount,
  } from "./retry-policy.ts";
 import { getAccountOwnership, toLegacyAccountLease } from "../../runtime/account/instance.ts";
-import { acquireGenerationAccount } from "../../runtime/gateway.ts";
+import { acquireGenerationAccount, peekReadyAccountIds } from "../../runtime/gateway.ts";
 import { TypedRuntimeError } from "../../domain/errors.ts";
 import type { AccountLease as DomainAccountLease } from "../../domain/types.ts";
 import { withDeadline } from "../../api/fail-fast.ts";
 
 /** How many alternate accounts a single request may try after a WAF challenge.
- * Scales with pool size (capped by maxAccountSwitches) so large pools can
- * survive multiple simultaneous challenges, while small pools stay bounded. */
+ * Scales with pool size but is NOT tied to `retry.maxAccountSwitches`: that
+ * budget is a latency guard for ordinary failover, while a Baxia challenge is a
+ * pool-wide condition. Measured on this deployment, ~40% of warm accounts are
+ * challenged at any moment, so giving up after `maxAccountSwitches` (2) failed
+ * requests whose 4th candidate was healthy — the observed WAF failure rate
+ * (~7%) matches `0.43^3` almost exactly. `retry.maxAntiBotRotations` sizes this
+ * budget to the challenge rate instead, still bounded by pool size so a small
+ * pool cannot spin forever. */
 function maxAntiBotRotations(poolSize: number): number {
-	return Math.max(1, Math.min(config.retry.maxAccountSwitches, poolSize - 1));
+	return Math.max(1, Math.min(config.retry.maxAntiBotRotations, poolSize - 1));
 }
 
 /**
@@ -443,6 +453,73 @@ function capDelayByCreateBudget(
   const remaining = createBudgetRemainingMs(retryContext);
   if (remaining === null) return delayMs;
   return Math.max(0, Math.min(delayMs, remaining));
+}
+
+/**
+ * Bounded wait for an UNCAPPED hot account when the first acquire returned
+ * NO_CANDIDATES because every READY account is capped for `model`.
+ *
+ * A model-scoped daily cap is transient: the readiness controller is warming
+ * uncapped standbys that reach READY within seconds, so failing fast here would
+ * surface "no hot accounts"/"limit reached" for a condition that resolves on its
+ * own before the client's next retry. This rides that out instead.
+ *
+ * Hard guarantees (so it can never regress the working failover contract):
+ *  - returns immediately (false) when the wait budget is 0 or `model` is unset,
+ *    preserving the exact fail-fast + client-retry behavior;
+ *  - never overshoots the per-request CREATE deadline (`capDelayByCreateBudget`);
+ *  - returns the instant the client aborts (`signal`) or an uncapped READY
+ *    account appears;
+ *  - requests a readiness tick up front so warming actually progresses.
+ * Returns true when an uncapped hot account became selectable (caller retries
+ * the acquire), false to fall through to the existing capacity error.
+ */
+async function waitForUncappedHotAccount(
+  model: string | undefined,
+  excludeSet: ReadonlySet<string>,
+  retryContext: RequestRetryContext | undefined,
+  signal: AbortSignal | undefined,
+): Promise<boolean> {
+  const budgetMs = config.pool.modelCapWaitMs;
+  if (!model || budgetMs <= 0) return false;
+
+  // Ask for warmup progress now: the next reconcile tick is up to
+  // POOL_RECONCILIATION_INTERVAL_MS away, but we are about to wait.
+  void import("../../runtime/construct.ts")
+    .then((m) => m.requestReadinessTick("model-cap-wait"))
+    .catch(() => {});
+
+  const uncappedReadyNow = (): boolean => {
+    const excl = new Set(excludeSet);
+    for (const id of cappedAccountsForModel(model)) excl.add(id);
+    return peekReadyAccountIds(excl).length > 0;
+  };
+  if (uncappedReadyNow()) return true;
+  if (signal?.aborted) return false;
+
+  const waitMs = capDelayByCreateBudget(retryContext, budgetMs);
+  if (waitMs <= 0) return false;
+  const deadline = Date.now() + waitMs;
+  const POLL_MS = 250;
+  while (Date.now() < deadline) {
+    const slice = Math.min(POLL_MS, deadline - Date.now());
+    if (slice <= 0) break;
+    await new Promise<void>((resolve) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, slice);
+      timer.unref?.();
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+    if (signal?.aborted) return false;
+    if (uncappedReadyNow()) return true;
+  }
+  return false;
 }
 
 /**
@@ -897,6 +974,16 @@ export async function acquireUpstreamStream(
 		excludeSet.add(stickyThreadAccountId);
 	}
 
+	// Daily model cap: an account that already reported `extra.update_member`
+	// for THIS model cannot serve it again today, so it must not be selected
+	// for this model at all. Skipping it up front is what turns the cap into a
+	// one-hop failover instead of a full pool walk.
+	if (params.model) {
+		for (const cappedId of cappedAccountsForModel(params.model)) {
+			excludeSet.add(cappedId);
+		}
+	}
+
 	// The lease authority (Gateway / AccountResourceManager) is the SOLE author
 	// of account selection. The legacy round-robin selector
 	// (resolveInitialAccount) must never run, so non-HOT accounts can never be
@@ -906,9 +993,25 @@ export async function acquireUpstreamStream(
 	let configuredAccounts: SelectedAccount[];
 	let account: SelectedAccount | null;
 	let ownershipLease: DomainAccountLease | null = null;
+
+	// Every account has exhausted its daily allowance for this model. Rotating
+	// cannot help, and each hop would burn a lease wait before failing the same
+	// way — say so plainly instead.
+	if (params.model) {
+		const everyAccountId = loadAccounts().map((a) => a.id);
+		if (allAccountsCappedForModel(everyAccountId, params.model)) {
+			const err = new Error(
+				`Every configured account has reached its daily ${params.model} limit. Capped accounts: ${cappedAccountsForModel(params.model).length}/${everyAccountId.length}. Try another model or wait for Qwen's daily reset.`,
+			) as Error & { code?: string; upstreamStatus?: number };
+			err.code = "model_daily_limit";
+			err.upstreamStatus = 503;
+			return { error: err, completionId, allOnCooldown: false };
+		}
+	}
+
 	if (useGateway) {
 		configuredAccounts = loadAccounts();
-		const claimed = acquireGenerationAccount({
+		let claimed = acquireGenerationAccount({
 			generationId: completionId,
 			preferredAccountId:
 				typeof resolvedPreferred === "string" ? resolvedPreferred : undefined,
@@ -916,6 +1019,32 @@ export async function acquireUpstreamStream(
 			deadline: Date.now() + config.timeouts.totalRequestTimeout,
 			modelId: params.model,
 		});
+		// A NO_CANDIDATES result has two distinct causes: every READY account is
+		// capped for THIS model while uncapped standbys are still warming (a
+		// transient, model-scoped condition the pool clears on its own in
+		// seconds), or genuinely zero warm accounts. Ride out the first with a
+		// bounded, deadline- and abort-aware wait so a model daily cap never
+		// surfaces as "no hot accounts"/"limit reached" for something that
+		// resolves before the client's next retry. Disabled when the wait budget
+		// is 0 (preserves the exact fail-fast contract).
+		if (!claimed.ok && claimed.failureCode === "NO_CANDIDATES") {
+			const uncappedAppeared = await waitForUncappedHotAccount(
+				params.model,
+				excludeSet,
+				params.retryContext,
+				params.requestSignal,
+			);
+			if (uncappedAppeared) {
+				claimed = acquireGenerationAccount({
+					generationId: completionId,
+					preferredAccountId:
+						typeof resolvedPreferred === "string" ? resolvedPreferred : undefined,
+					triedAccountIds: excludeSet,
+					deadline: Date.now() + config.timeouts.totalRequestTimeout,
+					modelId: params.model,
+				});
+			}
+		}
 		if (!claimed.ok) {
 			// Zero HOT candidates under the lease authority: same contract as the
 			// legacy null pick — bounded capacity error, never a non-HOT claim.
@@ -1441,6 +1570,24 @@ export async function acquireUpstreamStream(
 		}
 
 		account = pickNextHotCandidate(triedAccountIds);
+	}
+
+	// Release any ownership lease that was claimed but never handed to the
+	// inner function (e.g. budget violation at the top of the loop before
+	// tryCreateStreamWithRetry was called). Without this, the account stays
+	// RESERVED in the ownership authority and reports BUSY forever.
+	if (ownershipLease) {
+		try {
+			getAccountOwnership().release({
+				leaseId: ownershipLease.leaseId,
+				ownerToken: ownershipLease.ownerToken,
+				outcome: "cancelled",
+				reason: "outer-loop-exit",
+			});
+		} catch {
+			// Fenced/stale releases are safe no-ops inside the manager.
+		}
+		ownershipLease = null;
 	}
 
 	// The loop can exit with the create budget already spent (the last attempt
@@ -2249,8 +2396,10 @@ async function tryCreateStreamWithRetry(
 
 		// A served stream means the WAF accepted this account's identity:
 		// clear the hard-block escalation streak (keeps the next block at the
-		// base window instead of compounding forever).
+		// base window instead of compounding forever) and drop the lane's
+		// routing penalty so it is preferred again immediately.
 		noteWafRecovery(currentAccountId);
+		noteWafSuccess(currentAccountId);
 		markAccountSuccessful(currentAccountId);
 		// Pool 2.0: persistent health + gradual recovery of transient flags.
 		// noteAccountInitSuccess records the success AND clears the init-fail

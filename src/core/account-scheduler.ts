@@ -11,6 +11,7 @@
 import type { QwenAccount } from "./accounts.ts";
 import type { AccountHealthRecord } from "./account-health.ts";
 import { getTtfbFactor, getRecent429Rate } from "./account-health.ts";
+import { getAccountPressure } from "./waf-pressure.ts";
 
 export interface SchedulerCandidate {
   account: QwenAccount;
@@ -129,10 +130,35 @@ export function rankSchedulerCandidates(
   return rankByScore(selectable);
 }
 
+/**
+ * Routing penalty for recent challenge pressure, in 0.5..1.
+ *
+ * A lane that was just challenged is likely still flagged, so sending the next
+ * request there is the behaviour that provokes another challenge. Penalising it
+ * (softly, so a pressured lane is deprioritised rather than excluded) lets the
+ * pool rest challenged lanes instead of hammering them, and the pressure decays
+ * on its own so the lane returns without any explicit reset.
+ *
+ * Read from the leaf `waf-pressure` module: importing `waf-isolation` here would
+ * close the account-manager -> scheduler -> waf-isolation -> account-manager
+ * cycle and risk a TDZ ReferenceError depending on module entry order.
+ */
+function wafPressureFactor(accountId: string): number {
+  return 1 - 0.5 * getAccountPressure(accountId);
+}
+
 function rankByScore(selectable: SchedulerCandidate[]): SchedulerCandidate[] {
   return [...selectable].sort((a, b) => {
-    const scoreA = a.health.healthScore * getTtfbFactor(a.account.id) * (1 - getRecent429Rate(a.account.id));
-    const scoreB = b.health.healthScore * getTtfbFactor(b.account.id) * (1 - getRecent429Rate(b.account.id));
+    const scoreA =
+      a.health.healthScore *
+      getTtfbFactor(a.account.id) *
+      (1 - getRecent429Rate(a.account.id)) *
+      wafPressureFactor(a.account.id);
+    const scoreB =
+      b.health.healthScore *
+      getTtfbFactor(b.account.id) *
+      (1 - getRecent429Rate(b.account.id)) *
+      wafPressureFactor(b.account.id);
     const bandA = Math.floor(scoreA / 10);
     const bandB = Math.floor(scoreB / 10);
     if (bandA !== bandB) return bandB - bandA;

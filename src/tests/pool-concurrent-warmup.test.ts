@@ -76,6 +76,9 @@ class FakeOwnership implements IAccountOwnership {
   reapExpiredCooldowns(): number {
     return 0;
   }
+  sweepExpiredLeases(): number {
+    return 0;
+  }
 
   async recoverAccount(accountId: string, reason: string): Promise<void> {}
 }

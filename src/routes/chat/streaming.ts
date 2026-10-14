@@ -53,6 +53,7 @@ import { classifyError } from "../../api/error-classifier.js";
 import { ClientAbortedError } from "../../core/errors.js";
 import { config, type ChatMode } from "../../core/config.js";
 import { parseQwenErrorPayload } from "./errors.ts";
+import { markAccountModelCapped } from "../../services/model-daily-limit.ts";
 import {
   isNetworkLikeError,
   throwFromSseUpstreamError,
@@ -76,6 +77,7 @@ import {
   applyUpstreamUsage,
   buildUsage,
 } from "./helpers.ts";
+import { estimateTokenCount } from "../../utils/context-truncation.ts";
 import {
   getSharedSessionService,
   isSessionVersioningEnabled,
@@ -501,6 +503,21 @@ export async function processNonStreamingResponse(
           ) {
             const delta = chunk.choices[0].delta;
 
+            if (delta.extra?.update_member === true) {
+              markAccountModelCapped(activeAccountId, body.model);
+              throw toRetryableStreamError(
+                "model_daily_limit",
+                `account hit its daily allowance for ${body.model}; rotating to another account`,
+                {
+                  reason: "model_daily_limit",
+                  switchAccount: true,
+                  forceNewChat: true,
+                  retryWithFullPrompt: true,
+                  retryAfterMs: 0,
+                },
+              );
+            }
+
             if (delta.phase === "thinking_summary") {
               isThinkingChunk = true;
               const formattedSummary = formatThinkingSummaryContent(delta);
@@ -644,6 +661,17 @@ export async function processNonStreamingResponse(
           },
         );
       }
+    }
+
+    if (
+      !usageAccumulator.hasRealCompletionTokens &&
+      (finalContent || reasoningBuffer || toolCallsOut.length > 0)
+    ) {
+      usageAccumulator.completionTokens = estimateTokenCount(
+        reasoningBuffer,
+        finalContent,
+        toolCallsOut.length ? JSON.stringify(toolCallsOut) : "",
+      );
     }
 
     const usage = enrichUsageWithContextMeter(
@@ -1344,6 +1372,19 @@ export async function processStreamingResponse(
       const usageAccumulator = createUsageAccumulator(0);
       let pendingParentId: string | null = null;
       let upstreamDone = false;
+      // Diagnostics for the empty-completion guard: if the model DID answer but
+      // the turn still ends with zero content, these tell us which filter ate
+      // it (foreign response_id vs an unrecognised delta phase).
+      let ignoredChunks = 0;
+      let lastIgnoredReason = "";
+      // Ring of the last raw SSE payloads seen on the CURRENT attempt. Dumped
+      // by the empty-completion guard so a zero-token turn can be diagnosed
+      // from the file log (console.log only reaches the TUI, not the sink).
+      const rawChunkTrace: string[] = [];
+      const recordRawChunk = (raw: string) => {
+        rawChunkTrace.push(raw.length > 300 ? raw.slice(0, 300) + "…" : raw);
+        if (rawChunkTrace.length > 40) rawChunkTrace.shift();
+      };
       const rememberSession = (sessionId: string | null) => {
         if (!sessionId || sessionId === currentUiSessionId) return;
         currentUiSessionId = sessionId;
@@ -1530,7 +1571,6 @@ export async function processStreamingResponse(
           !normalizedError ||
           (clientDisconnected && !gracePending) ||
           c.req.raw.signal.aborted ||
-          retryContext.retriesLeft <= 0 ||
           !midStreamRetry ||
           emittedModelOutput
         ) {
@@ -1541,6 +1581,13 @@ export async function processStreamingResponse(
           requestAborted: c.req.raw.signal.aborted,
         });
         if (!policy.retryable) return false;
+
+        // model_daily_limit is a routing issue: it uses its own rotation
+        // counter (outer loop), not the shared retry budget. Allow recovery
+        // even when retriesLeft is 0.
+        if (retryContext.retriesLeft <= 0 && policy.reason !== "model_daily_limit") {
+          return false;
+        }
 
         // Full recovery decision — same rationale as the create-path policy
         // log: the failure line shows the error, this line shows WHY the
@@ -1555,7 +1602,12 @@ export async function processStreamingResponse(
           invalidateLogicalThreadParent(midStreamRetry.sessionId);
         }
 
-        retryContext.retriesLeft--;
+        // model_daily_limit is a routing issue, not a failure — it must not
+        // consume the shared retry budget (the outer loop has its own rotation
+        // counter for it). Every other reason decrements normally.
+        if (policy.reason !== "model_daily_limit") {
+          retryContext.retriesLeft--;
+        }
         console.warn(
           `🔄 [Chat] Stream recovery | account=${currentAccountId} | reason=${policy.reason} | error=${normalizedError.message.substring(0, 150)} | retries_left=${retryContext.retriesLeft}`,
         );
@@ -1777,10 +1829,12 @@ export async function processStreamingResponse(
       // mid-stream recovery instead of surfacing as an un-retried SSE error.
       // The response is already open — heartbeats cover the wait for the first
       // byte (slow thinking).
-      let probeFailed = false;
+let probeFailed = false;
       try {
         while (true) {
-          const { done, value } = await streamReader.read();
+          // `reader`, not the original `streamReader`: a transparent recovery
+          // swaps it, and the read loop below must follow the swap.
+          const { done, value } = await reader.read();
           if (done) {
             initialStreamBuffer += streamDecoder.decode();
             break;
@@ -1805,6 +1859,7 @@ export async function processStreamingResponse(
         // NOT checked here — the read loop detects chunk.error and routes it
         // through recoverFromStreamError. Checking here would duplicate that
         // and swallow the retry.
+        recordRawChunk("[probe] " + initialStreamBuffer.slice(0, 300));
         const probeUpstreamError = parseQwenErrorPayload(initialStreamBuffer);
         if (probeUpstreamError) {
           throwParsedUpstreamError(probeUpstreamError);
@@ -1814,10 +1869,10 @@ export async function processStreamingResponse(
         if (await recoverFromStreamError(probeError)) {
           // Recovery swapped the reader and reset buffer — proceed to the read
           // loop with the fresh stream.
-        } else {
-          await streamReader.cancel().catch(() => undefined);
-          throw probeError;
-        }
+} else {
+            await reader.cancel().catch(() => undefined);
+            throw probeError;
+          }
       }
       if (!probeFailed) {
         buffer = initialStreamBuffer;
@@ -1867,6 +1922,7 @@ export async function processStreamingResponse(
           lineStart = lineEnd + 1;
           if (!dataStr) continue;
 
+          recordRawChunk(dataStr);
           if (dataStr === "[DONE]") {
             upstreamDone = true;
             if (!clientDisconnected) {
@@ -1965,6 +2021,25 @@ export async function processStreamingResponse(
             let vStr = "";
             let foundStr = false;
             let isThinkingChunk = false;
+            let isTerminalAnswerDelta = false;
+
+            if (
+              chunk.choices &&
+              chunk.choices[0] &&
+              chunk.choices[0].delta
+            ) {
+              // Ownership filter: only the response we bound on `response.created`
+              // may contribute output. Count what it drops so a zero-token turn
+              // can be explained instead of guessing.
+              if (
+                targetResponseId !== null &&
+                chunk.response_id !== targetResponseId &&
+                chunk.choices[0].delta.content
+              ) {
+                ignoredChunks++;
+                lastIgnoredReason = `foreign_response_id:${chunk.response_id}`;
+              }
+            }
 
             if (
               chunk.choices &&
@@ -1975,14 +2050,40 @@ export async function processStreamingResponse(
             ) {
               const delta = chunk.choices[0].delta;
 
-              // Qwen streams may end with a {"status":"finished",
-              // "phase":"answer"} delta and NO trailing [DONE]. Treat it as
-              // the terminal event so we don't wait on the keep-alive
-              // connection to close (up to the 60s/10min idle timeout).
-              if (delta.phase === "answer" && delta.status === "finished") {
-                upstreamDone = true;
-                if (!clientDisconnected) flushWrites();
-                break; // Exit the for loop; the while check leaves the read loop
+              // Qwen streams may end with a {"status":"finished","phase":"answer"} delta
+              // and NO trailing [DONE]. Treat it as the terminal event so we
+              // don't wait on the keep-alive connection to close (up to the
+              // 60s/10min idle timeout).
+              //
+              // It is NOT necessarily content-free. Qwen's daily-quota reply
+              // arrives as ONE delta that carries the full message AND
+              // status:"finished" — breaking here first discarded that message
+              // and the turn then failed as a zero-token `empty_response`.
+              // Only treat it as terminal once this delta's content (if any)
+              // has been extracted and emitted below.
+              isTerminalAnswerDelta =
+                delta.phase === "answer" && delta.status === "finished";
+
+              // Qwen's per-account DAILY MODEL CAP. It answers with the
+              // limit notice as ordinary answer text plus
+              // `extra.update_member: true`, so it is indistinguishable from a
+              // real answer by content alone. Record it as routing state and
+              // fail retryably with an account switch: the very next attempt
+              // skips this account for this model and lands on one that still
+              // has allowance today.
+              if (delta.extra?.update_member === true) {
+                markAccountModelCapped(currentAccountId, body.model);
+                throw toRetryableStreamError(
+                  "model_daily_limit",
+                  `account hit its daily allowance for ${body.model}; rotating to another account`,
+                  {
+                    reason: "model_daily_limit",
+                    switchAccount: true,
+                    forceNewChat: true,
+                    retryWithFullPrompt: true,
+                    retryAfterMs: 0,
+                  },
+                );
               }
 
               if (delta.phase === "thinking_summary") {
@@ -2003,33 +2104,45 @@ export async function processStreamingResponse(
                     foundStr = true;
                   }
                 }
-              } else if (delta.phase === "answer") {
-                isThinkingChunk = false;
-                if (delta.content !== undefined) {
-                  const newContent = delta.content || "";
-                  const result = getIncrementalDelta(
-                    lastRawContent,
-                    newContent,
-                    lastRawContentLength,
-                    lastRawContentSuffix,
-                  );
-                  vStr = result.delta;
-                  if (recoverySeedPending && newContent) {
-                    seedParserWithDedupedPrefix(newContent, vStr || "");
-                    recoverySeedPending = false;
-                  }
-                  if (vStr) {
-                    lastRawContent = result.matchedContent;
-                    lastRawContentLength = result.contentLength;
-                    lastRawContentSuffix = result.contentSuffix;
-                    foundStr = true;
-                  }
-                }
+              } else if (delta.content !== undefined) {
+                // Answer text for ANY non-thinking phase. Requiring the exact
+                // label `phase === "answer"` silently dropped real model output
+                // whenever Qwen tagged a delta differently (or omitted the
+                // phase, which the fast path above already tolerates) — the
+                // turn then ended as a zero-token "empty completion". The
+                // malformed-tool retry channel has always keyed off
+                // `content !== undefined` only; this is the same rule.
+isThinkingChunk = false;
+              const newContent = delta.content || "";
+              const result = getIncrementalDelta(
+                lastRawContent,
+                newContent,
+                lastRawContentLength,
+                lastRawContentSuffix,
+              );
+              vStr = result.delta;
+              if (recoverySeedPending && newContent) {
+                seedParserWithDedupedPrefix(newContent, vStr || "");
+                recoverySeedPending = false;
               }
+              if (vStr) {
+                lastRawContent = result.matchedContent;
+                lastRawContentLength = result.contentLength;
+                lastRawContentSuffix = result.contentSuffix;
+                foundStr = true;
+              }
+            }
             }
 
             if (foundStr && vStr !== "") {
-              if (vStr === "FINISHED") continue;
+              if (vStr === "FINISHED") {
+                if (isTerminalAnswerDelta) {
+                  upstreamDone = true;
+                  if (!clientDisconnected) flushWrites();
+                  break;
+                }
+                continue;
+              }
 
               if (isThinkingChunk) {
                 emittedModelOutput = true;
@@ -2043,6 +2156,15 @@ export async function processStreamingResponse(
                   break;
                 }
               }
+            }
+
+            // Now that this terminal delta's own text is out, leave the loop.
+            // `break` here (not above) is what keeps a content-carrying
+            // `status:"finished"` delta from being silently discarded.
+            if (isTerminalAnswerDelta) {
+              upstreamDone = true;
+              if (!clientDisconnected) flushWrites();
+              break;
             }
           } catch (_e) {
             // Never start a transparent retry after the downstream client has
@@ -2068,8 +2190,66 @@ export async function processStreamingResponse(
         // the for loop above; leave the while loop instead of re-reading so a
         // lingering keep-alive upstream connection doesn't stall the tail
         // (finish_reason + [DONE]) until the idle timeout or connection close.
-        if (upstreamDone) break;
         if (stoppedByToolCap) break;
+
+        // ── Zero-token turn: recover in place ────────────────────────────────
+        // The upstream closed the turn having produced nothing at all. The SSE
+        // response to the client is already committed (the initial role chunk
+        // went out before the first upstream byte), so the request-level retry
+        // loop can never run again for this request. The transparent in-stream
+        // recovery is the only remaining chance, and it must be taken HERE —
+        // inside the read loop — because it swaps the reader this loop drains.
+        //
+        // Skipped when the tool parser still holds pending work: an unterminated
+        // tool call only surfaces after `flush()`, and the malformed-tool retry
+        // below owns that case.
+        if (
+          upstreamDone &&
+          !emittedModelOutput &&
+          !finalContent &&
+          !reasoningBuffer &&
+          !clientDisconnected &&
+          !c.req.raw.signal.aborted &&
+          midStreamRetry &&
+          retryContext.retriesLeft > 0 &&
+          (toolParser?.getEmittedToolCallCount() ?? 0) === 0 &&
+          (toolParser?.getMalformedToolCalls().length ?? 0) === 0
+        ) {
+          // Nothing worth appending to: the parent this attempt produced
+          // describes a response the client never saw. Drop it so neither the
+          // recovery nor the next request can build on it.
+          pendingParentId = null;
+          if (
+            await recoverFromStreamError(
+              toRetryableStreamError(
+                "empty_response",
+                "upstream produced no content, reasoning, or tool calls",
+                {
+                  reason: "empty_response",
+                  switchAccount: true,
+                  forceNewChat: true,
+                  retryWithFullPrompt: true,
+                  retryAfterMs: config.retry.baseDelayMs,
+                },
+              ),
+            )
+          ) {
+            logger.warn(
+              "[chat] stream: empty completion — recovered on a new stream",
+              {
+                completionId,
+                account: currentAccountId,
+                ignoredChunks,
+                lastIgnoredReason,
+              },
+            );
+            // Drain the swapped-in reader from the top of this same loop.
+            buffer = "";
+            continue;
+          }
+        }
+
+        if (upstreamDone) break;
 
         buffer = lineStart > 0 ? buffer.slice(lineStart) : buffer;
       }
@@ -2610,14 +2790,6 @@ export async function processStreamingResponse(
         }
       }
 
-      // The active upstream attempt completed: persist the next-turn parent.
-      // Failed/aborted attempts simply never commit, leaving the last successful
-      // parent as the append point for the next turn.
-      if (pendingParentId && upstreamDone) {
-        rememberParent(pendingParentId);
-        pendingParentId = null;
-      }
-
       const hasEmittedToolCalls =
         toolParser !== null && toolParser.getEmittedToolCallCount() > 0;
       if (
@@ -2643,16 +2815,31 @@ export async function processStreamingResponse(
       // going, leaving a permanent hole in the conversation. Fail retryably
       // instead: the stream error handler emits a terminal SSE error so the
       // client retries rather than storing nothing.
+      //
+      // Reaching this point means the in-place recovery inside the read loop
+      // already ran (or could not: no retry budget, client gone, or the tool
+      // parser still held pending work). So this is the terminal backstop.
       if (
         !clientDisconnected &&
         !finalContent &&
         !hasEmittedToolCalls &&
         !reasoningBuffer
       ) {
+        // Nothing worth appending to: the parent this attempt produced describes
+        // a response the client never saw. Drop it so the next request cannot
+        // build its context on a ghost.
+        pendingParentId = null;
+        if (logicalSessionId) {
+          invalidateLogicalThreadParent(logicalSessionId);
+        }
+
         logger.warn("[chat] stream: empty completion — failing retryably", {
           completionId,
           account: currentAccountId,
           upstreamDone,
+          ignoredChunks,
+          lastIgnoredReason,
+          rawUpstreamChunks: rawChunkTrace,
         });
         throw toRetryableStreamError(
           "empty_response",
@@ -2660,8 +2847,29 @@ export async function processStreamingResponse(
           {
             reason: "empty_response",
             switchAccount: true,
+            forceNewChat: true,
+            retryWithFullPrompt: true,
             retryAfterMs: config.retry.baseDelayMs,
           },
+        );
+      }
+
+      // The active upstream attempt completed AND produced verifiable output:
+      // only now does its parent become the append point for the next turn.
+      // Committing before the empty-turn check above persisted a parent for a
+      // zero-token response, so the next request appended onto a ghost.
+      if (pendingParentId && upstreamDone) {
+        rememberParent(pendingParentId);
+        pendingParentId = null;
+      }
+
+      if (
+        !usageAccumulator.hasRealCompletionTokens &&
+        (finalContent || reasoningBuffer || (toolParser && toolParser.getEmittedToolCallCount() > 0))
+      ) {
+        usageAccumulator.completionTokens = estimateTokenCount(
+          reasoningBuffer,
+          finalContent,
         );
       }
 

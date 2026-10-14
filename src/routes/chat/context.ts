@@ -117,9 +117,18 @@ export async function buildFinalContext(
   // would answer with no memory of the task or its own tool call
   // ("What would you like to do?").
   // Temp mode: always send the FULL history (OpenAI standard).
+  //
+  // The existence of a thread RECORD is not enough: `invalidateLogicalThreadParent`
+  // deliberately keeps the upstream chat binding and clears only `parentId`.
+  // Slicing to the delta in that state would append a fragment to nothing, so
+  // the reuse test is the same one `acquireUpstreamStream` applies — a
+  // non-empty chatSessionId AND a non-empty parentId.
+  const canReuseThreadDelta = Boolean(
+    existingThread?.chatSessionId && existingThread?.parentId,
+  );
   const baseActivePrompt = isTempMode
     ? prompt
-    : (existingThread ? currentPrompt : prompt) || prompt;
+    : (canReuseThreadDelta ? currentPrompt : prompt) || prompt;
 
   // If the previous turn of this session was closed early at the per-turn
   // tool-call cap, tell the model so it knows calls beyond the cap were NOT

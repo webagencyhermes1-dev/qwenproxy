@@ -507,3 +507,44 @@ test("Anthropic: translateStreamChunk handles thinking, text, and tool calls in 
   assert.equal(events4[1].delta.stop_reason, "tool_use");
   assert.equal(events4[1].usage.output_tokens, 30);
 });
+
+test("Anthropic: translateStreamChunk handles deferred usage in separate final chunk", () => {
+  const state: AnthropicStreamState = {
+    contentBlockIndex: 0,
+    currentBlockType: "text",
+    currentToolId: null,
+    currentToolIndex: null,
+    requestModel: "claude-3-5-sonnet-20241022",
+    inputTokens: 50,
+    outputTokens: 0,
+    hasEmittedToolUse: false,
+    pendingStopReason: null,
+  };
+
+  // 1. Penultimate chunk: finish_reason arrives without usage
+  const chunkFinish = {
+    choices: [{ finish_reason: "stop" }],
+  };
+  const eventsFinish = translateStreamChunk(chunkFinish, state).map((e) =>
+    JSON.parse(e),
+  );
+  assert.equal(eventsFinish.length, 1);
+  assert.equal(eventsFinish[0].type, "content_block_stop");
+  assert.equal(state.pendingStopReason, "end_turn");
+
+  // 2. Final chunk: choices is empty, usage arrives
+  const chunkUsage = {
+    choices: [],
+    usage: { prompt_tokens: 120, completion_tokens: 45, total_tokens: 165 },
+  };
+  const eventsUsage = translateStreamChunk(chunkUsage, state).map((e) =>
+    JSON.parse(e),
+  );
+  assert.equal(eventsUsage.length, 1);
+  assert.equal(eventsUsage[0].type, "message_delta");
+  assert.equal(eventsUsage[0].delta.stop_reason, "end_turn");
+  assert.equal(eventsUsage[0].usage.output_tokens, 45);
+  assert.equal(state.inputTokens, 120);
+  assert.equal(state.outputTokens, 45);
+  assert.equal(state.pendingStopReason, null);
+});

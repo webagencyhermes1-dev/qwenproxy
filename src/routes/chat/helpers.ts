@@ -180,8 +180,18 @@ export function applyUpstreamUsage(
   if (!candidate || typeof candidate !== "object") return;
 
   const usage = candidate as Record<string, unknown>;
-  const promptTokens = asFiniteNumber(usage.input_tokens);
-  const completionTokens = asFiniteNumber(usage.output_tokens);
+  // Accept BOTH upstream shapes. Qwen emits input_tokens/output_tokens; an
+  // OpenAI-compatible upstream (and some Qwen builds/paths that mirror it)
+  // emits prompt_tokens/completion_tokens. Reading only the Qwen names left an
+  // OpenAI-shaped usage SILENTLY IGNORED, so the accumulator kept the local
+  // ESTIMATE and the totals this proxy reported (and persisted to
+  // usage_totals) never matched what upstream actually billed. The Qwen names
+  // keep priority so the working Qwen path is unchanged.
+  const promptTokens =
+    asFiniteNumber(usage.input_tokens) ?? asFiniteNumber(usage.prompt_tokens);
+  const completionTokens =
+    asFiniteNumber(usage.output_tokens) ??
+    asFiniteNumber(usage.completion_tokens);
   const totalTokens = asFiniteNumber(usage.total_tokens);
 
   if (promptTokens !== null) {
@@ -213,23 +223,43 @@ export function applyUpstreamUsage(
     typeof usage.output_tokens_details === "object"
       ? (usage.output_tokens_details as Record<string, unknown>)
       : null;
+  // Same dual-shape rule as the token counts above: an OpenAI-compatible
+  // upstream reports these under completion_tokens_details instead of the Qwen
+  // output_tokens_details. Reading only one of the two silently dropped the
+  // reasoning/text breakdown from the reported usage.
+  const completionTokensDetails =
+    usage.completion_tokens_details &&
+    typeof usage.completion_tokens_details === "object"
+      ? (usage.completion_tokens_details as Record<string, unknown>)
+      : null;
 
-  const cachedTokens = asFiniteNumber(promptTokensDetails?.cached_tokens);
+  // Cached prompt tokens arrive under prompt_tokens_details (OpenAI) or
+  // input_tokens_details (Qwen-shaped). Accept either so the cache-hit
+  // breakdown is not silently dropped for one of the two shapes.
+  const cachedTokens =
+    asFiniteNumber(promptTokensDetails?.cached_tokens) ??
+    asFiniteNumber(inputTokensDetails?.cached_tokens);
   if (cachedTokens !== null) {
     accumulator.cachedPromptTokens = cachedTokens;
   }
 
-  const promptTextTokens = asFiniteNumber(inputTokensDetails?.text_tokens);
+  const promptTextTokens =
+    asFiniteNumber(inputTokensDetails?.text_tokens) ??
+    asFiniteNumber(promptTokensDetails?.text_tokens);
   if (promptTextTokens !== null) {
     accumulator.promptTextTokens = promptTextTokens;
   }
 
-  const reasoningTokens = asFiniteNumber(outputTokensDetails?.reasoning_tokens);
+  const reasoningTokens =
+    asFiniteNumber(outputTokensDetails?.reasoning_tokens) ??
+    asFiniteNumber(completionTokensDetails?.reasoning_tokens);
   if (reasoningTokens !== null) {
     accumulator.reasoningTokens = reasoningTokens;
   }
 
-  const completionTextTokens = asFiniteNumber(outputTokensDetails?.text_tokens);
+  const completionTextTokens =
+    asFiniteNumber(outputTokensDetails?.text_tokens) ??
+    asFiniteNumber(completionTokensDetails?.text_tokens);
   if (completionTextTokens !== null) {
     accumulator.completionTextTokens = completionTextTokens;
   }

@@ -13,6 +13,10 @@ import {
   type WarmupOutcome,
 } from "./readiness/readiness-controller.ts";
 import { reconcileBrokenAccounts } from "./readiness/broken-recovery.ts";
+import {
+  initModelCapsFromDb,
+  sweepExpiredModelCaps,
+} from "../services/model-daily-limit.ts";
 import { RetryCoordinator } from "./retry/retry-coordinator.ts";
 import {
   createStream,
@@ -177,6 +181,9 @@ export async function constructRuntime(
       maxWarmupFailures: config.pool.maxWarmupFailures,
       backoffBaseMs: config.pool.backoffBaseMs,
       backoffMaxMs: config.pool.backoffMaxMs,
+      maxFailedWarmupEras: config.pool.maxFailedWarmupEras,
+      failedEraSkipBaseMs: config.pool.failedEraSkipBaseMs,
+      failedEraSkipMaxMs: config.pool.failedEraSkipMaxMs,
     },
     {
       warmWarmup: (accountId) =>
@@ -221,6 +228,11 @@ export async function constructRuntime(
       // Recovery must never break the reconciliation loop.
     }
   };
+  // Restore persisted daily model caps BEFORE the first warmup tick: without
+  // this a restart forgets every cap, re-probes already-exhausted accounts, and
+  // re-drains the warm pool for the capped model within the first few requests
+  // (the post-restart "no hot accounts for qwen3.8-max" churn).
+  await initModelCapsFromDb();
   runBrokenRecovery();
   void readiness.tick();
 
@@ -233,6 +245,7 @@ export async function constructRuntime(
 
   const tickTimer = setInterval(() => {
     runBrokenRecovery();
+    void sweepExpiredModelCaps().catch(() => {});
     void readiness.tick();
   }, config.pool.reconciliationIntervalMs);
   tickTimer.unref?.();

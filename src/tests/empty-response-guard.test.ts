@@ -139,7 +139,14 @@ test("stream: empty upstream turn ends as a terminal error, never a clean empty 
       [],
       "an empty upstream turn must not emit assistant content",
     );
-    assert.equal(mock.getCompletionCalls(), 1);
+    // The turn must not die on the first attempt: once the SSE response is
+    // committed the request-level retry loop is gone, so the transparent
+    // in-stream recovery is the only chance left. Upstream is empty on EVERY
+    // account here, so it must exhaust that budget and still fail terminally.
+    assert.ok(
+      mock.getCompletionCalls() > 1,
+      `zero-token turn must attempt transparent recovery, got ${mock.getCompletionCalls()} completion call(s)`,
+    );
   } finally {
     mock.restore();
   }

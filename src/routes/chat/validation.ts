@@ -77,7 +77,7 @@ function parseActiveToolNames(c: Context): Set<string> | undefined {
  */
 const ChatBodySchema = z.object({
   model: z.string().min(1).max(200).optional(),
-  messages: z.array(z.any()).max(500),
+  messages: z.array(z.any()).max(5000),
   stream: z.boolean().optional(),
   tools: z.array(z.any()).max(100).optional(),
   tool_choice: z.any().optional(),

@@ -6,6 +6,11 @@ import {
   type ContextMeterOptions,
 } from "../services/context-meter.ts";
 import { estimateTokenCount } from "../utils/context-truncation.ts";
+import {
+  createUsageAccumulator,
+  applyUpstreamUsage,
+  buildUsage,
+} from "../routes/chat/helpers.ts";
 
 const enabledOptions: ContextMeterOptions = {
   enabled: true,
@@ -155,4 +160,41 @@ test("reportUsage falls back explicitly to a local estimate when Qwen sends no u
 
   assert.equal(usage.prompt_tokens, snapshot.estimatedContextTokens);
   assert.equal((usage as any).context_meter.measurementSource, "local_estimate");
+});
+
+test("applyUpstreamUsage supports both Qwen and OpenAI token usage formats", () => {
+  // 1. Qwen format (input_tokens / output_tokens)
+  const accQwen = createUsageAccumulator(10);
+  applyUpstreamUsage(accQwen, {
+    input_tokens: 42,
+    output_tokens: 18,
+    total_tokens: 60,
+    prompt_tokens_details: { cached_tokens: 5 },
+    output_tokens_details: { reasoning_tokens: 12, text_tokens: 6 },
+  });
+  const usageQwen = buildUsage(accQwen);
+  assert.equal(usageQwen.prompt_tokens, 42);
+  assert.equal(usageQwen.completion_tokens, 18);
+  assert.equal(usageQwen.total_tokens, 60);
+  assert.equal(usageQwen.prompt_tokens_details?.cached_tokens, 5);
+  assert.equal(usageQwen.completion_tokens_details?.reasoning_tokens, 12);
+  assert.equal(usageQwen.completion_tokens_details?.text_tokens, 6);
+
+  // 2. OpenAI format (prompt_tokens / completion_tokens)
+  const accOpenAI = createUsageAccumulator(10);
+  applyUpstreamUsage(accOpenAI, {
+    prompt_tokens: 30,
+    completion_tokens: 25,
+    total_tokens: 55,
+    input_tokens_details: { cached_tokens: 8, text_tokens: 22 },
+    completion_tokens_details: { reasoning_tokens: 15, text_tokens: 10 },
+  });
+  const usageOpenAI = buildUsage(accOpenAI);
+  assert.equal(usageOpenAI.prompt_tokens, 30);
+  assert.equal(usageOpenAI.completion_tokens, 25);
+  assert.equal(usageOpenAI.total_tokens, 55);
+  assert.equal(usageOpenAI.prompt_tokens_details?.cached_tokens, 8);
+  assert.equal(usageOpenAI.prompt_tokens_details?.text_tokens, 22);
+  assert.equal(usageOpenAI.completion_tokens_details?.reasoning_tokens, 15);
+  assert.equal(usageOpenAI.completion_tokens_details?.text_tokens, 10);
 });

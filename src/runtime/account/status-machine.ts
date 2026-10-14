@@ -14,7 +14,14 @@ const TRANSITIONS: Readonly<Record<AccountStatus, readonly AccountStatus[]>> = {
   // controller re-launches — the account then cycled warmup → exhaustion →
   // recovery → warmup forever instead of surfacing as failed.
   STANDBY: ["WARMING", "FAILED", "DISABLED"],
-  WARMING: ["READY", "FAILED", "COOLDOWN", "DISABLED"],
+  // WARMING → STANDBY ("warmup-abandoned"): a warmup that timed out without
+  // settling leaves the account occupying a WARMING slot forever, because the
+  // controller's timeout path only drops its in-flight entry and never touches
+  // ownership status. One orphan is enough to pin
+  // `deficit = target - ready - warming` at 0, which silently stops ALL further
+  // warmup — the pool then freezes at whatever count it reached. Requeueing
+  // returns the account to the warmable pool instead.
+  WARMING: ["READY", "STANDBY", "FAILED", "COOLDOWN", "DISABLED"],
   READY: ["RESERVED", "RECOVERING", "DRAINING", "COOLDOWN", "FAILED", "DISABLED"],
   RESERVED: ["GENERATING", "READY", "RECOVERING", "DRAINING", "FAILED", "DISABLED"],
   GENERATING: ["DRAINING", "RECOVERING", "READY", "FAILED", "DISABLED"],

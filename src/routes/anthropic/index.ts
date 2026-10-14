@@ -135,15 +135,26 @@ app.post("/v1/messages", async (c) => {
         };
 
         const messageId = generateMessageId();
+        const estimatedInputTokens = Math.max(
+          1,
+          estimateTokenCount(
+            ...(openaiRequest.messages ?? []).map((m: any) =>
+              typeof m.content === "string"
+                ? m.content
+                : JSON.stringify(m.content),
+            ),
+          ),
+        );
         const state: AnthropicStreamState = {
           contentBlockIndex: 0,
           currentBlockType: null,
           currentToolId: null,
           currentToolIndex: null,
           requestModel,
-          inputTokens: 0,
+          inputTokens: estimatedInputTokens,
           outputTokens: 0,
           hasEmittedToolUse: false,
+          pendingStopReason: null,
         };
 
         // Emit initial message_start event
@@ -157,7 +168,7 @@ app.post("/v1/messages", async (c) => {
             model: requestModel,
             stop_reason: null,
             stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 1 },
+            usage: { input_tokens: estimatedInputTokens, output_tokens: 1 },
           },
         };
         await write(
@@ -237,6 +248,23 @@ app.post("/v1/messages", async (c) => {
             );
             state.contentBlockIndex++;
             state.currentBlockType = null;
+          }
+
+          // Emit message_delta if still pending
+          if (state.pendingStopReason) {
+            await write(
+              `event: message_delta\ndata: ${JSON.stringify({
+                type: "message_delta",
+                delta: {
+                  stop_reason: state.pendingStopReason,
+                  stop_sequence: null,
+                },
+                usage: {
+                  output_tokens: state.outputTokens || 0,
+                },
+              })}\n\n`,
+            );
+            state.pendingStopReason = null;
           }
 
           // Emit final message_stop

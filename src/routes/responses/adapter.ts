@@ -365,16 +365,16 @@ export function chatCompletionsToResponses(
 
   // Build usage — always include details (Grok/serde requires them)
   const usage: ResponsesUsage = {
-    input_tokens: chatRes.usage.prompt_tokens,
-    output_tokens: chatRes.usage.completion_tokens,
-    total_tokens: chatRes.usage.total_tokens,
+    input_tokens: chatRes.usage?.prompt_tokens ?? 0,
+    output_tokens: chatRes.usage?.completion_tokens ?? 0,
+    total_tokens: chatRes.usage?.total_tokens ?? 0,
     input_tokens_details: {
-      cached_tokens: (chatRes.usage as any).prompt_tokens_details?.cached_tokens ?? 0,
+      cached_tokens: (chatRes.usage as any)?.prompt_tokens_details?.cached_tokens ?? 0,
     },
     output_tokens_details: {
-      reasoning_tokens: (chatRes.usage as any).completion_tokens_details?.reasoning_tokens ?? 0,
+      reasoning_tokens: (chatRes.usage as any)?.completion_tokens_details?.reasoning_tokens ?? 0,
     },
-    ...(chatRes.usage.context_meter
+    ...(chatRes.usage?.context_meter
       ? { context_meter: chatRes.usage.context_meter }
       : {}),
   };

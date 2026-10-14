@@ -144,6 +144,11 @@ test("multiturn-thinking-tools: keyed session with existing thread sends only th
             `data: {"response.created":{"chat_id":"tool-delta-chat","response_id":"tool-delta-resp-${capturedPayloads.length}"}}\n\n`,
           ),
         );
+        c.enqueue(
+          new TextEncoder().encode(
+            `data: {"response_id":"tool-delta-resp-${capturedPayloads.length}","choices":[{"delta":{"phase":"answer","content":"ok"}}]}\n\n`,
+          ),
+        );
         c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
         c.close();
       },
@@ -368,6 +373,11 @@ test("session-parent-tracking: sends only current delta using response message_i
             `data: {"response.created":{"chat_id":"qwen-chat-parent-tracking","response_id":"${mockMessageId}"}}\n\n`,
           ),
         );
+        c.enqueue(
+          new TextEncoder().encode(
+            `data: {"response_id":"${mockMessageId}","choices":[{"delta":{"phase":"answer","content":"ok"}}]}\n\n`,
+          ),
+        );
         c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
         c.close();
       },
@@ -542,6 +552,11 @@ test("thread-native: never includes system and tools in messages (personalizatio
             `data: {"response.created":{"chat_id":"qwen-chat-first-only","response_id":"${mockMessageId}"}}\n\n`,
           ),
         );
+        c.enqueue(
+          new TextEncoder().encode(
+            `data: {"response_id":"${mockMessageId}","choices":[{"delta":{"phase":"answer","content":"ok"}}]}\n\n`,
+          ),
+        );
         c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
         c.close();
       },
@@ -666,6 +681,11 @@ test("thread-native: recreates Qwen chat when upstream chat is missing", async (
             `data: {"response.created":{"chat_id":"${chatId}","response_id":"${responseId}"}}\n\n`,
           ),
         );
+        c.enqueue(
+          new TextEncoder().encode(
+            `data: {"response_id":"${responseId}","choices":[{"delta":{"phase":"answer","content":"ok"}}]}\n\n`,
+          ),
+        );
         c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
         c.close();
       },
@@ -743,6 +763,11 @@ test("topic-change: same agent conversation keeps the upstream parent chain", as
         c.enqueue(
           new TextEncoder().encode(
             `data: {"response.created":{"chat_id":"qwen-chat-topic-reset","response_id":"${mockMessageId}"}}\n\n`,
+          ),
+        );
+        c.enqueue(
+          new TextEncoder().encode(
+            `data: {"response_id":"${mockMessageId}","choices":[{"delta":{"phase":"answer","content":"ok"}}]}\n\n`,
           ),
         );
         c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
@@ -825,6 +850,11 @@ test("explicit-session-id: without session_id, creates new chat each time", asyn
             `data: {"response.created":{"chat_id":"${chatId}","response_id":"resp-${requestCount}"}}\n\n`,
           ),
         );
+        c.enqueue(
+          new TextEncoder().encode(
+            `data: {"response_id":"resp-${requestCount}","choices":[{"delta":{"phase":"answer","content":"ok"}}]}\n\n`,
+          ),
+        );
         c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
         c.close();
       },
@@ -890,6 +920,11 @@ test("explicit-session-id: with session_id, reuses same chat", async () => {
         c.enqueue(
           new TextEncoder().encode(
             `data: {"response.created":{"chat_id":"${chatId}","response_id":"${responseId}"}}\n\n`,
+          ),
+        );
+        c.enqueue(
+          new TextEncoder().encode(
+            `data: {"response_id":"${responseId}","choices":[{"delta":{"phase":"answer","content":"ok"}}]}\n\n`,
           ),
         );
         c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));

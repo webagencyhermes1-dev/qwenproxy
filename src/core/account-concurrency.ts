@@ -892,6 +892,19 @@ export function startLeaseSweepTimer(): void {
     if (swept > 0) {
       logger.info("[concurrency] periodic stale lease sweep", { swept });
     }
+    if (isAccountOwnershipBound()) {
+      try {
+        const ownershipSwept = getAccountOwnership().sweepExpiredLeases();
+        if (ownershipSwept > 0) {
+          logger.warn(
+            "[concurrency] ownership-level expired lease sweep",
+            { swept: ownershipSwept },
+          );
+        }
+      } catch {
+        // Best-effort: the next tick will retry.
+      }
+    }
   }, SWEEP_INTERVAL_MS);
   // Allow the process to exit even if the timer is running
   if (sweepTimer && typeof sweepTimer === "object" && "unref" in sweepTimer) {

@@ -136,6 +136,13 @@ const envSchema = z
     RETRY_MAX_DELAY_MS: z.string().default(process.env.TEST_MOCK_QWEN_AUTH === "true" ? "200" : "10000"),
     RETRY_MAX_ATTEMPTS: z.string().default("3"),
     RETRY_MAX_ACCOUNT_SWITCHES: z.string().default("2"),
+    // How many accounts a request may try after a WAF challenge before giving
+    // up. Deliberately SEPARATE from RETRY_MAX_ACCOUNT_SWITCHES: that budget
+    // guards latency on ordinary failover (2 is right there), but a WAF
+    // challenge is a pool-wide condition — with ~40% of warm accounts
+    // challenged, giving up after 3 attempts fails requests that a 4th healthy
+    // account would have served. Sized to survive the observed challenge rate.
+    RETRY_MAX_ANTIBOT_ROTATIONS: z.string().default("6"),
     RETRY_ON_UNKNOWN_UPSTREAM: z.string().default("true"),
     RETRY_AUTO_MALFORMED_TOOLS: z.string().default("true"),
     RETRY_AUTO_MALFORMED_TOOLS_MAX: z.string().default("2"),
@@ -218,6 +225,19 @@ const envSchema = z
     POOL_MAX_WARMUP_FAILURES: z.string().default("3"),
     POOL_WARMUP_BACKOFF_BASE_MS: z.string().default("500"),
     POOL_WARMUP_BACKOFF_MAX_MS: z.string().default("300000"),
+    // Bounded wait for an uncapped account to come hot when every READY account
+    // is capped for the requested model. 0 keeps the fail-fast + client-retry
+    // contract; 8000 lets the request ride out a warmup instead of surfacing
+    // "limit reached" for a condition that clears in seconds.
+    POOL_MODEL_CAP_WAIT_MS: z.string().default("8000"),
+    // Warmup circuit breaker: after this many EXHAUSTED warmup eras (each era
+    // = POOL_MAX_WARMUP_FAILURES failed attempts) an account is parked instead
+    // of having a browser launched for it again. Stops WAF-blocked / dead-credential
+    // accounts from burning a ~450MB Chromium context every recovery cycle.
+    // 0 disables the breaker (old behaviour: re-arm forever).
+    POOL_MAX_FAILED_WARMUP_ERAS: z.string().default("3"),
+    POOL_FAILED_ERA_SKIP_BASE_MS: z.string().default("7200000"),
+    POOL_FAILED_ERA_SKIP_MAX_MS: z.string().default("86400000"),
 
 
     QWEN_BASE_URL: z.string().default("https://chat.qwen.ai"),
@@ -464,6 +484,12 @@ export const config = {
     maxDelayMs: parseInt(env.RETRY_MAX_DELAY_MS),
     maxAttempts: Math.max(1, parseInt(env.RETRY_MAX_ATTEMPTS)),
     maxAccountSwitches: Math.max(0, parseInt(env.RETRY_MAX_ACCOUNT_SWITCHES)),
+    maxAntiBotRotations: Math.max(
+      1,
+      Number.isFinite(parseInt(env.RETRY_MAX_ANTIBOT_ROTATIONS))
+        ? parseInt(env.RETRY_MAX_ANTIBOT_ROTATIONS)
+        : 6,
+    ),
     /** Per-request create-phase wall-clock deadline (0 disables enforcement). */
     createDeadlineMs: Number.isFinite(parseInt(env.CHAT_CREATE_DEADLINE_MS))
       ? Math.max(0, parseInt(env.CHAT_CREATE_DEADLINE_MS))
@@ -473,16 +499,35 @@ export const config = {
       ? Math.max(1, parseInt(env.RETRY_MAX_TOTAL_ATTEMPTS))
       : 8,
     onUnknownUpstream: env.RETRY_ON_UNKNOWN_UPSTREAM !== "false",
-    chatInProgressDelayMs: Math.max(0, parseInt(env.CHAT_IN_PROGRESS_RETRY_DELAY_MS)),
-    chatInProgressBusyMs: Math.max(0, parseInt(env.CHAT_IN_PROGRESS_BUSY_MS)),
-    chatInProgressMaxAttempts: Math.max(1, parseInt(env.CHAT_IN_PROGRESS_MAX_RETRIES)),
+    chatInProgressDelayMs: Math.max(
+      0,
+      Number.isFinite(parseInt(env.CHAT_IN_PROGRESS_RETRY_DELAY_MS))
+        ? parseInt(env.CHAT_IN_PROGRESS_RETRY_DELAY_MS)
+        : 5_000,
+    ),
+    chatInProgressBusyMs: Math.max(
+      0,
+      Number.isFinite(parseInt(env.CHAT_IN_PROGRESS_BUSY_MS))
+        ? parseInt(env.CHAT_IN_PROGRESS_BUSY_MS)
+        : 30_000,
+    ),
+    chatInProgressMaxAttempts: Math.max(
+      1,
+      Number.isFinite(parseInt(env.CHAT_IN_PROGRESS_MAX_RETRIES))
+        ? parseInt(env.CHAT_IN_PROGRESS_MAX_RETRIES)
+        : 3,
+    ),
     midStreamFailoverThreshold: Math.max(
       0,
-      parseInt(env.MID_STREAM_FAILOVER_THRESHOLD),
+      Number.isFinite(parseInt(env.MID_STREAM_FAILOVER_THRESHOLD))
+        ? parseInt(env.MID_STREAM_FAILOVER_THRESHOLD)
+        : 3,
     ),
     midStreamFailoverBusyMs: Math.max(
       0,
-      parseInt(env.MID_STREAM_FAILOVER_BUSY_MS),
+      Number.isFinite(parseInt(env.MID_STREAM_FAILOVER_BUSY_MS))
+        ? parseInt(env.MID_STREAM_FAILOVER_BUSY_MS)
+        : 15_000,
     ),
     autoRetryMalformedTools: env.RETRY_AUTO_MALFORMED_TOOLS !== "false",
     autoRetryMalformedToolsMax: Math.max(1, parseInt(env.RETRY_AUTO_MALFORMED_TOOLS_MAX)),
@@ -520,10 +565,12 @@ export const config = {
         ? parseInt(env.ACQUIRE_DEADLINE_MS as string)
         : 120_000,
     ),
-    /** Safety net: force-release leases held longer than this (default 10 min). */
+    /** Safety net: force-release leases held longer than this (default 15 min). */
     leaseMaxDurationMs: Math.max(
-      0,
-      parseInt(env.ACCOUNT_LEASE_MAX_DURATION_MS),
+      1,
+      Number.isFinite(parseInt(env.ACCOUNT_LEASE_MAX_DURATION_MS))
+        ? parseInt(env.ACCOUNT_LEASE_MAX_DURATION_MS)
+        : 900_000,
     ),
     initFailureCooldownMs: Math.max(
       30_000,
@@ -552,6 +599,27 @@ export const config = {
     reconciliationIntervalMs: Math.max(
       1,
       parseInt(env.POOL_RECONCILIATION_INTERVAL_MS),
+    ),
+    /** Bounded wait (ms) for an uncapped account to come hot when every READY
+     *  account is capped for the requested model. 0 disables the wait and keeps
+     *  the fail-fast + client-retry contract. */
+    modelCapWaitMs: Math.max(
+      0,
+      Number.isFinite(parseInt(env.POOL_MODEL_CAP_WAIT_MS))
+        ? parseInt(env.POOL_MODEL_CAP_WAIT_MS)
+        : 8_000,
+    ),
+    maxFailedWarmupEras: Math.max(
+      0,
+      parseInt(env.POOL_MAX_FAILED_WARMUP_ERAS || "3"),
+    ),
+    failedEraSkipBaseMs: Math.max(
+      1_000,
+      parseInt(env.POOL_FAILED_ERA_SKIP_BASE_MS || "7200000"),
+    ),
+    failedEraSkipMaxMs: Math.max(
+      1_000,
+      parseInt(env.POOL_FAILED_ERA_SKIP_MAX_MS || "86400000"),
     ),
   },
 
